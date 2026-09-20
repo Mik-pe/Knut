@@ -3,6 +3,7 @@ mod edge;
 mod error;
 mod judgment;
 mod model;
+mod planner;
 mod policy;
 mod runtime;
 mod system_one;
@@ -23,6 +24,7 @@ pub use model::{
     CascadeOutcome, ComputeCascade, ExpectedArtifact, Model, ModelAttempt, ModelIdentity,
     ModelRequest, ModelResponse, Usage, VerificationVerdict, Verifier,
 };
+pub use planner::{MAX_DEPTH, MAX_NODES, PlanRejection, Planner, PlanningContext, ValidatedPlan};
 pub use policy::{
     ApprovalLedger, ExecOutcome, ExecutionGate, ExecutionRequest, Policy, PolicyVerdict,
     SideEffectPolicy, WriteJournal,

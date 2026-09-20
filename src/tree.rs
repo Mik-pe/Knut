@@ -79,7 +79,8 @@ impl PlanNode {
         }
     }
 
-    fn children(&self) -> &[PlanNode] {
+    /// Direct children (empty for leaves).
+    pub fn children(&self) -> &[PlanNode] {
         match self {
             PlanNode::Sequence { children, .. }
             | PlanNode::Selector { children, .. }

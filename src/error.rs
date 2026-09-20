@@ -28,4 +28,7 @@ pub enum KnutError {
         reason: String,
         attempts: Vec<crate::model::ModelAttempt>,
     },
+
+    #[error("plan rejected: {errors:?}")]
+    PlanRejected { errors: Vec<String> },
 }
