@@ -68,7 +68,8 @@ impl DecisionInput {
     }
 }
 
-#[derive(Debug, Clone, PartialEq, Eq)]
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
 pub enum Action {
     AskUser,
     Retrieve(RetrievalSource),

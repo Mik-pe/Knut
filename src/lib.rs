@@ -1,6 +1,7 @@
 mod decision;
 mod edge;
 mod error;
+mod evals;
 mod judgment;
 mod model;
 mod planner;
@@ -16,6 +17,10 @@ pub use edge::{
     EdgeChoice, EdgeJudgment, EdgeRouter, EdgeSelector, EdgeState, MAX_STEP_ATTEMPTS, NodeOutcome,
 };
 pub use error::KnutError;
+pub use evals::{
+    Benchmark, BenchmarkComparison, BenchmarkTask, CostModel, Expectation, Metrics,
+    ShadowSystemOne, TraceLog, TurnOutcome, TurnTrace,
+};
 pub use judgment::{
     Complexity, Handler, IngressJudgments, Judgment, JudgmentRouter, JudgmentSystemOne,
     RetrievalJudgment, StaticJudgments, TierJudgment, YesNo,

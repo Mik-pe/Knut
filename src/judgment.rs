@@ -63,7 +63,7 @@ pub enum TierJudgment {
 ///
 /// Every field is always populated (observability); the decision derived
 /// from it consumes only the fields relevant to the chosen handler.
-#[derive(Debug, Clone, PartialEq)]
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
 pub struct IngressJudgments {
     pub handler: Judgment<Handler>,
     pub complexity: Judgment<Complexity>,
