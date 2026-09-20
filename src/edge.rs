@@ -387,8 +387,8 @@ mod tests {
         }
 
         let mut registry = crate::ToolRegistry::default();
-        registry.register(StaticTool);
-        registry.register(WorkingTool);
+        registry.register(StaticTool).unwrap();
+        registry.register(WorkingTool).unwrap();
         struct NoModel;
         #[async_trait]
         impl crate::model::Model for NoModel {
@@ -412,8 +412,15 @@ mod tests {
                 crate::VerificationVerdict::Sufficient
             }
         }
+        let gate = Arc::new(crate::ExecutionGate::new(
+            crate::SideEffectPolicy::new()
+                .allow(crate::SideEffect::ReadOnly)
+                .allow(crate::SideEffect::IdempotentWrite)
+                .allow(crate::SideEffect::NonIdempotentWrite),
+        ));
         let executor = TreeExecutor::new(
             Arc::new(registry),
+            gate,
             Arc::new(crate::ComputeCascade::empty().with_reasoner(NoModel)),
             Arc::new(Accept),
         );

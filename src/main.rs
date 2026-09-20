@@ -241,18 +241,22 @@ fn playground_registry() -> ToolRegistry {
     }
 
     let mut registry = ToolRegistry::default();
-    registry.register(CannedTool {
-        id: "get_weather",
-        capability: "weather",
-        description: "current conditions for a city",
-        output: json!({ "city": "Stockholm", "temp_c": 14, "sky": "cloudy" }),
-    });
-    registry.register(CannedTool {
-        id: "read_note",
-        capability: "files",
-        description: "read a note from the notebook",
-        output: json!({ "note": "Knut routes; Jev judges; Rust decides." }),
-    });
+    registry
+        .register(CannedTool {
+            id: "get_weather",
+            capability: "weather",
+            description: "current conditions for a city",
+            output: json!({ "city": "Stockholm", "temp_c": 14, "sky": "cloudy" }),
+        })
+        .unwrap();
+    registry
+        .register(CannedTool {
+            id: "read_note",
+            capability: "files",
+            description: "read a note from the notebook",
+            output: json!({ "note": "Knut routes; Jev judges; Rust decides." }),
+        })
+        .unwrap();
     registry
 }
 
@@ -442,7 +446,10 @@ async fn demo_tree(verbose: bool) -> Result<(), KnutError> {
         }
     })?;
 
-    let executor = TreeExecutor::new(Arc::clone(&registry), cascade, Arc::new(AcceptAll));
+    let gate = Arc::new(knut::ExecutionGate::new(
+        knut::SideEffectPolicy::new().allow(SideEffect::ReadOnly),
+    ));
+    let executor = TreeExecutor::new(Arc::clone(&registry), gate, cascade, Arc::new(AcceptAll));
     let started = Instant::now();
     let result: TreeRunResult = executor
         .run(&plan, Arc::new(std::sync::atomic::AtomicBool::new(false)))

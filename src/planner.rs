@@ -375,7 +375,7 @@ mod tests {
         }
 
         let mut registry = ToolRegistry::default();
-        registry.register(Fake);
+        registry.register(Fake).unwrap();
         registry
     }
 

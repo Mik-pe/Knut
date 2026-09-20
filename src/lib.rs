@@ -32,8 +32,8 @@ pub use model::{
 };
 pub use planner::{MAX_DEPTH, MAX_NODES, PlanRejection, Planner, PlanningContext, ValidatedPlan};
 pub use policy::{
-    ApprovalLedger, ExecOutcome, ExecutionGate, ExecutionRequest, Policy, PolicyVerdict,
-    SideEffectPolicy, WriteJournal,
+    ApprovalLedger, Authorization, ExecOutcome, ExecutionGate, InMemoryJournal, JournalEntry,
+    JournalStore, OutcomeState, Policy, PolicyVerdict, ProposedExecution, SideEffectPolicy,
 };
 pub use runtime::{DecisionSource, Knut, Routed};
 pub use system_one::{StaticSystemOne, SystemOne};
@@ -41,7 +41,7 @@ pub use system_zero::{
     ExplicitCapabilityRule, InvalidInputRule, RoutingCache, RuleVerdict, SystemZero,
     SystemZeroOutcome, SystemZeroRule, UnavailableCapabilityRule,
 };
-pub use tool::{SideEffect, Tool, ToolMetadata, ToolRegistry};
+pub use tool::{SchemaError, SideEffect, Tool, ToolMetadata, ToolRegistry, validate_arguments};
 pub use tree::{
     AskUserHandler, CancelFlag, NodeStatus, PlanError, PlanNode, TreeExecutor, TreeRunResult,
     validate_plan,

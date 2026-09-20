@@ -31,4 +31,18 @@ pub enum KnutError {
 
     #[error("plan rejected: {errors:?}")]
     PlanRejected { errors: Vec<String> },
+
+    #[error("invalid arguments {path}: {reason}")]
+    InvalidArguments { path: String, reason: String },
+
+    #[error(
+        "unknown effect for {fingerprint}: the previous attempt may have partially applied; reconcile or ask, do not retry"
+    )]
+    UnknownEffect { fingerprint: String },
+
+    #[error("previous attempt failed for {fingerprint}: {detail}")]
+    PreviousFailure { fingerprint: String, detail: String },
+
+    #[error("execution already reserved for {fingerprint}")]
+    ExecutionReserved { fingerprint: String },
 }

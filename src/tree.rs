@@ -10,7 +10,8 @@ use serde_json::Value;
 use thiserror::Error;
 
 use crate::{
-    ComputeCascade, ExpectedArtifact, KnutError, ModelRequest, ModelTier, ToolRegistry, Verifier,
+    ComputeCascade, ExecutionGate, ExpectedArtifact, KnutError, ModelRequest, ModelTier, Risk,
+    ToolRegistry, Verifier,
 };
 
 /// Explicit status of every node in a plan.
@@ -223,19 +224,24 @@ pub struct TreeRunResult {
 /// Executes validated plans against real or fake tools/models.
 pub struct TreeExecutor {
     registry: Arc<ToolRegistry>,
+    gate: Arc<ExecutionGate>,
     cascade: Arc<ComputeCascade>,
     verifier: Arc<dyn Verifier>,
     ask_handler: Option<Arc<dyn AskUserHandler>>,
 }
 
 impl TreeExecutor {
+    /// `gate` is mandatory: tree execution cannot exist without an
+    /// authorization boundary, so there is no gate-less constructor.
     pub fn new(
         registry: Arc<ToolRegistry>,
+        gate: Arc<ExecutionGate>,
         cascade: Arc<ComputeCascade>,
         verifier: Arc<dyn Verifier>,
     ) -> Self {
         Self {
             registry,
+            gate,
             cascade,
             verifier,
             ask_handler: None,
@@ -390,16 +396,36 @@ impl TreeExecutor {
                 capability,
                 tool_id,
                 input,
-            } => match self.registry.find_exact(capability, tool_id) {
-                Err(_) => NodeStatus::Blocked,
-                Ok(tool) => match tool.call(input.clone()).await {
-                    Ok(output) => {
-                        outputs.insert(id.clone(), output);
+            } => {
+                // Single execution path: availability, argument schema,
+                // policy, approval, and journal semantics all live in the
+                // gate. A node never calls an implementation directly.
+                match self
+                    .registry
+                    .invoke(
+                        &self.gate,
+                        capability,
+                        tool_id,
+                        input.clone(),
+                        None,
+                        Risk::Low,
+                    )
+                    .await
+                {
+                    Ok(outcome) => {
+                        outputs.insert(id.clone(), outcome.output);
                         NodeStatus::Succeeded
                     }
+                    // Unavailable tool or refused authorization: blocked.
+                    Err(KnutError::ToolNotFound(_))
+                    | Err(KnutError::PolicyDenied { .. })
+                    | Err(KnutError::ApprovalRequired { .. })
+                    | Err(KnutError::ExecutionReserved { .. })
+                    | Err(KnutError::UnknownEffect { .. }) => NodeStatus::Blocked,
+                    // Bad arguments or tool failure: failed.
                     Err(_) => NodeStatus::Failed,
-                },
-            },
+                }
+            }
             PlanNode::Generate {
                 id,
                 instruction,
@@ -570,9 +596,18 @@ mod tests {
     fn registry_with(tools: Vec<StaticTool>) -> Arc<ToolRegistry> {
         let mut registry = ToolRegistry::default();
         for tool in tools {
-            registry.register(tool);
+            registry.register(tool).unwrap();
         }
         Arc::new(registry)
+    }
+
+    fn test_gate() -> Arc<ExecutionGate> {
+        Arc::new(ExecutionGate::new(
+            crate::SideEffectPolicy::new()
+                .allow(crate::SideEffect::ReadOnly)
+                .allow(crate::SideEffect::IdempotentWrite)
+                .allow(crate::SideEffect::NonIdempotentWrite),
+        ))
     }
 
     fn executor(registry: Arc<ToolRegistry>) -> TreeExecutor {
@@ -581,7 +616,7 @@ mod tests {
             calls: Mutex::new(0),
         };
         let cascade = Arc::new(ComputeCascade::empty().with_reasoner(model));
-        TreeExecutor::new(registry, cascade, Arc::new(AcceptAll))
+        TreeExecutor::new(registry, test_gate(), cascade, Arc::new(AcceptAll))
     }
 
     fn tool_node(id: &str, capability: &str, tool_id: &str) -> PlanNode {
@@ -751,18 +786,25 @@ mod tests {
     #[tokio::test]
     async fn verify_fails_on_invalid_json_from_generate() {
         let mut registry = ToolRegistry::default();
-        registry.register(StaticTool {
-            id: "ok",
-            capability: "files",
-            output: json!({}),
-            fail: false,
-        });
+        registry
+            .register(StaticTool {
+                id: "ok",
+                capability: "files",
+                output: json!({}),
+                fail: false,
+            })
+            .unwrap();
         let model = EchoModel {
             content: "definitely not json".to_owned(),
             calls: Mutex::new(0),
         };
         let cascade = Arc::new(ComputeCascade::empty().with_reasoner(model));
-        let executor = TreeExecutor::new(Arc::new(registry), cascade, Arc::new(AcceptAll));
+        let executor = TreeExecutor::new(
+            Arc::new(registry),
+            test_gate(),
+            cascade,
+            Arc::new(AcceptAll),
+        );
 
         let plan = PlanNode::Sequence {
             id: "root".into(),
@@ -792,12 +834,14 @@ mod tests {
         // the next, forcing a Fast -> Reasoner escalation mid-tree; the
         // reasoner echo model answers with valid JSON.
         let mut registry = ToolRegistry::default();
-        registry.register(StaticTool {
-            id: "ok",
-            capability: "files",
-            output: json!({}),
-            fail: false,
-        });
+        registry
+            .register(StaticTool {
+                id: "ok",
+                capability: "files",
+                output: json!({}),
+                fail: false,
+            })
+            .unwrap();
         let fast = EchoModel {
             content: "nope".to_owned(),
             calls: Mutex::new(0),
@@ -813,6 +857,7 @@ mod tests {
         );
         let executor = TreeExecutor::new(
             Arc::new(registry),
+            test_gate(),
             cascade,
             Arc::new(RetryThenAccept {
                 remaining_retries: Mutex::new(1),
@@ -848,21 +893,28 @@ mod tests {
         assert_eq!(blocked.statuses.get("ask"), Some(&NodeStatus::Blocked));
 
         let mut registry = ToolRegistry::default();
-        registry.register(StaticTool {
-            id: "ok",
-            capability: "files",
-            output: json!({}),
-            fail: false,
-        });
+        registry
+            .register(StaticTool {
+                id: "ok",
+                capability: "files",
+                output: json!({}),
+                fail: false,
+            })
+            .unwrap();
         let model = EchoModel {
             content: "x".to_owned(),
             calls: Mutex::new(0),
         };
         let cascade = Arc::new(ComputeCascade::empty().with_reasoner(model));
-        let executor = TreeExecutor::new(Arc::new(registry), cascade, Arc::new(AcceptAll))
-            .with_ask_handler(Arc::new(AskingUser {
-                answer: Some("notes.txt".to_owned()),
-            }));
+        let executor = TreeExecutor::new(
+            Arc::new(registry),
+            test_gate(),
+            cascade,
+            Arc::new(AcceptAll),
+        )
+        .with_ask_handler(Arc::new(AskingUser {
+            answer: Some("notes.txt".to_owned()),
+        }));
 
         let answered = executor.run(&plan, no_cancel()).await.unwrap();
         assert_eq!(answered.statuses.get("ask"), Some(&NodeStatus::Succeeded));
@@ -898,22 +950,31 @@ mod tests {
 
         let flag: CancelFlag = Arc::new(AtomicBool::new(false));
         let mut registry = ToolRegistry::default();
-        registry.register(CancelAfterCall {
-            flag: Arc::clone(&flag),
-        });
-        registry.register(StaticTool {
-            id: "ok",
-            capability: "files",
-            output: json!({}),
-            fail: false,
-        });
+        registry
+            .register(CancelAfterCall {
+                flag: Arc::clone(&flag),
+            })
+            .unwrap();
+        registry
+            .register(StaticTool {
+                id: "ok",
+                capability: "files",
+                output: json!({}),
+                fail: false,
+            })
+            .unwrap();
         let model = EchoModel {
             content: "x".to_owned(),
             calls: Mutex::new(0),
         };
         let cascade = Arc::new(ComputeCascade::empty().with_reasoner(model));
 
-        let executor = TreeExecutor::new(Arc::new(registry), cascade, Arc::new(AcceptAll));
+        let executor = TreeExecutor::new(
+            Arc::new(registry),
+            test_gate(),
+            cascade,
+            Arc::new(AcceptAll),
+        );
         let plan = PlanNode::Sequence {
             id: "root".into(),
             children: vec![
