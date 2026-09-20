@@ -38,16 +38,36 @@ System 1        Jev-style bounded decisions
 
 ## Current scope
 
-The first draft contains:
+The core contains:
 
 - typed routing decisions,
 - a `SystemOne` trait,
+- deterministic System 0 fast paths (named rules, routing cache),
+- batched ingress judgments in one System One call,
 - confidence-gated escalation,
-- a capability-oriented tool registry,
-- a small runtime that turns decisions into executable next actions,
-- a static System One implementation for tests and local experiments.
+- a capability-oriented tool registry with bounded candidate discovery,
+- a model tier abstraction with a bounded compute cascade,
+- a validated behavior-tree core with cooperative cancellation,
+- an edge selector so System One re-routes after node results,
+- a policy layer: permission and side-effect approval are Rust, not judgment,
+- a System Two planner that produces validated plans only,
+- eval traces, shadow routing, replay, and offline benchmarks.
 
-It deliberately does **not** contain a planner, behavior-tree executor, LLM provider, or Jev HTTP adapter yet. Those are isolated follow-up pieces rather than assumptions baked into the core.
+Open follow-ups live in the issue tracker; the Jev HTTP adapter (#2) is the next isolated piece.
+
+## CLI playground
+
+```console
+$ cargo run -- route weather
+weather -> Tool { capability: "weather" } (confidence 1.00, via system-0)
+
+$ cargo run -- route "find my notes" --verbose
+$ cargo run -- demo-tree          # execute the canned validated tree
+$ cargo run -- eval               # hybrid routing vs always-reasoner
+$ cargo run -- repl               # route prompts interactively
+```
+
+The playground runs fully offline against a deterministic mock System One; live Jev routing is issue #2.
 
 ## Example
 
