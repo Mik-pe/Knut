@@ -1,4 +1,5 @@
 mod decision;
+mod edge;
 mod error;
 mod judgment;
 mod model;
@@ -9,6 +10,9 @@ mod tool;
 mod tree;
 
 pub use decision::{Action, Decision, DecisionInput, ModelTier, RetrievalSource, Risk, Route};
+pub use edge::{
+    EdgeChoice, EdgeJudgment, EdgeRouter, EdgeSelector, EdgeState, MAX_STEP_ATTEMPTS, NodeOutcome,
+};
 pub use error::KnutError;
 pub use judgment::{
     Complexity, Handler, IngressJudgments, Judgment, JudgmentRouter, JudgmentSystemOne,

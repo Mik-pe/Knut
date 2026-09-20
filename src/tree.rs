@@ -66,7 +66,8 @@ pub enum PlanNode {
 }
 
 impl PlanNode {
-    fn id(&self) -> &str {
+    /// The node's stable identifier.
+    pub fn id(&self) -> &str {
         match self {
             PlanNode::Sequence { id, .. }
             | PlanNode::Selector { id, .. }
