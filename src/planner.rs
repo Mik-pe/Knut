@@ -362,6 +362,7 @@ mod tests {
             fn metadata(&self) -> ToolMetadata {
                 ToolMetadata {
                     id: "read_file".to_owned(),
+                    tool_version: "1".to_owned(),
                     capability: "files".to_owned(),
                     description: "read a file".to_owned(),
                     input_schema: json!({ "type": "object" }),

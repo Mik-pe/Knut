@@ -228,6 +228,7 @@ fn playground_registry() -> ToolRegistry {
         fn metadata(&self) -> ToolMetadata {
             ToolMetadata {
                 id: self.id.to_owned(),
+                tool_version: "1".to_owned(),
                 capability: self.capability.to_owned(),
                 description: self.description.to_owned(),
                 input_schema: json!({ "type": "object" }),

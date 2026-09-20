@@ -510,6 +510,7 @@ mod tests {
         fn metadata(&self) -> ToolMetadata {
             ToolMetadata {
                 id: self.id.to_owned(),
+                tool_version: "1".to_owned(),
                 capability: self.capability.to_owned(),
                 description: "static test tool".to_owned(),
                 input_schema: json!({ "type": "object" }),
@@ -935,6 +936,7 @@ mod tests {
             fn metadata(&self) -> ToolMetadata {
                 ToolMetadata {
                     id: "cancelme".to_owned(),
+                    tool_version: "1".to_owned(),
                     capability: "files".to_owned(),
                     description: "sets the cancel flag".to_owned(),
                     input_schema: json!({ "type": "object" }),

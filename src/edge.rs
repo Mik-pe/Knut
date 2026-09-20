@@ -349,6 +349,7 @@ mod tests {
             fn metadata(&self) -> crate::tool::ToolMetadata {
                 crate::tool::ToolMetadata {
                     id: "probe".to_owned(),
+                    tool_version: "1".to_owned(),
                     capability: "diag".to_owned(),
                     description: "probe that fails once".to_owned(),
                     input_schema: serde_json::json!({ "type": "object" }),
@@ -371,6 +372,7 @@ mod tests {
             fn metadata(&self) -> crate::tool::ToolMetadata {
                 crate::tool::ToolMetadata {
                     id: "work".to_owned(),
+                    tool_version: "1".to_owned(),
                     capability: "diag".to_owned(),
                     description: "succeeds".to_owned(),
                     input_schema: serde_json::json!({ "type": "object" }),

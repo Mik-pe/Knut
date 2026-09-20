@@ -27,6 +27,9 @@ pub enum SideEffect {
 pub struct ToolMetadata {
     /// Globally unique tool ID.
     pub id: String,
+    /// Implementation version; part of the execution fingerprint, so a
+    /// changed implementation invalidates stale approvals and replays.
+    pub tool_version: String,
     /// Capability this tool belongs to; the routing-level grouping.
     pub capability: String,
     /// One-line human/model-readable summary.
@@ -188,6 +191,8 @@ impl ToolRegistry {
     /// The single execution path: gate-checked, schema-validated, and
     /// audit-logged. `execute` is the raw implementation, reachable only
     /// from inside the crate after policy approval.
+    /// Invoke without content preconditions (the common case for tools
+    /// whose arguments reference nothing external).
     pub(crate) async fn invoke(
         &self,
         gate: &ExecutionGate,
@@ -197,6 +202,40 @@ impl ToolRegistry {
         idempotency_key: Option<String>,
         risk: Risk,
     ) -> Result<ExecOutcome, KnutError> {
+        self.invoke_with_preconditions(
+            gate,
+            &InvocationRequest {
+                capability,
+                tool_id,
+                input,
+                preconditions: &crate::policy::ContentPreconditions::none(),
+                idempotency_key,
+                risk,
+            },
+        )
+        .await
+    }
+
+    pub(crate) async fn invoke_with_preconditions(
+        &self,
+        gate: &ExecutionGate,
+        invocation: &InvocationRequest<'_>,
+    ) -> Result<ExecOutcome, KnutError> {
+        let InvocationRequest {
+            capability,
+            tool_id,
+            input,
+            preconditions,
+            idempotency_key,
+            risk,
+        } = invocation;
+        let (capability, tool_id, input, idempotency_key, risk) = (
+            *capability,
+            *tool_id,
+            input,
+            idempotency_key.as_deref(),
+            *risk,
+        );
         // Unknown identity is a policy denial (issue #14: unknown
         // capabilities/tools are denied, not "not found" into an
         // escalate-elsewhere path). Metadata lookup stays available for
@@ -208,16 +247,22 @@ impl ToolRegistry {
         };
 
         // Supported-schema check against the registered schema.
-        validate_arguments(&entry.metadata.input_schema, &input).map_err(KnutError::from)?;
+        validate_arguments(&entry.metadata.input_schema, input).map_err(KnutError::from)?;
 
         let authorization = gate
-            .authorize(&entry.metadata, &input, idempotency_key.as_deref(), risk)
+            .authorize_with_preconditions(
+                &entry.metadata,
+                input,
+                preconditions,
+                idempotency_key,
+                risk,
+            )
             .await?;
 
         let outcome = match authorization {
             crate::policy::Authorization::Replay(outcome) => outcome,
             crate::policy::Authorization::Execute { fingerprint } => {
-                gate.execute(entry.tool.as_ref(), fingerprint, &input)
+                gate.execute(entry.tool.as_ref(), fingerprint, input)
                     .await?
             }
         };
@@ -232,6 +277,16 @@ impl ToolRegistry {
 
         Ok(outcome)
     }
+}
+
+/// Everything one gated invocation needs.
+pub struct InvocationRequest<'a> {
+    pub capability: &'a str,
+    pub tool_id: &'a str,
+    pub input: Value,
+    pub preconditions: &'a crate::policy::ContentPreconditions,
+    pub idempotency_key: Option<String>,
+    pub risk: Risk,
 }
 
 /// The JSON Schema subset Knut validates: type, required, enum,
@@ -391,6 +446,7 @@ mod tests {
         fn metadata(&self) -> ToolMetadata {
             ToolMetadata {
                 id: self.id.to_owned(),
+                tool_version: "1".to_owned(),
                 capability: self.capability.to_owned(),
                 description: self.description.to_owned(),
                 input_schema: json!({ "type": "object" }),

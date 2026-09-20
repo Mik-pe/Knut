@@ -59,6 +59,11 @@ pub trait JournalStore: Send + Sync {
     /// Release a reservation without an outcome (cancelled before the
     /// action started).
     fn release(&self, fingerprint: &str);
+
+    /// Bind a replay key to an execution fingerprint. Returns
+    /// `Err(bound_fingerprint)` when the key is already bound elsewhere:
+    /// a replay-key conflict, not a cache hit.
+    fn bind_key(&self, key: &str, fingerprint: &str) -> Result<(), String>;
 }
 
 /// Deterministic in-memory journal implementation.
@@ -66,6 +71,10 @@ pub trait JournalStore: Send + Sync {
 pub struct InMemoryJournal {
     reserved: Mutex<BTreeSet<String>>,
     entries: Mutex<HashMap<String, JournalEntry>>,
+    /// Replay-key bindings: key -> fingerprint of the execution that
+    /// first used it. A reused key mapping to a *different* fingerprint
+    /// is a conflict, never a cache hit or a silent identity swap.
+    key_bindings: Mutex<std::collections::HashMap<String, String>>,
 }
 
 impl InMemoryJournal {
@@ -75,6 +84,18 @@ impl InMemoryJournal {
 }
 
 impl JournalStore for InMemoryJournal {
+    fn bind_key(&self, key: &str, fingerprint: &str) -> Result<(), String> {
+        let mut bindings = self.key_bindings.lock().expect("journal poisoned");
+        match bindings.get(key) {
+            Some(bound) if bound != fingerprint => Err(bound.clone()),
+            Some(_) => Ok(()),
+            None => {
+                bindings.insert(key.to_owned(), fingerprint.to_owned());
+                Ok(())
+            }
+        }
+    }
+
     fn reserve(&self, fingerprint: &str) -> bool {
         self.reserved
             .lock()
@@ -140,6 +161,8 @@ pub struct ExecutionGate {
     policy: Box<dyn Policy>,
     approvals: ApprovalLedger,
     journal: InMemoryJournal,
+    workspace: WorkspaceIdentity,
+    policy_revision: String,
 }
 
 impl ExecutionGate {
@@ -148,7 +171,23 @@ impl ExecutionGate {
             policy: Box::new(policy),
             approvals: ApprovalLedger::new(),
             journal: InMemoryJournal::new(),
+            workspace: WorkspaceIdentity::local(),
+            policy_revision: "side-effect-default".to_owned(),
         }
+    }
+
+    /// Bind the gate to a workspace identity; approvals and journal
+    /// entries minted under another workspace do not apply here.
+    pub fn with_workspace(mut self, workspace: WorkspaceIdentity) -> Self {
+        self.workspace = workspace;
+        self
+    }
+
+    /// Set the policy revision identity. Bump it whenever the effective
+    /// policy changes: all prior approvals become stale by construction.
+    pub fn with_policy_revision(mut self, revision: impl Into<String>) -> Self {
+        self.policy_revision = revision.into();
+        self
     }
 
     pub fn approvals(&self) -> &ApprovalLedger {
@@ -178,6 +217,28 @@ impl ExecutionGate {
         idempotency_key: Option<&str>,
         risk: Risk,
     ) -> Result<Authorization, KnutError> {
+        self.authorize_with_preconditions(
+            metadata,
+            input,
+            &ContentPreconditions::none(),
+            idempotency_key,
+            risk,
+        )
+        .await
+    }
+
+    /// [`authorize`](ExecutionGate::authorize) with content
+    /// preconditions: watch the revisions the arguments reference. If
+    /// they changed since approval, the fingerprint changes and the
+    /// stale approval no longer applies.
+    pub async fn authorize_with_preconditions(
+        &self,
+        metadata: &ToolMetadata,
+        input: &Value,
+        preconditions: &ContentPreconditions,
+        idempotency_key: Option<&str>,
+        risk: Risk,
+    ) -> Result<Authorization, KnutError> {
         let side_effect = metadata.side_effect;
 
         let request = ProposedExecution {
@@ -188,15 +249,24 @@ impl ExecutionGate {
             risk,
         };
 
+        // Fingerprint as seen by approval: "-" stands in for "no replay
+        // key" so approval identity covers the same fields in both cases.
+        let approval_fingerprint = execution_fingerprint(
+            metadata,
+            &self.workspace,
+            input,
+            preconditions,
+            idempotency_key.unwrap_or("-"),
+            &self.policy_revision,
+        );
+
         match self.policy.check(&request, side_effect) {
             PolicyVerdict::Denied { reason } => return Err(KnutError::PolicyDenied { reason }),
             PolicyVerdict::ApprovalRequired { reason } => {
-                let fingerprint =
-                    execution_fingerprint(metadata, input, idempotency_key.unwrap_or("-"));
-                if !self.approvals.is_approved(&fingerprint) {
+                if !self.approvals.is_approved(&approval_fingerprint) {
                     return Err(KnutError::ApprovalRequired {
                         reason,
-                        approval_key: fingerprint,
+                        approval_key: approval_fingerprint,
                     });
                 }
             }
@@ -206,7 +276,14 @@ impl ExecutionGate {
         let fingerprint = match side_effect {
             SideEffect::ReadOnly => return Ok(Authorization::Execute { fingerprint: None }),
             SideEffect::IdempotentWrite => match idempotency_key {
-                Some(key) => execution_fingerprint(metadata, input, key),
+                Some(key) => execution_fingerprint(
+                    metadata,
+                    &self.workspace,
+                    input,
+                    preconditions,
+                    key,
+                    &self.policy_revision,
+                ),
                 None => return Ok(Authorization::Execute { fingerprint: None }),
             },
             SideEffect::NonIdempotentWrite => {
@@ -218,7 +295,14 @@ impl ExecutionGate {
                         ),
                     });
                 };
-                execution_fingerprint(metadata, input, key)
+                execution_fingerprint(
+                    metadata,
+                    &self.workspace,
+                    input,
+                    preconditions,
+                    key,
+                    &self.policy_revision,
+                )
             }
         };
 
@@ -241,6 +325,20 @@ impl ExecutionGate {
 
         if !self.journal.reserve(&fingerprint) {
             return Err(KnutError::ExecutionReserved { fingerprint });
+        }
+
+        // Bind the replay key to this exact fingerprint. The key travels
+        // inside the fingerprint, so a *different* fingerprint carrying
+        // the same key means the key was reused for changed arguments:
+        // refuse it rather than treating it as a fresh identity.
+        if let Some(key) = idempotency_key
+            && let Err(expected) = self.journal.bind_key(&format!("key:{key}"), &fingerprint)
+        {
+            self.journal.release(&fingerprint);
+            return Err(KnutError::ReplayKeyConflict {
+                key: key.to_owned(),
+                expected,
+            });
         }
 
         Ok(Authorization::Execute {
@@ -387,22 +485,91 @@ impl ApprovalLedger {
     }
 }
 
-/// The exact-action identity: registered tool identity (capability, id,
-/// side-effect class), normalized arguments, and the replay key.
+/// The exact-action identity.
 ///
-/// Changing the arguments, the tool identity, or the replay key produces
-/// a different fingerprint and invalidates any prior approval. serde_json
-/// object keys are sorted by default, so argument key order is irrelevant.
+/// Covers registered tool identity and version (capability, id,
+/// side-effect class, tool version), normalized arguments, the workspace
+/// identity, relevant content preconditions, and the policy revision
+/// that authorized the action. serde_json object keys are sorted by
+/// default, so argument key order is irrelevant.
+///
+/// Any change to a covered field produces a different fingerprint and
+/// invalidates prior approvals and journal entries for the action. This
+/// is also why a reused replay key with changed arguments is a conflict,
+/// not a cache hit: the same key now maps to two different identities.
 pub(crate) fn execution_fingerprint(
     metadata: &ToolMetadata,
+    workspace: &WorkspaceIdentity,
     input: &Value,
+    preconditions: &ContentPreconditions,
     idempotency_key: &str,
+    policy_revision: &str,
 ) -> String {
     let args = serde_json::to_string(input).unwrap_or_else(|_| "<unserializable>".to_owned());
     format!(
-        "v1:{}/{}:effect={:?}:args={args}:key={idempotency_key}",
-        metadata.capability, metadata.id, metadata.side_effect
+        "v2:{}/{}/{}:effect={:?}:args={args}:ws={}:pre={}:policy={policy_revision}:key={idempotency_key}",
+        metadata.capability,
+        metadata.id,
+        metadata.tool_version,
+        metadata.side_effect,
+        workspace.id,
+        preconditions.id(),
     )
+}
+
+/// Which workspace the action runs against; part of the approval and
+/// replay identity so an identity from one workspace never authorizes
+/// work in another.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct WorkspaceIdentity {
+    pub id: String,
+}
+
+impl WorkspaceIdentity {
+    pub fn new(id: impl Into<String>) -> Self {
+        Self { id: id.into() }
+    }
+
+    /// The single-process default; explicit multi-workspace support is
+    /// deliberately deferred until the session layer exists.
+    pub fn local() -> Self {
+        Self::new("local")
+    }
+}
+
+/// Relevant content preconditions: what the arguments referenced at
+/// approval time. Changing the watched content invalidates the approval
+/// (the approved action is no longer the action that would run).
+///
+/// `None` watches nothing, which is the right default for tools whose
+/// arguments do not reference external content.
+#[derive(Debug, Clone, PartialEq, Eq, Default)]
+pub struct ContentPreconditions {
+    conditions: Vec<(String, String)>,
+}
+
+impl ContentPreconditions {
+    pub fn none() -> Self {
+        Self::default()
+    }
+
+    /// Watch a content revision: label names the thing (file path,
+    /// buffer id, document hash input), revision is its content identity
+    /// (hash, mtime+size, version).
+    pub fn watch(mut self, label: impl Into<String>, revision: impl Into<String>) -> Self {
+        self.conditions.push((label.into(), revision.into()));
+        self
+    }
+
+    fn id(&self) -> String {
+        let mut sorted = self.conditions.clone();
+        sorted.sort();
+        sorted
+            .iter()
+            .map(|(k, v)| format!("{k}={v}"))
+            .collect::<Vec<_>>()
+            .join(";")
+    }
 }
 
 #[cfg(test)]
@@ -423,6 +590,7 @@ mod tests {
         fn metadata(&self) -> ToolMetadata {
             ToolMetadata {
                 id: self.id.to_owned(),
+                tool_version: "1".to_owned(),
                 capability: self.capability.to_owned(),
                 description: "counting test tool".to_owned(),
                 input_schema: serde_json::json!({ "type": "object" }),
@@ -574,7 +742,7 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn replay_key_with_different_arguments_is_not_a_hit() {
+    async fn replay_key_reuse_with_changed_arguments_conflicts() {
         let gate = ExecutionGate::new(SideEffectPolicy::new().allow(SideEffect::IdempotentWrite));
         let registry = write_registry(false);
 
@@ -589,7 +757,12 @@ mod tests {
             )
             .await
             .unwrap();
-        let second = registry
+        assert!(!first.replayed);
+
+        // Same replay key, different arguments: the key is now bound to
+        // the first fingerprint. This is a conflict, never a cache hit
+        // and never a silent new identity.
+        let err = registry
             .invoke(
                 &gate,
                 "files",
@@ -599,12 +772,26 @@ mod tests {
                 Risk::Low,
             )
             .await
-            .unwrap();
+            .unwrap_err();
+        match err {
+            KnutError::ReplayKeyConflict { key, .. } => assert_eq!(key, "k"),
+            other => panic!("expected conflict, got {other:?}"),
+        }
 
-        // Different fingerprint: executes fresh, never replays the old hit.
-        assert!(!first.replayed);
-        assert!(!second.replayed);
-        assert_ne!(first.output, second.output);
+        // The original action still replays exactly.
+        let replay = registry
+            .invoke(
+                &gate,
+                "files",
+                "write",
+                serde_json::json!({ "path": "a.txt" }),
+                Some("k".to_owned()),
+                Risk::Low,
+            )
+            .await
+            .unwrap();
+        assert!(replay.replayed);
+        assert_eq!(first.output, replay.output);
     }
 
     #[tokio::test]
@@ -723,6 +910,7 @@ mod tests {
             fn metadata(&self) -> ToolMetadata {
                 ToolMetadata {
                     id: "write".to_owned(),
+                    tool_version: "1".to_owned(),
                     capability: "files".to_owned(),
                     description: "race tool".to_owned(),
                     input_schema: serde_json::json!({ "type": "object" }),

@@ -17,7 +17,7 @@ pub use decision::{Action, Decision, DecisionInput, ModelTier, RetrievalSource, 
 pub use edge::{
     EdgeChoice, EdgeJudgment, EdgeRouter, EdgeSelector, EdgeState, MAX_STEP_ATTEMPTS, NodeOutcome,
 };
-pub use error::KnutError;
+pub use error::{KnutError, redacted};
 pub use evals::{
     Benchmark, BenchmarkComparison, BenchmarkTask, CostModel, Expectation, Metrics,
     ShadowSystemOne, TraceLog, TurnOutcome, TurnTrace,
