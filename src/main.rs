@@ -19,11 +19,11 @@ use serde_json::json;
 
 use knut::{
     Action, Benchmark, BenchmarkTask, ComputeCascade, CostModel, Decision, DecisionInput,
-    DecisionSource, ExpectedArtifact, IngressJudgments, Judgment, Knut, KnutError, Metrics,
-    ModelIdentity, ModelRequest, ModelResponse, ModelTier, PlanNode, RetrievalJudgment,
+    DecisionSource, ExpectedArtifact, IngressJudgments, JevSystemOne, Judgment, Knut, KnutError,
+    Metrics, ModelIdentity, ModelRequest, ModelResponse, ModelTier, PlanNode, RetrievalJudgment,
     RetrievalSource, Risk, Route, SideEffect, SystemOne, TierJudgment, Tool, ToolMetadata,
-    ToolRegistry, TreeExecutor, TreeRunResult, TurnOutcome, TurnTrace, Usage, VerificationVerdict,
-    validate_plan,
+    ToolRegistry, TreeExecutor, TreeRunResult, TurnOutcome, TurnTrace, TypeSafeConfig, Usage,
+    VerificationVerdict, validate_plan,
 };
 
 fn main() -> std::process::ExitCode {
@@ -49,6 +49,7 @@ async fn run(args: Vec<String>) -> Result<(), KnutError> {
     let mut positionals: Vec<String> = Vec::new();
     let mut capabilities: Vec<String> = Vec::new();
     let mut confidence_floor: Option<f32> = None;
+    let mut backend = String::from("static");
 
     let mut iter = args.into_iter();
     let Some(command) = iter.next() else {
@@ -65,6 +66,11 @@ async fn run(args: Vec<String>) -> Result<(), KnutError> {
                     .ok_or_else(|| KnutError::SystemOne("--capability needs a value".to_owned()))?;
                 capabilities.push(value);
             }
+            "--backend" => {
+                backend = iter
+                    .next()
+                    .ok_or_else(|| KnutError::SystemOne("--backend needs a value".to_owned()))?;
+            }
             "--confidence" => {
                 let value = iter
                     .next()
@@ -77,15 +83,33 @@ async fn run(args: Vec<String>) -> Result<(), KnutError> {
         }
     }
 
+    let system_one = match backend.as_str() {
+        "static" => SystemOneBackend::Static(MockIngress),
+        "jev" => SystemOneBackend::Jev(Arc::new(JevSystemOne::new(TypeSafeConfig::from_env()?)?)),
+        other => {
+            return Err(KnutError::SystemOne(format!(
+                "unknown backend {other:?}; expected static or jev"
+            )));
+        }
+    };
+
     match command.as_str() {
         "route" => {
             let prompt = positionals.join(" ");
             if prompt.trim().is_empty() {
                 return Err(KnutError::SystemOne(usage()));
             }
-            route_once(prompt, capabilities, confidence_floor, verbose, as_json).await
+            route_once(
+                prompt,
+                capabilities,
+                confidence_floor,
+                verbose,
+                as_json,
+                system_one,
+            )
+            .await
         }
-        "repl" => repl(capabilities, confidence_floor, verbose).await,
+        "repl" => repl(capabilities, confidence_floor, verbose, system_one).await,
         "demo-tree" => demo_tree(verbose).await,
         "eval" => eval().await,
         "--help" | "-h" | "help" => {
@@ -108,14 +132,16 @@ USAGE:
   knut demo-tree [--verbose]
   knut eval
 
-System One backends:
+System One backends (--backend):
   static (default)   deterministic mock, fully offline
-  jev                not yet implemented; see issue #2"
+  jev                live TypeSafe System One API; reads TYPESAFE_API_KEY,
+                     optional TYPESAFE_BASE_URL / TYPESAFE_MODEL"
         .to_owned()
 }
 
 /// Mock System One: full fan-out judgments derived from obvious prompt
 /// shape. One call, complete answer set — like the real thing, offline.
+#[derive(Clone, Copy)]
 struct MockIngress;
 
 fn judgments_for(prompt: &str, capabilities: &[String]) -> IngressJudgments {
@@ -230,12 +256,30 @@ fn playground_registry() -> ToolRegistry {
     registry
 }
 
-async fn route_once(
+/// Selected System One backend for the playground.
+#[derive(Clone)]
+enum SystemOneBackend {
+    Static(MockIngress),
+    Jev(Arc<JevSystemOne>),
+}
+
+#[async_trait]
+impl SystemOne for SystemOneBackend {
+    async fn decide(&self, input: &DecisionInput) -> Result<Decision, KnutError> {
+        match self {
+            SystemOneBackend::Static(mock) => mock.decide(input).await,
+            SystemOneBackend::Jev(jev) => jev.decide(input).await,
+        }
+    }
+}
+
+async fn route_once<S: SystemOne>(
     prompt: String,
     capabilities: Vec<String>,
     confidence_floor: Option<f32>,
     verbose: bool,
     as_json: bool,
+    system_one: S,
 ) -> Result<(), KnutError> {
     let registry = playground_registry();
     let mut available = registry.capabilities();
@@ -243,7 +287,7 @@ async fn route_once(
     available.sort();
     available.dedup();
 
-    let mut runtime = Knut::new(MockIngress);
+    let mut runtime = Knut::new(system_one);
     if let Some(floor) = confidence_floor {
         runtime = runtime.with_confidence_floor(floor);
     }
@@ -295,10 +339,11 @@ async fn route_once(
     Ok(())
 }
 
-async fn repl(
+async fn repl<S: SystemOne + Clone>(
     capabilities: Vec<String>,
     confidence_floor: Option<f32>,
     verbose: bool,
+    system_one: S,
 ) -> Result<(), KnutError> {
     println!("knut repl — one prompt per line, empty line quits");
     let stdin = std::io::stdin();
@@ -319,6 +364,7 @@ async fn repl(
             confidence_floor,
             verbose,
             false,
+            system_one.clone(),
         )
         .await?;
     }

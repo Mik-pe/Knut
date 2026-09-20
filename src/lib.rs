@@ -11,6 +11,7 @@ mod system_one;
 mod system_zero;
 mod tool;
 mod tree;
+mod typesafe;
 
 pub use decision::{Action, Decision, DecisionInput, ModelTier, RetrievalSource, Risk, Route};
 pub use edge::{
@@ -44,4 +45,8 @@ pub use tool::{SideEffect, Tool, ToolMetadata, ToolRegistry};
 pub use tree::{
     AskUserHandler, CancelFlag, NodeStatus, PlanError, PlanNode, TreeExecutor, TreeRunResult,
     validate_plan,
+};
+pub use typesafe::{
+    Answer, DEFAULT_BASE_URL, DEFAULT_MODEL, DEFAULT_TIMEOUT, JevSystemOne, Question,
+    SystemOneRequest, SystemOneResponse, TypeSafeConfig,
 };
