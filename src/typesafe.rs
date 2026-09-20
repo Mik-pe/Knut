@@ -1,13 +1,15 @@
-//! TypeSafe System One HTTP adapter (Jev), issue #2.
+//! TypeSafe System One HTTP adapter (Jev).
 //!
-//! Wire contract (TypeSafe docs / SDK reference):
+//! Wire contract (https://docs.typesafe.ai/api, checked 2026-09-20):
 //! `POST {base}/v1/systemone` with `Authorization: Bearer <key>`, body
 //! `{ model, state, questions }`. Questions are one of three primitives:
 //! `noul` (yes/no probability), `choice` (criteria map -> choice +
-//! probabilities + confidence), `score` (levels -> fractional score +
-//! probabilities + confidence). Answers come back keyed by question
-//! name. Errors: 401 auth, 422 validation, 429 rate limit, 529
-//! overloaded. No hidden retries; every failure surfaces.
+//! probabilities + confidence), `score` (criteria array -> fractional
+//! score + legend + probabilities + confidence). The response envelope is
+//! `{ model, answers: {question_id: answer}, usage }`; every answer
+//! carries a `type` matching its question. Errors: 401 auth, 422
+//! validation, 429 rate limit, 529 overloaded. No hidden retries; every
+//! failure surfaces as a typed [`SystemOneFailure`].
 //!
 //! Jev-specific wire details stay in this module: the rest of Knut sees
 //! a `SystemOne` / `JudgmentRouter` implementation.
@@ -22,47 +24,69 @@ use serde_json::Value;
 
 use crate::{
     Complexity, Decision, DecisionInput, Handler, IngressJudgments, Judgment, JudgmentRouter,
-    KnutError, RetrievalJudgment, Risk, TierJudgment, YesNo,
+    KnutError, RetrievalJudgment, Risk, SystemOneFailure, TierJudgment, YesNo,
 };
 
 pub const DEFAULT_BASE_URL: &str = "https://api.typesafe.ai";
 pub const DEFAULT_MODEL: &str = "jev-latest";
 /// Bounded timeout: one routing call must never hang the runtime.
 pub const DEFAULT_TIMEOUT: Duration = Duration::from_secs(10);
+/// Bounded request bodies (questions + state) so a runaway frame cannot
+/// exceed the documented 64k-token request budget unchecked.
+pub const MAX_REQUEST_BODY_BYTES: usize = 256 * 1024;
+/// Bounded response body so a hostile or broken endpoint cannot exhaust
+/// memory before parsing.
+pub const MAX_RESPONSE_BODY_BYTES: usize = 1024 * 1024;
+/// Documented wire limits (https://docs.typesafe.ai/api).
+pub const MAX_CHOICE_OPTIONS: usize = 255;
+pub const MAX_SCORE_LEVELS: usize = 10;
+/// Tolerance when validating that a probability distribution sums to 1.
+/// Floats on the wire are not exact; anything outside this band is a
+/// protocol violation, not a rounding artifact.
+pub const PROBABILITY_SUM_TOLERANCE: f64 = 1e-3;
 
-/// Noul answers may omit confidence; the SDK convention derives
-/// `max(noul, 1 - noul)`, which never drops below 0.5.
-fn noul_confidence(noul: f64) -> f32 {
+/// Noul answers carry no confidence on the wire; the SDK convention
+/// derives `max(noul, 1 - noul)`, which never drops below 0.5. This is a
+/// separately named derived statistic, not an API-provided value.
+fn derived_noul_confidence(noul: f64) -> f32 {
     noul.max(1.0 - noul) as f32
 }
 
+fn is_finite_in_range(value: f64, low: f64, high: f64) -> bool {
+    value.is_finite() && value >= low && value <= high
+}
+
 /// The three question primitives on the wire.
+///
+/// `instructions` is required by the API; `criteria` is the documented
+/// field for both Choice (option -> rubric map) and Score (ordered level
+/// array). Noul's optional `criteria` ({true, false}) is supported.
 #[derive(Debug, Clone, PartialEq, Serialize)]
 #[serde(tag = "type", rename_all = "snake_case")]
 pub enum Question {
     /// Yes/no judgment; answer is a probability of true.
     Noul {
+        instructions: String,
         #[serde(skip_serializing_if = "Option::is_none")]
-        instructions: Option<String>,
+        criteria: Option<BTreeMap<String, String>>,
     },
     /// Pick one of 2–255 options; `criteria` maps option key -> description.
     Choice {
-        #[serde(skip_serializing_if = "Option::is_none")]
-        instructions: Option<String>,
+        instructions: String,
         criteria: BTreeMap<String, String>,
     },
     /// Ordered rubric of 2–10 levels, low to high.
     Score {
-        #[serde(skip_serializing_if = "Option::is_none")]
-        instructions: Option<String>,
-        levels: Vec<String>,
+        instructions: String,
+        criteria: Vec<String>,
     },
 }
 
 impl Question {
     pub fn noul(instructions: impl Into<String>) -> Question {
         Question::Noul {
-            instructions: Some(instructions.into()),
+            instructions: instructions.into(),
+            criteria: None,
         }
     }
 
@@ -71,7 +95,7 @@ impl Question {
         criteria: impl IntoIterator<Item = (impl Into<String>, impl Into<String>)>,
     ) -> Question {
         Question::Choice {
-            instructions: Some(instructions.into()),
+            instructions: instructions.into(),
             criteria: criteria
                 .into_iter()
                 .map(|(k, v)| (k.into(), v.into()))
@@ -81,62 +105,340 @@ impl Question {
 
     pub fn score(instructions: impl Into<String>, levels: Vec<&str>) -> Question {
         Question::Score {
-            instructions: Some(instructions.into()),
-            levels: levels.into_iter().map(str::to_owned).collect(),
+            instructions: instructions.into(),
+            criteria: levels.into_iter().map(str::to_owned).collect(),
         }
+    }
+
+    /// Validate against the documented wire limits before sending.
+    pub fn validate(&self) -> Result<(), KnutError> {
+        match self {
+            Question::Noul { instructions, .. } => {
+                if instructions.trim().is_empty() {
+                    return Err(KnutError::SystemOne(
+                        "noul question requires non-empty instructions".to_owned(),
+                    ));
+                }
+            }
+            Question::Choice {
+                instructions,
+                criteria,
+            } => {
+                if instructions.trim().is_empty() {
+                    return Err(KnutError::SystemOne(
+                        "choice question requires non-empty instructions".to_owned(),
+                    ));
+                }
+                if criteria.len() < 2 {
+                    return Err(KnutError::SystemOne(format!(
+                        "choice question needs 2..={MAX_CHOICE_OPTIONS} options, got {}",
+                        criteria.len()
+                    )));
+                }
+                if criteria.len() > MAX_CHOICE_OPTIONS {
+                    return Err(KnutError::SystemOne(format!(
+                        "choice question has {} options, max is {MAX_CHOICE_OPTIONS}",
+                        criteria.len()
+                    )));
+                }
+            }
+            Question::Score {
+                instructions,
+                criteria,
+            } => {
+                if instructions.trim().is_empty() {
+                    return Err(KnutError::SystemOne(
+                        "score question requires non-empty instructions".to_owned(),
+                    ));
+                }
+                if criteria.len() < 2 {
+                    return Err(KnutError::SystemOne(format!(
+                        "score question needs 2..={MAX_SCORE_LEVELS} levels, got {}",
+                        criteria.len()
+                    )));
+                }
+                if criteria.len() > MAX_SCORE_LEVELS {
+                    return Err(KnutError::SystemOne(format!(
+                        "score question has {} levels, max is {MAX_SCORE_LEVELS}",
+                        criteria.len()
+                    )));
+                }
+            }
+        }
+        Ok(())
     }
 }
 
-/// One answer on the wire. Tagged per primitive; unknown shapes fail the
-/// parse loudly rather than decoding to a default.
-#[derive(Debug, Clone, PartialEq, Deserialize)]
-pub struct Answer {
-    #[serde(default)]
-    pub noul: Option<f64>,
-    #[serde(default)]
-    pub choice: Option<String>,
-    #[serde(default)]
-    pub score: Option<f64>,
-    /// Probability per option/level; sums to 1 on the wire.
-    #[serde(default)]
-    pub probabilities: Option<BTreeMap<String, f64>>,
-    #[serde(default)]
-    pub confidence: Option<f64>,
-    #[serde(default)]
-    pub legend: Option<Value>,
+/// One typed answer on the wire. Every answer carries a `type` matching
+/// its question; contradictory shapes fail validation loudly rather than
+/// decoding to a default route.
+#[derive(Debug, Clone, PartialEq)]
+pub enum Answer {
+    Noul {
+        noul: f64,
+    },
+    Choice {
+        choice: String,
+        probabilities: BTreeMap<String, f64>,
+        confidence: f64,
+    },
+    Score {
+        score: f64,
+        legend: BTreeMap<String, String>,
+        probabilities: BTreeMap<String, f64>,
+        confidence: f64,
+    },
 }
 
 impl Answer {
-    /// The bounded-confidence reading the runtime gates on.
-    ///
-    /// Choice/Score use the API's confidence; Noul derives
-    /// `max(noul, 1 - noul)` (TypeSafe sends no separate Noul confidence).
-    pub fn confidence(&self) -> Result<f32, KnutError> {
-        if let Some(confidence) = self.confidence {
-            return Ok(confidence as f32);
+    /// Validate the answer against the question that produced it.
+    pub fn validate(&self, question: &Question) -> Result<(), KnutError> {
+        let mismatch = |expected: &str| {
+            KnutError::SystemOne(format!("answer type {expected:?} does not match question"))
+        };
+
+        let validate_distribution = |probabilities: &BTreeMap<String, f64>,
+                                     keys: &[String],
+                                     what: &str|
+         -> Result<(), KnutError> {
+            if probabilities.len() != keys.len() {
+                return Err(KnutError::SystemOne(format!(
+                    "{what} distribution has {} entries, expected {}",
+                    probabilities.len(),
+                    keys.len()
+                )));
+            }
+            for key in keys {
+                let Some(p) = probabilities.get(key) else {
+                    return Err(KnutError::SystemOne(format!(
+                        "{what} distribution is missing key {key:?}"
+                    )));
+                };
+                if !is_finite_in_range(*p, 0.0, 1.0) {
+                    return Err(KnutError::SystemOne(format!(
+                        "{what} probability for {key:?} is not in [0, 1]: {p}"
+                    )));
+                }
+            }
+            let sum: f64 = probabilities.values().sum();
+            if (sum - 1.0).abs() > PROBABILITY_SUM_TOLERANCE {
+                return Err(KnutError::SystemOne(format!(
+                    "{what} probabilities sum to {sum}, expected 1 +/- {PROBABILITY_SUM_TOLERANCE}"
+                )));
+            }
+            Ok(())
+        };
+
+        match (self, question) {
+            (Answer::Noul { noul }, Question::Noul { .. }) => {
+                if !is_finite_in_range(*noul, 0.0, 1.0) {
+                    return Err(KnutError::SystemOne(format!(
+                        "noul probability {noul} is not in [0, 1]"
+                    )));
+                }
+            }
+            (
+                Answer::Choice {
+                    choice,
+                    probabilities,
+                    confidence,
+                },
+                Question::Choice { criteria, .. },
+            ) => {
+                if !criteria.contains_key(choice) {
+                    return Err(KnutError::SystemOne(format!(
+                        "choice answer {choice:?} is not a submitted option"
+                    )));
+                }
+                if !is_finite_in_range(*confidence, 0.0, 1.0) {
+                    return Err(KnutError::SystemOne(format!(
+                        "choice confidence {confidence} is not in [0, 1]"
+                    )));
+                }
+                let keys: Vec<String> = criteria.keys().cloned().collect();
+                validate_distribution(probabilities, &keys, "choice")?;
+            }
+            (
+                Answer::Score {
+                    score,
+                    legend,
+                    probabilities,
+                    confidence,
+                },
+                Question::Score { criteria, .. },
+            ) => {
+                let max = (criteria.len() - 1) as f64;
+                if !is_finite_in_range(*score, 0.0, max) {
+                    return Err(KnutError::SystemOne(format!(
+                        "score {score} is outside the rubric range 0..={max}"
+                    )));
+                }
+                if !is_finite_in_range(*confidence, 0.0, 1.0) {
+                    return Err(KnutError::SystemOne(format!(
+                        "score confidence {confidence} is not in [0, 1]"
+                    )));
+                }
+                let expected_keys: Vec<String> =
+                    (0..criteria.len()).map(|i| i.to_string()).collect();
+                if legend.len() != criteria.len() {
+                    return Err(KnutError::SystemOne(format!(
+                        "score legend has {} levels, expected {}",
+                        legend.len(),
+                        criteria.len()
+                    )));
+                }
+                for (i, expected) in criteria.iter().enumerate() {
+                    match legend.get(&i.to_string()) {
+                        Some(actual) if actual == expected => {}
+                        Some(actual) => {
+                            return Err(KnutError::SystemOne(format!(
+                                "score legend level {i} is {actual:?}, expected {expected:?}"
+                            )));
+                        }
+                        None => {
+                            return Err(KnutError::SystemOne(format!(
+                                "score legend is missing level {i}"
+                            )));
+                        }
+                    }
+                }
+                validate_distribution(probabilities, &expected_keys, "score")?;
+            }
+            (Answer::Noul { .. }, _) => return Err(mismatch("noul")),
+            (Answer::Choice { .. }, _) => return Err(mismatch("choice")),
+            (Answer::Score { .. }, _) => return Err(mismatch("score")),
         }
-        self.noul.map(noul_confidence).ok_or_else(|| {
-            KnutError::SystemOne("answer has neither confidence nor noul".to_owned())
-        })
+        Ok(())
+    }
+
+    /// The API-provided confidence for Choice/Score answers.
+    ///
+    /// Noul answers carry no API confidence; `derived_noul_confidence`
+    /// computes the separately named SDK-convention statistic
+    /// `max(noul, 1 - noul)`. That statistic is a routing heuristic, not
+    /// a model-reported certainty and not a task-correctness probability.
+    pub fn confidence(&self) -> Result<f32, KnutError> {
+        match self {
+            Answer::Noul { noul } => Ok(derived_noul_confidence(*noul)),
+            Answer::Choice { confidence, .. } | Answer::Score { confidence, .. } => {
+                Ok(*confidence as f32)
+            }
+        }
     }
 
     pub fn as_bool(&self) -> Result<bool, KnutError> {
-        let noul = self
-            .noul
-            .ok_or_else(|| KnutError::SystemOne("expected noul answer".to_owned()))?;
-        Ok(noul >= 0.5)
+        match self {
+            Answer::Noul { noul } => Ok(*noul >= 0.5),
+            _ => Err(KnutError::SystemOne("expected noul answer".to_owned())),
+        }
     }
 
     pub fn as_choice(&self) -> Result<String, KnutError> {
-        self.choice
-            .clone()
-            .ok_or_else(|| KnutError::SystemOne("expected choice answer".to_owned()))
+        match self {
+            Answer::Choice { choice, .. } => Ok(choice.clone()),
+            _ => Err(KnutError::SystemOne("expected choice answer".to_owned())),
+        }
     }
 
     pub fn as_score(&self) -> Result<f64, KnutError> {
-        self.score
-            .ok_or_else(|| KnutError::SystemOne("expected score answer".to_owned()))
+        match self {
+            Answer::Score { score, .. } => Ok(*score),
+            _ => Err(KnutError::SystemOne("expected score answer".to_owned())),
+        }
     }
+}
+
+impl<'de> Deserialize<'de> for Answer {
+    fn deserialize<D: serde::Deserializer<'de>>(deserializer: D) -> Result<Self, D::Error> {
+        /// Wire shape: `{type, ...}` with type-specific required fields.
+        #[derive(Deserialize)]
+        struct WireAnswer {
+            #[serde(rename = "type")]
+            answer_type: String,
+            #[serde(default)]
+            noul: Option<f64>,
+            #[serde(default)]
+            choice: Option<String>,
+            #[serde(default)]
+            score: Option<f64>,
+            #[serde(default)]
+            legend: Option<BTreeMap<String, String>>,
+            #[serde(default)]
+            probabilities: Option<BTreeMap<String, f64>>,
+            #[serde(default)]
+            confidence: Option<f64>,
+        }
+
+        let wire = WireAnswer::deserialize(deserializer)?;
+
+        let unexpected = |field: &str, answer_type: &str| {
+            Err(serde::de::Error::custom(format!(
+                "{answer_type} answer must not carry a {field} field"
+            )))
+        };
+
+        match wire.answer_type.as_str() {
+            "noul" => {
+                let Some(noul) = wire.noul else {
+                    return Err(serde::de::Error::custom(
+                        "noul answer requires a noul field",
+                    ));
+                };
+                if wire.choice.is_some() || wire.score.is_some() {
+                    return unexpected("choice/score", "noul");
+                }
+                if !noul.is_finite() {
+                    return Err(serde::de::Error::custom("noul value is not finite"));
+                }
+                Ok(Answer::Noul { noul })
+            }
+            "choice" => {
+                let (Some(choice), Some(probabilities), Some(confidence)) =
+                    (wire.choice, wire.probabilities, wire.confidence)
+                else {
+                    return Err(serde::de::Error::custom(
+                        "choice answer requires choice, probabilities and confidence",
+                    ));
+                };
+                if wire.noul.is_some() || wire.score.is_some() || wire.legend.is_some() {
+                    return unexpected("noul/score/legend", "choice");
+                }
+                Ok(Answer::Choice {
+                    choice,
+                    probabilities,
+                    confidence,
+                })
+            }
+            "score" => {
+                let (Some(score), Some(legend), Some(probabilities), Some(confidence)) =
+                    (wire.score, wire.legend, wire.probabilities, wire.confidence)
+                else {
+                    return Err(serde::de::Error::custom(
+                        "score answer requires score, legend, probabilities and confidence",
+                    ));
+                };
+                if wire.noul.is_some() || wire.choice.is_some() {
+                    return unexpected("noul/choice", "score");
+                }
+                Ok(Answer::Score {
+                    score,
+                    legend,
+                    probabilities,
+                    confidence,
+                })
+            }
+            other => Err(serde::de::Error::custom(format!(
+                "unknown answer type {other:?}"
+            ))),
+        }
+    }
+}
+
+/// Token usage reported by the API.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+pub struct Usage {
+    pub input_tokens: u64,
+    pub output_tokens: u64,
 }
 
 /// Request body for `POST /v1/systemone`.
@@ -147,63 +449,105 @@ pub struct SystemOneRequest {
     pub questions: BTreeMap<String, Question>,
 }
 
-/// Response envelope for `POST /v1/systemone`.
-///
-/// The wire format flattens answers at the top level next to envelope
-/// metadata (`{"is_urgent": {...}, "department": {...}, "model":
-/// "jev-1.13.0"}`), so deserialization partitions every field: a value
-/// that parses as a typed answer (and carries a noul/choice/score) is an
-/// answer; everything else is preserved in `extra` for tracing.
+impl SystemOneRequest {
+    /// Validate questions and enforce a bounded serialized size.
+    pub fn validate(&self) -> Result<(), KnutError> {
+        if self.model.trim().is_empty() {
+            return Err(KnutError::SystemOne("model must not be empty".to_owned()));
+        }
+        if self.questions.is_empty() {
+            return Err(KnutError::SystemOne(
+                "at least one question is required".to_owned(),
+            ));
+        }
+        for (id, question) in &self.questions {
+            if id.trim().is_empty() {
+                return Err(KnutError::SystemOne(
+                    "question ids must not be empty".to_owned(),
+                ));
+            }
+            question.validate()?;
+        }
+        let size = serde_json::to_vec(self)
+            .map_err(|e| KnutError::SystemOne(format!("serialize request: {e}")))?
+            .len();
+        if size > MAX_REQUEST_BODY_BYTES {
+            return Err(KnutError::SystemOne(format!(
+                "request body is {size} bytes, max is {MAX_REQUEST_BODY_BYTES}"
+            )));
+        }
+        Ok(())
+    }
+}
+
+/// Response envelope for `POST /v1/systemone`:
+/// `{model, answers: {question_id: answer}, usage}`.
 #[derive(Debug, Clone, PartialEq)]
 pub struct SystemOneResponse {
+    /// The versioned model ID that answered, for logging and pinning.
+    pub resolved_model: String,
     pub answers: BTreeMap<String, Answer>,
-    /// Envelope metadata (resolved model, request id, usage, ...).
-    pub extra: BTreeMap<String, Value>,
-    /// `model` field from the envelope, when present.
-    pub resolved_model: Option<String>,
+    pub usage: Usage,
 }
 
 impl<'de> Deserialize<'de> for SystemOneResponse {
     fn deserialize<D: serde::Deserializer<'de>>(deserializer: D) -> Result<Self, D::Error> {
-        let fields = BTreeMap::<String, Value>::deserialize(deserializer)?;
-
-        let mut answers = BTreeMap::new();
-        let mut extra = BTreeMap::new();
-        let mut resolved_model = None;
-
-        for (key, value) in fields {
-            let parsed = serde_json::from_value::<Answer>(value.clone())
-                .ok()
-                .filter(|a| a.noul.is_some() || a.choice.is_some() || a.score.is_some());
-
-            match parsed {
-                Some(answer) => {
-                    answers.insert(key, answer);
-                }
-                None => {
-                    if key == "model" {
-                        resolved_model = value.as_str().map(str::to_owned);
-                    }
-                    extra.insert(key, value);
-                }
-            }
+        /// Wire envelope. `answers` and `usage` are required by the
+        /// documented contract; unknown extra fields are tolerated but
+        /// never interpreted.
+        #[derive(Deserialize)]
+        struct WireEnvelope {
+            model: String,
+            answers: BTreeMap<String, Answer>,
+            usage: Usage,
         }
 
+        let wire = WireEnvelope::deserialize(deserializer)?;
         Ok(SystemOneResponse {
-            answers,
-            extra,
-            resolved_model,
+            resolved_model: wire.model,
+            answers: wire.answers,
+            usage: wire.usage,
         })
     }
 }
 
 impl SystemOneResponse {
-    /// Collect the answers into a typed [`IngressJudgments`].
+    /// Validate every answer against the questions that were submitted.
+    ///
+    /// Missing answers, type mismatches, unknown option keys, out-of-range
+    /// numbers and invalid distributions are typed errors — never default
+    /// routes.
+    pub fn validate_against(
+        &self,
+        questions: &BTreeMap<String, Question>,
+    ) -> Result<(), KnutError> {
+        for (id, question) in questions {
+            let Some(answer) = self.answers.get(id) else {
+                return Err(KnutError::SystemOne(format!(
+                    "response is missing an answer for question {id:?}"
+                )));
+            };
+            answer.validate(question)?;
+        }
+        for id in self.answers.keys() {
+            if !questions.contains_key(id) {
+                return Err(KnutError::SystemOne(format!(
+                    "response contains an answer for unknown question {id:?}"
+                )));
+            }
+        }
+        Ok(())
+    }
+
+    /// Collect the answers into a typed [`IngressJudgments`] after
+    /// validating them against the submitted ingress questions.
     ///
     /// The seven ingress questions and their option keys are Knut's
     /// contract with itself; every option key is fixed here so the wire
     /// mapping is testable against recorded fixtures.
     pub fn to_ingress_judgments(&self) -> Result<IngressJudgments, KnutError> {
+        self.validate_against(&JevSystemOne::ingress_questions())?;
+
         let answers = &self.answers;
 
         let get = |key: &str| {
@@ -213,8 +557,7 @@ impl SystemOneResponse {
         };
 
         let handler = get("handler")?;
-        let handler_choice = handler.as_choice()?;
-        let handler_choice = match handler_choice.as_str() {
+        let handler_choice = match handler.as_choice()?.as_str() {
             "clarify" => Handler::Clarify,
             "retrieve" => Handler::Retrieve,
             "act" => Handler::Act,
@@ -323,17 +666,41 @@ impl SystemOneResponse {
     }
 }
 
-/// Configuration for the HTTP adapter.
+/// A secret-safe view of [`TypeSafeConfig`] for display and errors.
 #[derive(Debug, Clone)]
+pub struct TypeSafeConfigSummary {
+    pub base_url: String,
+    pub model: String,
+    pub timeout: Duration,
+    /// True when the key came from the process environment rather than
+    /// explicit configuration; shown instead of the key itself.
+    pub api_key_source: &'static str,
+}
+
+/// Configuration for the HTTP adapter. Debug output never reveals the key.
+#[derive(Clone)]
 pub struct TypeSafeConfig {
-    /// API key; never logged, never serialized.
+    /// API key; never logged, never serialized, never shown in Debug.
     pub api_key: String,
     /// Defaults to `https://api.typesafe.ai` (no trailing slash).
     pub base_url: String,
-    /// Defaults to `jev-latest`.
+    /// Defaults to `jev-latest`. A pinned versioned ID (for example
+    /// `jev-1.13.0`) is accepted even though `GET /v1/models` lists only
+    /// aliases; the response's resolved `model` records what answered.
     pub model: String,
     /// Bounded request timeout; defaults to 10s.
     pub timeout: Duration,
+}
+
+impl std::fmt::Debug for TypeSafeConfig {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.debug_struct("TypeSafeConfig")
+            .field("api_key", &"[redacted]")
+            .field("base_url", &self.base_url)
+            .field("model", &self.model)
+            .field("timeout", &self.timeout)
+            .finish()
+    }
 }
 
 impl TypeSafeConfig {
@@ -368,13 +735,24 @@ impl TypeSafeConfig {
             timeout: DEFAULT_TIMEOUT,
         })
     }
+
+    /// Secret-free summary for logs, errors and doctor output.
+    pub fn summary(&self) -> TypeSafeConfigSummary {
+        TypeSafeConfigSummary {
+            base_url: self.base_url.clone(),
+            model: self.model.clone(),
+            timeout: self.timeout,
+            api_key_source: "configured",
+        }
+    }
 }
 
 /// The `SystemOne` backend against TypeSafe's System One API.
 ///
 /// One HTTP call per routing decision; all ingress questions ride in the
-/// same request (speculative fan-out). No retries: 429/529 surface as
-/// errors so callers decide their own backoff policy.
+/// same request (speculative fan-out). No retries: failures surface as
+/// typed [`SystemOneFailure`]s so callers choose their own bounded
+/// backoff policy. The live backend never silently falls back to a mock.
 pub struct JevSystemOne {
     http: reqwest::Client,
     config: TypeSafeConfig,
@@ -384,6 +762,9 @@ impl JevSystemOne {
     pub fn new(config: TypeSafeConfig) -> Result<Self, KnutError> {
         let http = reqwest::Client::builder()
             .timeout(config.timeout)
+            // Credentials must never be forwarded to a different origin
+            // on a redirect.
+            .redirect(reqwest::redirect::Policy::none())
             .build()
             .map_err(|e| KnutError::SystemOne(format!("http client: {e}")))?;
 
@@ -491,6 +872,8 @@ impl JevSystemOne {
     }
 
     async fn post(&self, request: &SystemOneRequest) -> Result<SystemOneResponse, KnutError> {
+        request.validate()?;
+
         let response = self
             .http
             .post(self.endpoint())
@@ -499,34 +882,62 @@ impl JevSystemOne {
             .send()
             .await
             .map_err(|e| {
-                // Timeouts and connection failures surface as-is; no retry.
-                KnutError::SystemOne(format!("system one transport: {e}"))
+                // Timeouts and connection failures surface as transient;
+                // no retry is performed here.
+                KnutError::SystemOneCall {
+                    failure: SystemOneFailure::Transient,
+                    message: format!("transport: {e}"),
+                }
             })?;
 
         let status = response.status();
         if !status.is_success() {
+            // 3xx is an error under the no-redirect policy: credentials
+            // must not follow a redirect to another origin.
+            let failure = match status {
+                StatusCode::UNAUTHORIZED => SystemOneFailure::Auth,
+                StatusCode::UNPROCESSABLE_ENTITY => SystemOneFailure::Validation,
+                StatusCode::TOO_MANY_REQUESTS => SystemOneFailure::RateLimit,
+                s if s.as_u16() == 529 => SystemOneFailure::Overloaded,
+                _ if status.is_redirection() => SystemOneFailure::Protocol,
+                s if s.is_server_error() => SystemOneFailure::Transient,
+                _ => SystemOneFailure::Protocol,
+            };
+
             // Body text may echo request content; keep it short and strip
             // anything resembling the key just in case.
             let body = response.text().await.unwrap_or_default();
             let snippet: String = body.chars().take(200).collect();
             let snippet = snippet.replace(&self.config.api_key, "[redacted]");
 
-            let kind = match status {
-                StatusCode::UNAUTHORIZED => "auth",
-                StatusCode::UNPROCESSABLE_ENTITY => "validation",
-                StatusCode::TOO_MANY_REQUESTS => "rate limit",
-                s if s.as_u16() == 529 => "overloaded",
-                _ => "http",
-            };
-            return Err(KnutError::SystemOne(format!(
-                "system one {kind} error ({status}): {snippet}"
-            )));
+            return Err(KnutError::SystemOneCall {
+                failure,
+                message: format!("http {status}: {snippet}"),
+            });
         }
 
-        response
-            .json::<SystemOneResponse>()
+        // Bound the response body before parsing.
+        let bytes = response
+            .bytes()
             .await
-            .map_err(|e| KnutError::SystemOne(format!("system one protocol: {e}")))
+            .map_err(|e| KnutError::SystemOneCall {
+                failure: SystemOneFailure::Transient,
+                message: format!("read body: {e}"),
+            })?;
+        if bytes.len() > MAX_RESPONSE_BODY_BYTES {
+            return Err(KnutError::SystemOneCall {
+                failure: SystemOneFailure::Protocol,
+                message: format!(
+                    "response body is {} bytes, max is {MAX_RESPONSE_BODY_BYTES}",
+                    bytes.len()
+                ),
+            });
+        }
+
+        serde_json::from_slice::<SystemOneResponse>(&bytes).map_err(|e| KnutError::SystemOneCall {
+            failure: SystemOneFailure::Protocol,
+            message: format!("envelope: {e}"),
+        })
     }
 }
 
@@ -556,42 +967,54 @@ impl crate::SystemOne for JevSystemOne {
 mod tests {
     use super::*;
 
+    /// Fixture copied independently from the documented response example
+    /// shape: `{model, answers, usage}` with typed answers.
     fn response_json() -> &'static str {
-        // Recorded fixture shape: answers keyed by name, plus envelope
-        // metadata flattened at the top level.
         r#"{
-            "handler": {
-                "choice": "retrieve",
-                "probabilities": {
-                    "clarify": 0.05, "retrieve": 0.82, "act": 0.03, "generate": 0.10
-                },
-                "confidence": 0.82
-            },
-            "complexity": {
-                "score": 1.6,
-                "probabilities": {"0": 0.05, "1": 0.60, "2": 0.30, "3": 0.05},
-                "confidence": 0.77,
-                "legend": ["trivial", "routine", "multi-step", "deep"]
-            },
-            "retrieval": {
-                "choice": "files",
-                "probabilities": {"none": 0.04, "files": 0.91, "memory": 0.02, "web": 0.01, "mixed": 0.02},
-                "confidence": 0.91
-            },
-            "missing_user_info": { "noul": 0.12 },
-            "parallelizable": { "noul": 0.85, "confidence": 0.80 },
-            "risk": {
-                "choice": "low",
-                "probabilities": {"low": 0.93, "medium": 0.05, "high": 0.02},
-                "confidence": 0.93
-            },
-            "model_tier": {
-                "choice": "fast",
-                "probabilities": {"fast": 0.88, "standard": 0.09, "reasoner": 0.03},
-                "confidence": 0.88
-            },
             "model": "jev-1.13.0",
-            "request_id": "req_abc123"
+            "answers": {
+                "handler": {
+                    "type": "choice",
+                    "choice": "retrieve",
+                    "probabilities": {
+                        "clarify": 0.05, "retrieve": 0.82, "act": 0.03, "generate": 0.10
+                    },
+                    "confidence": 0.82
+                },
+                "complexity": {
+                    "type": "score",
+                    "score": 1.6,
+                    "legend": {
+                        "0": "A trivial one-liner with no judgment",
+                        "1": "Routine work with a standard shape",
+                        "2": "Multiple steps that must be coordinated",
+                        "3": "Deep work needing careful reasoning"
+                    },
+                    "probabilities": {"0": 0.05, "1": 0.60, "2": 0.30, "3": 0.05},
+                    "confidence": 0.77
+                },
+                "retrieval": {
+                    "type": "choice",
+                    "choice": "files",
+                    "probabilities": {"none": 0.04, "files": 0.91, "memory": 0.02, "web": 0.01, "mixed": 0.02},
+                    "confidence": 0.91
+                },
+                "missing_user_info": {"type": "noul", "noul": 0.12},
+                "parallelizable": {"type": "noul", "noul": 0.85},
+                "risk": {
+                    "type": "choice",
+                    "choice": "low",
+                    "probabilities": {"low": 0.93, "medium": 0.05, "high": 0.02},
+                    "confidence": 0.93
+                },
+                "model_tier": {
+                    "type": "choice",
+                    "choice": "fast",
+                    "probabilities": {"fast": 0.88, "standard": 0.09, "reasoner": 0.03},
+                    "confidence": 0.88
+                }
+            },
+            "usage": {"input_tokens": 296, "output_tokens": 20}
         }"#
     }
 
@@ -600,23 +1023,38 @@ mod tests {
     }
 
     #[test]
-    fn response_fixture_parses_with_metadata_preserved() {
+    fn documented_envelope_fixture_parses() {
         let response = parse();
 
-        assert_eq!(response.answers.len(), 7);
-        // Flattened envelope metadata survives for tracing.
+        assert_eq!(response.resolved_model, "jev-1.13.0");
         assert_eq!(
-            response.extra.get("model").and_then(|v| v.as_str()),
-            Some("jev-1.13.0")
+            response.usage,
+            Usage {
+                input_tokens: 296,
+                output_tokens: 20
+            }
         );
-        assert!(response.extra.contains_key("request_id"));
+        assert_eq!(response.answers.len(), 7);
     }
 
     #[test]
-    fn noul_confidence_derivation() {
-        assert!((noul_confidence(0.97) - 0.97).abs() < 1e-9);
-        assert!((noul_confidence(0.03) - 0.97).abs() < 1e-9);
-        assert!((noul_confidence(0.5) - 0.5).abs() < 1e-9);
+    fn the_flattened_legacy_shape_is_rejected() {
+        // The old adapter searched for answer objects at the top level;
+        // the documented envelope is {model, answers, usage}. A response
+        // without the answers map is a protocol error, not an empty one.
+        let result = serde_json::from_str::<SystemOneResponse>(
+            r#"{"handler": {"type": "choice", "choice": "act",
+                "probabilities": {"act": 1.0}, "confidence": 0.9},
+                "model": "jev-1.13.0"}"#,
+        );
+        assert!(result.is_err());
+    }
+
+    #[test]
+    fn noul_confidence_is_a_derived_statistic() {
+        assert!((derived_noul_confidence(0.97) - 0.97).abs() < 1e-9);
+        assert!((derived_noul_confidence(0.03) - 0.97).abs() < 1e-9);
+        assert!((derived_noul_confidence(0.5) - 0.5).abs() < 1e-9);
     }
 
     #[test]
@@ -629,17 +1067,21 @@ mod tests {
         assert_eq!(answers["handler"].as_choice().unwrap(), "retrieve");
         assert!((answers["complexity"].as_score().unwrap() - 1.6).abs() < 1e-9);
 
-        // Noul without explicit confidence derives max(n, 1-n).
+        // Noul without API confidence derives max(n, 1-n).
         let derived = answers["missing_user_info"].confidence().unwrap();
         assert!((derived - 0.88).abs() < 1e-6);
 
-        // Choice carries its own confidence.
+        // Choice carries its own API confidence.
         let explicit = answers["handler"].confidence().unwrap();
         assert!((explicit - 0.82).abs() < 1e-6);
+
+        // Wrong-shape readers fail loudly.
+        assert!(answers["handler"].as_bool().is_err());
+        assert!(answers["missing_user_info"].as_choice().is_err());
     }
 
     #[test]
-    fn ingress_judgments_map_from_wire_answers() {
+    fn ingress_judgments_map_from_validated_wire_answers() {
         let judgments = parse().to_ingress_judgments().unwrap();
 
         assert_eq!(judgments.handler.choice, Handler::Retrieve);
@@ -668,8 +1110,13 @@ mod tests {
 
     #[test]
     fn missing_answers_fail_loudly() {
-        let response: SystemOneResponse =
-            serde_json::from_str(r#"{"handler": {"choice": "act", "confidence": 0.9}}"#).unwrap();
+        let response: SystemOneResponse = serde_json::from_str(
+            r#"{"model": "jev-1.13.0",
+                "answers": {"handler": {"type": "choice", "choice": "act",
+                    "probabilities": {"act": 1.0}, "confidence": 0.9}},
+                "usage": {"input_tokens": 1, "output_tokens": 1}}"#,
+        )
+        .unwrap();
 
         let err = response.to_ingress_judgments().unwrap_err();
         assert!(err.to_string().contains("complexity"));
@@ -678,13 +1125,27 @@ mod tests {
     #[test]
     fn unknown_option_keys_fail_loudly() {
         let response: SystemOneResponse = serde_json::from_str(
-            r#"{"handler": {"choice": "teleport", "confidence": 0.9},
-                "complexity": {"score": 1.0, "confidence": 0.9},
-                "retrieval": {"choice": "none", "confidence": 0.9},
-                "missing_user_info": {"noul": 0.1},
-                "parallelizable": {"noul": 0.1},
-                "risk": {"choice": "low", "confidence": 0.9},
-                "model_tier": {"choice": "fast", "confidence": 0.9}}"#,
+            r#"{"model": "jev-1.13.0",
+                "answers": {
+                    "handler": {"type": "choice", "choice": "teleport",
+                        "probabilities": {"teleport": 1.0}, "confidence": 0.9},
+                    "complexity": {"type": "score", "score": 1.0,
+                        "legend": {"0": "A trivial one-liner with no judgment",
+                            "1": "Routine work with a standard shape",
+                            "2": "Multiple steps that must be coordinated",
+                            "3": "Deep work needing careful reasoning"},
+                        "probabilities": {"0": 0.0, "1": 1.0, "2": 0.0, "3": 0.0},
+                        "confidence": 0.9},
+                    "retrieval": {"type": "choice", "choice": "none",
+                        "probabilities": {"none": 1.0}, "confidence": 0.9},
+                    "missing_user_info": {"type": "noul", "noul": 0.1},
+                    "parallelizable": {"type": "noul", "noul": 0.1},
+                    "risk": {"type": "choice", "choice": "low",
+                        "probabilities": {"low": 1.0}, "confidence": 0.9},
+                    "model_tier": {"type": "choice", "choice": "fast",
+                        "probabilities": {"fast": 1.0}, "confidence": 0.9}
+                },
+                "usage": {"input_tokens": 1, "output_tokens": 1}}"#,
         )
         .unwrap();
 
@@ -693,7 +1154,120 @@ mod tests {
     }
 
     #[test]
-    fn request_serializes_to_the_wire_shape() {
+    fn contradictory_answer_variants_fail_deserialization() {
+        // noul + choice on one answer.
+        assert!(
+            serde_json::from_str::<Answer>(r#"{"type": "noul", "noul": 0.5, "choice": "x"}"#)
+                .is_err()
+        );
+
+        // choice without probabilities.
+        assert!(
+            serde_json::from_str::<Answer>(
+                r#"{"type": "choice", "choice": "x", "confidence": 0.9}"#
+            )
+            .is_err()
+        );
+
+        // score without legend.
+        assert!(serde_json::from_str::<Answer>(
+            r#"{"type": "score", "score": 1.0, "probabilities": {"0": 0.5, "1": 0.5}, "confidence": 0.9}"#
+        )
+        .is_err());
+
+        // unknown type.
+        assert!(serde_json::from_str::<Answer>(r#"{"type": "vibe"}"#).is_err());
+
+        // answer without a type field.
+        assert!(serde_json::from_str::<Answer>(r#"{"noul": 0.5}"#).is_err());
+    }
+
+    #[test]
+    fn out_of_range_numbers_and_invalid_distributions_fail_validation() {
+        let question = Question::choice("pick", [("a", "A"), ("b", "B")]);
+
+        // Unknown option.
+        let answer = Answer::Choice {
+            choice: "c".to_owned(),
+            probabilities: BTreeMap::from([("a".to_owned(), 0.5), ("b".to_owned(), 0.5)]),
+            confidence: 0.9,
+        };
+        assert!(answer.validate(&question).is_err());
+
+        // Probabilities do not sum to 1.
+        let answer = Answer::Choice {
+            choice: "a".to_owned(),
+            probabilities: BTreeMap::from([("a".to_owned(), 0.5), ("b".to_owned(), 0.2)]),
+            confidence: 0.9,
+        };
+        assert!(answer.validate(&question).is_err());
+
+        // Missing probability key.
+        let answer = Answer::Choice {
+            choice: "a".to_owned(),
+            probabilities: BTreeMap::from([("a".to_owned(), 1.0)]),
+            confidence: 0.9,
+        };
+        assert!(answer.validate(&question).is_err());
+
+        // Confidence out of range.
+        let answer = Answer::Choice {
+            choice: "a".to_owned(),
+            probabilities: BTreeMap::from([("a".to_owned(), 1.0), ("b".to_owned(), 0.0)]),
+            confidence: 1.5,
+        };
+        assert!(answer.validate(&question).is_err());
+
+        // Score outside rubric range.
+        let score_question = Question::score("rate", vec!["low", "high"]);
+        let answer = Answer::Score {
+            score: 5.0,
+            legend: BTreeMap::from([
+                ("0".to_owned(), "low".to_owned()),
+                ("1".to_owned(), "high".to_owned()),
+            ]),
+            probabilities: BTreeMap::from([("0".to_owned(), 1.0), ("1".to_owned(), 0.0)]),
+            confidence: 0.9,
+        };
+        assert!(answer.validate(&score_question).is_err());
+
+        // Noul out of range.
+        let noul_question = Question::noul("yes?");
+        let answer = Answer::Noul { noul: 1.5 };
+        assert!(answer.validate(&noul_question).is_err());
+
+        // Type mismatch: choice answer for a noul question.
+        let answer = Answer::Choice {
+            choice: "a".to_owned(),
+            probabilities: BTreeMap::from([("a".to_owned(), 1.0), ("b".to_owned(), 0.0)]),
+            confidence: 0.9,
+        };
+        assert!(answer.validate(&noul_question).is_err());
+    }
+
+    #[test]
+    fn answers_for_unknown_questions_are_rejected() {
+        let response: SystemOneResponse = serde_json::from_str(
+            r#"{"model": "jev-1.13.0",
+                "answers": {
+                    "handler": {"type": "choice", "choice": "act",
+                        "probabilities": {"act": 1.0}, "confidence": 0.9},
+                    "extra": {"type": "noul", "noul": 0.5}
+                },
+                "usage": {"input_tokens": 1, "output_tokens": 1}}"#,
+        )
+        .unwrap();
+
+        let questions = BTreeMap::from([(
+            "handler".to_owned(),
+            Question::choice("pick", [("act", "do it"), ("no", "don't")]),
+        )]);
+
+        assert!(response.validate_against(&questions).is_err());
+    }
+
+    #[test]
+    fn request_serializes_to_the_documented_wire_shape() {
         let mut questions = BTreeMap::new();
         questions.insert(
             "urgent".to_owned(),
@@ -708,6 +1282,10 @@ mod tests {
                     ("technical", "Bugs, outages, integrations"),
                 ],
             ),
+        );
+        questions.insert(
+            "frustration".to_owned(),
+            Question::score("How frustrated is the customer?", vec!["Calm", "Angry"]),
         );
 
         let request = SystemOneRequest {
@@ -724,12 +1302,53 @@ mod tests {
             json["questions"]["department"]["criteria"]["billing"],
             "Payments, invoicing, refunds"
         );
-        // Optional instructions serialize when present.
+        // Score serializes `criteria` as the ordered level array; the
+        // undocumented `levels` field must not appear.
+        assert_eq!(
+            json["questions"]["frustration"]["criteria"],
+            serde_json::json!(["Calm", "Angry"])
+        );
+        assert!(json["questions"]["frustration"].get("levels").is_none());
+        // Instructions are required and always serialize.
         assert!(json["questions"]["urgent"]["instructions"].is_string());
     }
 
     #[test]
-    fn api_key_never_appears_in_error_output() {
+    fn question_and_request_validation_enforces_wire_limits() {
+        // Score with one level.
+        assert!(Question::score("rate", vec!["only"]).validate().is_err());
+        // Score with too many levels.
+        let levels: Vec<&str> = (0..11).map(|_| "level").collect();
+        assert!(Question::score("rate", levels).validate().is_err());
+        // Choice with one option.
+        assert!(Question::choice("pick", [("a", "A")]).validate().is_err());
+        // Empty instructions.
+        assert!(Question::noul("  ").validate().is_err());
+
+        // Oversized request.
+        let mut questions = BTreeMap::new();
+        questions.insert(
+            "big".to_owned(),
+            Question::noul("x?".repeat(MAX_REQUEST_BODY_BYTES / 2)),
+        );
+        let request = SystemOneRequest {
+            model: "jev-latest".to_owned(),
+            state: Value::Null,
+            questions,
+        };
+        assert!(request.validate().is_err());
+
+        // Empty model / no questions.
+        let request = SystemOneRequest {
+            model: " ".to_owned(),
+            state: Value::Null,
+            questions: BTreeMap::new(),
+        };
+        assert!(request.validate().is_err());
+    }
+
+    #[test]
+    fn config_and_errors_never_reveal_the_key() {
         let config = TypeSafeConfig {
             api_key: "sk-secret-value".to_owned(),
             base_url: DEFAULT_BASE_URL.to_owned(),
@@ -737,9 +1356,18 @@ mod tests {
             timeout: DEFAULT_TIMEOUT,
         };
 
+        // Debug output redacts the key.
+        let debug = format!("{config:?}");
+        assert!(debug.contains("[redacted]"));
+        assert!(!debug.contains("sk-secret-value"));
+
+        // The secret-free summary carries no key material.
+        let summary = format!("{:?}", config.summary());
+        assert!(!summary.contains("sk-secret-value"));
+
+        // Error formatting redacts echoed bodies.
         let leaked = "some body sk-secret-value trailing".to_owned();
         let redacted = leaked.replace(&config.api_key, "[redacted]");
-
         assert!(redacted.contains("[redacted]"));
         assert!(!redacted.contains("sk-secret-value"));
     }
@@ -756,7 +1384,7 @@ mod tests {
         assert_eq!(config.model, "jev-latest");
         assert_eq!(config.timeout, DEFAULT_TIMEOUT);
 
-        // Overrides win.
+        // Overrides win, including pinned versioned model IDs.
         let config = TypeSafeConfig::from_parts(
             "k".to_owned(),
             Some("http://localhost:8080".to_owned()),
@@ -778,5 +1406,26 @@ mod tests {
 
         let jev = JevSystemOne::new(config).unwrap();
         assert_eq!(jev.endpoint(), "http://localhost:8080/v1/systemone");
+    }
+
+    #[tokio::test]
+    async fn live_smoke_jev_ingress_round_trip() {
+        // Opt-in live test: only runs when TYPESAFE_LIVE_SMOKE=1 and a key
+        // is present. Never silently executes in ordinary CI.
+        if std::env::var("TYPESAFE_LIVE_SMOKE").ok().as_deref() != Some("1") {
+            return;
+        }
+        let config = match TypeSafeConfig::from_env() {
+            Ok(config) => config,
+            Err(_) => return,
+        };
+
+        let jev = JevSystemOne::new(config).unwrap();
+        let input = DecisionInput::new("read the config file", vec!["files".to_owned()]);
+        let judgments = jev.judge(&input).await.unwrap();
+
+        // The full answer set comes back and collapses into a decision.
+        let decision = judgments.to_decision();
+        assert!(decision.confidence >= 0.0);
     }
 }

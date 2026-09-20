@@ -14,10 +14,45 @@ pub fn redacted(identity: &str) -> &str {
     &identity[..end]
 }
 
+/// Why a System One call failed.
+///
+/// Auth/schema failures are configuration or contract bugs and must
+/// surface; rate-limit/overload/transient failures may be retried by an
+/// explicit, bounded policy chosen by the runtime.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum SystemOneFailure {
+    /// 401: missing or invalid credentials.
+    Auth,
+    /// 422: the request failed server-side validation.
+    Validation,
+    /// 429: rate limited; back off before retrying.
+    RateLimit,
+    /// 529: provider temporarily overloaded.
+    Overloaded,
+    /// Timeout, connection failure or server error: outcome unknown but
+    /// no answer was produced.
+    Transient,
+    /// The response violated the documented wire contract.
+    Protocol,
+}
+
+impl SystemOneFailure {
+    /// Only these failures are safe for a bounded retry policy.
+    pub fn is_retryable(&self) -> bool {
+        matches!(self, Self::RateLimit | Self::Overloaded | Self::Transient)
+    }
+}
+
 #[derive(Debug, Error)]
 pub enum KnutError {
     #[error("system one failed: {0}")]
     SystemOne(String),
+
+    #[error("system one {failure:?} failure: {message}")]
+    SystemOneCall {
+        failure: SystemOneFailure,
+        message: String,
+    },
 
     #[error("tool not found: {0}")]
     ToolNotFound(String),
