@@ -3,6 +3,7 @@ mod edge;
 mod error;
 mod judgment;
 mod model;
+mod policy;
 mod runtime;
 mod system_one;
 mod system_zero;
@@ -21,6 +22,10 @@ pub use judgment::{
 pub use model::{
     CascadeOutcome, ComputeCascade, ExpectedArtifact, Model, ModelAttempt, ModelIdentity,
     ModelRequest, ModelResponse, Usage, VerificationVerdict, Verifier,
+};
+pub use policy::{
+    ApprovalLedger, ExecOutcome, ExecutionGate, ExecutionRequest, Policy, PolicyVerdict,
+    SideEffectPolicy, WriteJournal,
 };
 pub use runtime::{DecisionSource, Knut, Routed};
 pub use system_one::{StaticSystemOne, SystemOne};

@@ -10,7 +10,7 @@ use crate::KnutError;
 /// What executing a tool does to the world.
 ///
 /// Policy (issue #10) reads this class; tools merely declare it.
-#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+#[derive(Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord, Serialize, Deserialize)]
 #[serde(rename_all = "snake_case")]
 pub enum SideEffect {
     /// Pure read; safe to retry at will.

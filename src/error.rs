@@ -14,6 +14,15 @@ pub enum KnutError {
     #[error("blocked by deterministic rule: {reason}")]
     Blocked { reason: String },
 
+    #[error("denied by policy: {reason}")]
+    PolicyDenied { reason: String },
+
+    #[error("approval required: {reason} (approval key: {approval_key})")]
+    ApprovalRequired {
+        reason: String,
+        approval_key: String,
+    },
+
     #[error("model escalation exhausted: {reason}")]
     ModelExhausted {
         reason: String,
