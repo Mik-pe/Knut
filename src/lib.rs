@@ -1,3 +1,4 @@
+mod completion;
 mod decision;
 mod edge;
 mod error;
@@ -13,6 +14,10 @@ mod tool;
 mod tree;
 mod typesafe;
 
+pub use completion::{
+    ArtifactRevision, ArtifactVerifier, CompletionRequirements, Evidence, Requirement,
+    gather_evidence,
+};
 pub use decision::{Action, Decision, DecisionInput, ModelTier, RetrievalSource, Risk, Route};
 pub use edge::{
     EdgeChoice, EdgeJudgment, EdgeRouter, EdgeSelector, EdgeState, MAX_STEP_ATTEMPTS, NodeOutcome,
