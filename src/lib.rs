@@ -6,6 +6,7 @@ mod runtime;
 mod system_one;
 mod system_zero;
 mod tool;
+mod tree;
 
 pub use decision::{Action, Decision, DecisionInput, ModelTier, RetrievalSource, Risk, Route};
 pub use error::KnutError;
@@ -23,4 +24,8 @@ pub use system_zero::{
     ExplicitCapabilityRule, InvalidInputRule, RoutingCache, RuleVerdict, SystemZero,
     SystemZeroOutcome, SystemZeroRule, UnavailableCapabilityRule,
 };
-pub use tool::{Tool, ToolRegistry};
+pub use tool::{SideEffect, Tool, ToolMetadata, ToolRegistry};
+pub use tree::{
+    AskUserHandler, CancelFlag, NodeStatus, PlanError, PlanNode, TreeExecutor, TreeRunResult,
+    validate_plan,
+};
