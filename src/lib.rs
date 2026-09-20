@@ -1,6 +1,7 @@
 mod decision;
 mod error;
 mod judgment;
+mod model;
 mod runtime;
 mod system_one;
 mod system_zero;
@@ -11,6 +12,10 @@ pub use error::KnutError;
 pub use judgment::{
     Complexity, Handler, IngressJudgments, Judgment, JudgmentRouter, JudgmentSystemOne,
     RetrievalJudgment, StaticJudgments, TierJudgment, YesNo,
+};
+pub use model::{
+    CascadeOutcome, ComputeCascade, ExpectedArtifact, Model, ModelAttempt, ModelIdentity,
+    ModelRequest, ModelResponse, Usage, VerificationVerdict, Verifier,
 };
 pub use runtime::{DecisionSource, Knut, Routed};
 pub use system_one::{StaticSystemOne, SystemOne};

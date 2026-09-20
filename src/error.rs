@@ -13,4 +13,10 @@ pub enum KnutError {
 
     #[error("blocked by deterministic rule: {reason}")]
     Blocked { reason: String },
+
+    #[error("model escalation exhausted: {reason}")]
+    ModelExhausted {
+        reason: String,
+        attempts: Vec<crate::model::ModelAttempt>,
+    },
 }
