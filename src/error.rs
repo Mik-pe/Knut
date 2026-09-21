@@ -78,6 +78,22 @@ pub enum KnutError {
         attempts: Vec<crate::model::ModelAttempt>,
     },
 
+    /// A provider call failed for a reason the caller can act on.
+    #[error("model provider error: {0}")]
+    Model(String),
+
+    /// 401/403 from a generative provider: bad, missing or revoked key.
+    #[error("model provider authentication failed: {0}")]
+    ModelAuth(String),
+
+    /// 429 from a generative provider.
+    #[error("model provider rate limited the request: {0}")]
+    ModelRateLimit(String),
+
+    /// 5xx or a transport failure at the provider.
+    #[error("model provider unavailable: {0}")]
+    ModelUnavailable(String),
+
     #[error("plan rejected: {errors:?}")]
     PlanRejected { errors: Vec<String> },
 

@@ -112,6 +112,7 @@ async fn run(args: Vec<String>) -> Result<(), KnutError> {
         "repl" => repl(capabilities, confidence_floor, verbose, system_one).await,
         "demo-tree" => demo_tree(verbose).await,
         "eval" => eval().await,
+        "doctor" => doctor(live_from_flags(&positionals)).await,
         "--help" | "-h" | "help" => {
             println!("{}", usage());
             Ok(())
@@ -131,11 +132,18 @@ USAGE:
   knut repl [--capability <id>]... [--verbose]
   knut demo-tree [--verbose]
   knut eval
+  knut doctor [--live]
 
 System One backends (--backend):
   static (default)   deterministic mock, fully offline
   jev                live TypeSafe System One API; reads TYPESAFE_API_KEY,
-                     optional TYPESAFE_BASE_URL / TYPESAFE_MODEL"
+                     optional TYPESAFE_BASE_URL / TYPESAFE_MODEL
+
+Reasoner provider (knut doctor, and KNUT_PROVIDER_* env):
+  KNUT_PROVIDER_API_KEY   required for live reasoner calls (never logged)
+  KNUT_PROVIDER_BASE_URL  default https://api.z.ai/api/coding/paas/v4
+  KNUT_PROVIDER_MODEL     default glm-5.3-flash
+  KNUT_PROVIDER_TIER      fast | standard | reasoner"
         .to_owned()
 }
 
@@ -481,6 +489,100 @@ async fn demo_tree(verbose: bool) -> Result<(), KnutError> {
     }
 
     Ok(())
+}
+
+/// `doctor`: report what is configured, and optionally prove it works.
+///
+/// Offline by default: it inspects configuration and reports honestly
+/// what is missing. `--live` performs one real reasoner call so an
+/// operator can verify credentials and transport end to end.
+async fn doctor(live: bool) -> Result<(), KnutError> {
+    println!("knut doctor");
+
+    // System One (Jev) configuration.
+    match std::env::var("TYPESAFE_API_KEY") {
+        Ok(key) if !key.trim().is_empty() => {
+            let base = std::env::var("TYPESAFE_BASE_URL")
+                .unwrap_or_else(|_| knut::DEFAULT_BASE_URL.to_owned());
+            let model =
+                std::env::var("TYPESAFE_MODEL").unwrap_or_else(|_| knut::DEFAULT_MODEL.to_owned());
+            println!("  system one:  configured (base {base}, model {model})");
+            if live {
+                let system_one = knut::JevSystemOne::new(knut::TypeSafeConfig::from_env()?)?;
+                let input = knut::DecisionInput::new(
+                    "read the project notes".to_owned(),
+                    vec!["files".to_owned()],
+                );
+                match knut::SystemOne::decide(&system_one, &input).await {
+                    Ok(decision) => println!(
+                        "    live:      ok (route {:?}, confidence {:.2})",
+                        decision.route, decision.confidence
+                    ),
+                    Err(err) => println!("    live:      FAILED ({err})"),
+                }
+            }
+        }
+        _ => println!("  system one:  not configured (TYPESAFE_API_KEY unset)"),
+    }
+
+    // Reasoner (BYOK provider) configuration.
+    match std::env::var("KNUT_PROVIDER_API_KEY") {
+        Ok(key) if !key.trim().is_empty() => {
+            let config = knut::ProviderConfig::from_env()?;
+            let summary = config.summary();
+            println!(
+                "  reasoner:    configured (model {}, tier {:?}, billing {:?})",
+                summary.model, summary.tier, summary.billing
+            );
+            println!(
+                "               endpoint {} (timeout {:?})",
+                summary.base_url, summary.timeout
+            );
+
+            let model = knut::OpenAiCompatibleModel::new(config)?;
+            let caps = knut::Model::capabilities(&model);
+            println!(
+                "               capabilities: streaming={} tools={} reasoning={} continuation={} usage={}",
+                caps.streaming, caps.tools, caps.reasoning, caps.continuation, caps.usage
+            );
+
+            if live {
+                let request = knut::ModelRequest::new(
+                    "Reply with exactly the word pong.",
+                    knut::ExpectedArtifact::Text,
+                );
+                let mut sink = knut::BufferedSink::new();
+                match knut::Model::stream(&model, &request, &mut sink).await {
+                    Ok(response) => {
+                        let usage =
+                            match (response.usage.input_tokens, response.usage.output_tokens) {
+                                (Some(i), Some(o)) => format!("{i} in / {o} out"),
+                                _ => "unknown".to_owned(),
+                            };
+                        println!(
+                            "    live:      ok (model {}, usage {usage}, reasoning parts {})",
+                            response.identity.model,
+                            response.continuation.parts.len()
+                        );
+                    }
+                    Err(err) => println!("    live:      FAILED ({err})"),
+                }
+            }
+        }
+        _ => println!("  reasoner:    not configured (KNUT_PROVIDER_API_KEY unset)"),
+    }
+
+    // The offline playground always works.
+    println!("  playground:  ok (static backend, offline)");
+
+    if !live {
+        println!("\nrun `knut doctor --live` to verify credentials with one real call");
+    }
+    Ok(())
+}
+
+fn live_from_flags(positionals: &[String]) -> bool {
+    positionals.iter().any(|p| p == "--live")
 }
 
 /// Mini benchmark: the mock router against an always-reasoner baseline.

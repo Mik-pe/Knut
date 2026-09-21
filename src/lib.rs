@@ -7,6 +7,7 @@ mod judgment;
 mod model;
 mod planner;
 mod policy;
+mod provider;
 mod runtime;
 mod session;
 mod system_one;
@@ -41,6 +42,10 @@ pub use planner::{MAX_DEPTH, MAX_NODES, PlanRejection, Planner, PlanningContext,
 pub use policy::{
     ApprovalLedger, Authorization, ExecOutcome, ExecutionGate, InMemoryJournal, JournalEntry,
     JournalStore, OutcomeState, Policy, PolicyVerdict, ProposedExecution, SideEffectPolicy,
+};
+pub use provider::{
+    BillingPath, DEFAULT_CHAT_PATH, OpenAiCompatibleModel, ProviderConfig, ProviderSummary,
+    ReasoningEffort,
 };
 pub use runtime::{DecisionSource, Knut, Routed};
 pub use session::{
