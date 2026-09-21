@@ -2,6 +2,7 @@ mod attach;
 mod cards;
 mod completion;
 mod composer;
+mod concurrency;
 mod context;
 mod decision;
 mod edge;
@@ -44,6 +45,10 @@ pub use completion::{
     gather_evidence,
 };
 pub use composer::{Composer, MAX_COMPOSER_CHARS, MAX_HISTORY, MAX_PASTE_CHARS};
+pub use concurrency::{
+    Budget, BudgetSnapshot, ItemOutcome, ItemResult, ItemRunner, PoolCapacity, ResourceClass,
+    ScheduleOutcome, Scheduler, SkipReason, WorkItem, items_from_plan,
+};
 pub use context::{
     AcceptanceRequirement, ArtifactIndex, Constraint, ContextReport, DecisionProjection,
     DiagnosticRef, MAX_FRAME_CANDIDATES, MAX_FRAME_TEXT, ReasonerProjection, SourceExcerpt,
