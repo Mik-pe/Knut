@@ -664,9 +664,29 @@ fn render_timeline(frame: &mut Frame, state: &WorkbenchState, area: Rect, theme:
 /// The empty-state: the mark, what this is, and how to start.
 fn render_welcome(frame: &mut Frame, state: &WorkbenchState, area: Rect, theme: &Theme) {
     let inner_width = area.width.saturating_sub(2) as usize;
-    let mut lines = knot::logo_lines(theme, inner_width);
-    lines.push(Line::from(""));
+    let inner_height = area.height.saturating_sub(2) as usize;
+    let mut lines: Vec<Line<'static>> = Vec::new();
 
+    // The mark, then the block wordmark. A splash screen names the product
+    // at a size body text cannot: that is the whole point of a wordmark.
+    lines.extend(knot::logo_lines(theme, inner_width));
+    for line in knot::wordmark_block(theme.glyphs.unicode).lines {
+        if theme.level.is_color() {
+            lines.push(centered_spans(
+                gradient_over(theme, line, theme.palette.cyan, theme.palette.magenta),
+                inner_width,
+            ));
+        } else {
+            lines.push(centered(line.to_string(), inner_width, theme.text()));
+        }
+    }
+    if inner_width >= 60 {
+        for line in wrap_text(knot::SUBTITLE, inner_width.saturating_sub(6)) {
+            lines.push(centered(line, inner_width, theme.faint()));
+        }
+    }
+
+    // Readiness, stated as an instruction the user can act on.
     let ready = state.model.is_some();
     let (status, status_style) = if ready {
         (
@@ -679,26 +699,30 @@ fn render_welcome(frame: &mut Frame, state: &WorkbenchState, area: Rect, theme: 
             theme.warn(),
         )
     };
+    lines.push(Line::from(""));
     lines.push(centered(status, inner_width, status_style));
+
+    // What this session can actually do, in columns — the harness's own
+    // inventory, not a promise. Three columns when there is room, stacked
+    // otherwise, because a capability list is the first thing a new user
+    // needs and the first thing a wide screen wastes.
+    lines.push(Line::from(""));
+    if inner_width >= 56 {
+        lines.extend(capability_columns(state, inner_width, theme));
+    } else {
+        lines.extend(capability_stack(state, inner_width, theme));
+    }
 
     if inner_width >= 40 {
         lines.push(Line::from(""));
-        for line in wrap_text(knot::SUBTITLE, inner_width.saturating_sub(4)) {
-            lines.push(centered(line, inner_width, theme.faint()));
-        }
-        lines.push(Line::from(""));
         for hint in [
-            "Enter  submit    Ctrl+J  newline    Tab  focus",
-            "F1     help      :       commands   q      quit",
+            "Enter  submit      Ctrl+J  newline     Tab  focus",
+            "F1     help        :       commands    q    quit",
         ] {
             lines.push(centered(hint.to_owned(), inner_width, theme.faint()));
         }
     }
 
-    // The detailed reason is only repeated here when the status line could
-    // not carry it: an empty state that says the same sentence twice reads
-    // as a bug. The status line above already names the missing variable,
-    // so this block only expands on *how* to fix it.
     if state.model.is_none() && inner_width >= 60 {
         lines.push(Line::from(""));
         for line in wrap_text(
@@ -710,11 +734,11 @@ fn render_welcome(frame: &mut Frame, state: &WorkbenchState, area: Rect, theme: 
         }
     }
 
-    // Keep the block vertically centred in the panel.
-    let inner_height = area.height.saturating_sub(2) as usize;
-    let top = inner_height.saturating_sub(lines.len()) / 2;
-    let mut padded: Vec<Line> = Vec::with_capacity(lines.len() + top);
-    for _ in 0..top {
+    // Sit the block a little above centre: text pinned to the exact middle
+    // drifts as the terminal resizes.
+    let pad = inner_height.saturating_sub(lines.len()) * 2 / 5;
+    let mut padded: Vec<Line<'static>> = Vec::with_capacity(lines.len() + pad);
+    for _ in 0..pad {
         padded.push(Line::from(""));
     }
     padded.extend(lines);
@@ -729,6 +753,153 @@ fn render_welcome(frame: &mut Frame, state: &WorkbenchState, area: Rect, theme: 
             .style(theme.bg(theme.palette.bg_panel)),
         area,
     );
+}
+
+/// The session's real capabilities, side by side.
+fn capability_columns(state: &WorkbenchState, width: usize, theme: &Theme) -> Vec<Line<'static>> {
+    let columns: [(&str, Vec<String>); 3] = [
+        (
+            "model",
+            vec![
+                state.reasoner_label(),
+                state
+                    .endpoint
+                    .clone()
+                    .unwrap_or_else(|| "no endpoint".to_owned()),
+                if state.live_routing {
+                    "live routing".to_owned()
+                } else {
+                    "deterministic routing".to_owned()
+                },
+            ],
+        ),
+        (
+            "gate",
+            vec![
+                "tools: read, search, write".to_owned(),
+                "writes need approval".to_owned(),
+                "sandboxed processes".to_owned(),
+            ],
+        ),
+        (
+            "checks",
+            vec![
+                format!("{} configured", state.checks),
+                "revision-bound evidence".to_owned(),
+                "no checks, no done".to_owned(),
+            ],
+        ),
+    ];
+
+    let total: usize = columns.iter().map(|(_, rows)| column_width(rows)).sum();
+    let gaps = 4 * (columns.len().saturating_sub(1));
+    // Fall back to the stacked form when the columns will not fit: three
+    // cramped columns are worse than one readable list.
+    if total + gaps + 4 > width {
+        return capability_stack(state, width, theme);
+    }
+    let spare = width.saturating_sub(total + gaps);
+    let pad = spare / (columns.len() + 1);
+
+    let mut heads: Vec<Span<'static>> = vec![Span::raw(" ".repeat(pad))];
+    for (index, (name, rows)) in columns.iter().enumerate() {
+        let w = column_width(rows);
+        heads.push(Span::styled(
+            format!("{:<w$}", name.to_ascii_uppercase()),
+            theme.accent().add_modifier(Modifier::BOLD),
+        ));
+        if index + 1 < columns.len() {
+            heads.push(Span::raw(" ".repeat(4 + pad)));
+        }
+    }
+
+    let mut outs = vec![Line::from(heads)];
+    let depth = columns
+        .iter()
+        .map(|(_, rows)| rows.len())
+        .max()
+        .unwrap_or(0);
+    for row in 0..depth {
+        let mut spans: Vec<Span<'static>> = vec![Span::raw(" ".repeat(pad))];
+        for (index, (_, rows)) in columns.iter().enumerate() {
+            let w = column_width(rows);
+            let text = rows.get(row).cloned().unwrap_or_default();
+            let text: String = text.chars().take(w).collect();
+            spans.push(Span::styled(
+                format!("{text:<w$}"),
+                if row == 0 {
+                    theme.text()
+                } else {
+                    theme.faint()
+                },
+            ));
+            if index + 1 < columns.len() {
+                spans.push(Span::raw(" ".repeat(4 + pad)));
+            }
+        }
+        outs.push(Line::from(spans));
+    }
+    outs
+}
+
+/// The same capability list, one row per item, for narrow panes.
+fn capability_stack(state: &WorkbenchState, width: usize, theme: &Theme) -> Vec<Line<'static>> {
+    let items = [
+        format!(
+            "model   {} at {}",
+            state.reasoner_label(),
+            state.endpoint.as_deref().unwrap_or("-")
+        ),
+        "tools   read, search, write behind an approval gate".to_owned(),
+        format!(
+            "checks  {} revision-bound checks gate completion",
+            state.checks
+        ),
+    ];
+    let mut out = Vec::new();
+    for item in items {
+        for line in wrap_text(&item, width.saturating_sub(8)) {
+            out.push(centered(line, width, theme.faint()));
+        }
+    }
+    out
+}
+
+/// The width a column needs: its widest row, bounded.
+fn column_width(rows: &[String]) -> usize {
+    rows.iter()
+        .map(|row| row.chars().count())
+        .max()
+        .unwrap_or(0)
+        .min(30)
+}
+
+/// Centre a run of spans inside a width, padding with unstyled spaces.
+fn centered_spans(spans: Vec<Span<'static>>, width: usize) -> Line<'static> {
+    let content: usize = spans.iter().map(|s| s.content.chars().count()).sum();
+    let pad = width.saturating_sub(content) / 2;
+    let mut out = vec![Span::raw(" ".repeat(pad))];
+    out.extend(spans);
+    Line::from(out)
+}
+
+/// One line of text, tinted along a ramp, for the wordmark.
+fn gradient_over(
+    theme: &Theme,
+    text: &str,
+    from: crate::theme::Rgb,
+    to: crate::theme::Rgb,
+) -> Vec<Span<'static>> {
+    let chars: Vec<char> = text.chars().collect();
+    let last = chars.len().saturating_sub(1).max(1);
+    chars
+        .into_iter()
+        .enumerate()
+        .map(|(index, ch)| {
+            let rgb = crate::theme::lerp(from, to, index as f32 / last as f32);
+            Span::styled(ch.to_string(), Style::default().fg(theme.color(rgb)))
+        })
+        .collect()
 }
 
 fn centered(text: String, width: usize, style: Style) -> Line<'static> {
@@ -1856,7 +2027,11 @@ mod tests {
     fn the_welcome_screen_teaches_the_first_move() {
         let state = WorkbenchState::new("/workspace/knut");
         let text = snapshot(&state, 100, 30, Tab::Timeline);
-        assert!(text.contains("K"), "the mark is drawn:{text}");
+        // The block wordmark spells the name at display size.
+        assert!(
+            text.contains('K') || text.contains('█'),
+            "the mark is drawn:{text}"
+        );
         assert!(
             text.contains("offline") || text.contains("ready"),
             "the empty state says whether it can work:\n{text}"

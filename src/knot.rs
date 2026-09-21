@@ -31,92 +31,53 @@ impl Art {
     }
 }
 
-/// The largest mark: for the welcome screen on a roomy terminal.
+/// The marks: a looped square, the classic knot glyph.
 ///
-/// Two strands (System 0 and System 1) crossing through a shared ring.
-/// Every block is exactly rectangular and mirrors about its vertical
-/// axis — the tests enforce both, because a ragged or lopsided logo reads
-/// as a rendering bug rather than as a mark.
+/// Four ears interlace around a square core — strands that visibly cross
+/// rather than boxes that nest, which is what makes a mark read as a
+/// *knot* and not as a target. Terminal cells are about twice as tall as
+/// they are wide, so every block is built to that ratio; a "square" block
+/// renders as a tall pill, the most common way terminal art looks broken.
+///
+/// Each block is exactly rectangular and mirrors about its vertical axis,
+/// and the tests enforce both.
 pub const KNOT_LARGE: Art = Art {
     lines: &[
-        "  ╭─────────────╮  ",
-        " ╭╯  ╭───────╮  ╰╮ ",
-        "╭╯  ╭╯       ╰╮  ╰╮",
-        "│  ╭╯  ╭───╮  ╰╮  │",
-        "│  │   │   │   │  │",
-        "│  ╰╮  ╰───╯  ╭╯  │",
-        "╰╮  ╰╮       ╭╯  ╭╯",
-        " ╰╮  ╰───────╯  ╭╯ ",
-        "  ╰─────────────╯  ",
+        "  ╭───╮     ╭───╮  ",
+        "  │   ╰─────╯   │  ",
+        " ╭╯             ╰╮ ",
+        "╭╯  ╭──╮   ╭──╮  ╰╮",
+        "│   │  ╰───╯  │   │",
+        "╰╮  ╰──╮   ╭──╯  ╭╯",
+        " ╰╮    │   │    ╭╯ ",
+        "  │   ╭╯   ╰╮   │  ",
+        "  ╰───╯     ╰───╯  ",
     ],
 };
 
 /// The middle mark: the welcome screen's default.
 pub const KNOT_MEDIUM: Art = Art {
     lines: &[
-        " ╭───────────╮ ",
-        "╭╯  ╭─────╮  ╰╮",
-        "│  ╭╯     ╰╮  │",
-        "│  │  ╭─╮  │  │",
-        "│  │  ╰─╯  │  │",
-        "│  ╰╮     ╭╯  │",
-        "╰╮  ╰─────╯  ╭╯",
-        " ╰───────────╯ ",
+        " ╭──╮   ╭──╮ ",
+        " │  ╰───╯  │ ",
+        " ╰──╮   ╭──╯ ",
+        "    │   │    ",
+        " ╭──╯   ╰──╮ ",
+        " │  ╭───╮  │ ",
+        " ╰──╯   ╰──╯ ",
     ],
 };
 
-/// The smallest mark: a compact weave, used beside the wordmark.
+/// The smallest mark: a compact weave.
 pub const KNOT_SMALL: Art = Art {
     lines: &[
-        " ╭───────╮ ",
-        "╭╯ ╭───╮ ╰╮",
-        "│ ╭╯╭─╮╰╮ │",
-        "│ ╰╮╰─╯╭╯ │",
-        "╰╮ ╰───╯ ╭╯",
-        " ╰───────╯ ",
-    ],
-};
-
-/// ASCII twins, used when the terminal cannot be trusted with box art.
-///
-/// The same geometry in `.`, `-`, `/`, `\` and `|`, so the mark keeps its
-/// identity on a terminal that would otherwise render a row of question
-/// marks.
-pub const KNOT_LARGE_ASCII: Art = Art {
-    lines: &[
-        "   .-------------.   ",
-        " .-'  .-------.  '-. ",
-        "/   .-'       '-.   \\",
-        "|   /   .---.   \\   |",
-        "|   |   |   |   |   |",
-        "|   \\   '---'   /   |",
-        "\\   '-.       .-'   /",
-        " '-.  '-------'  .-' ",
-        "   '-------------'   ",
-    ],
-};
-
-pub const KNOT_MEDIUM_ASCII: Art = Art {
-    lines: &[
-        " .-----------. ",
-        "/  .-------.  \\",
-        "|  /       \\  |",
-        "|  |  .-.  |  |",
-        "|  |  '-'  |  |",
-        "|  \\       /  |",
-        "\\  '-------'  /",
-        " '-----------' ",
-    ],
-};
-
-pub const KNOT_SMALL_ASCII: Art = Art {
-    lines: &[
-        " .-------. ",
-        "/  .---.  \\",
-        "|  / . \\  |",
-        "|  \\ ' /  |",
-        "\\  '---'  /",
-        " '-------' ",
+        " ╭─╮ ╭─╮ ",
+        " │ ╰─╯ │ ",
+        " ╰╮   ╭╯ ",
+        "  │   │  ",
+        " ╭╯   ╰╮ ",
+        " │ ╭─╮ │ ",
+        " ╰─╯ ╰─╯ ",
     ],
 };
 
@@ -126,6 +87,85 @@ pub const WORDMARK: &str = "K N U T";
 pub const TAGLINE: &str = "agentic harness";
 /// The sub-line: what the harness actually is.
 pub const SUBTITLE: &str = "System 0 / System 1 routing · gated tools · verified completion";
+
+/// The wordmark as block letters, for the welcome screen.
+///
+/// Drawn as a fixed 5-row block rather than a single line: a wordmark is
+/// branding, and branding that is the same size as body text does not read
+/// as one. Kept to five rows so the welcome screen stays a workbench rather
+/// than a splash screen.
+pub const WORDMARK_BLOCK: Art = Art {
+    lines: &[
+        "█   █ ██  █ █   █ ▀▀█▀▀",
+        "█  █  █ █ █ █   █   █  ",
+        "███   █  ██ █   █   █  ",
+        "█  █  █   █ █   █   █  ",
+        "█   █ █   █  ▀▀▀    █  ",
+    ],
+};
+
+/// The block wordmark in ASCII, for terminals without block glyphs.
+pub const WORDMARK_BLOCK_ASCII: Art = Art {
+    lines: &[
+        "#   # ##  # #   # #####",
+        "#  #  # # # #   #   #  ",
+        "###   #  ## #   #   #  ",
+        "#  #  #   # #   #   #  ",
+        "#   # #   #  ###    #  ",
+    ],
+};
+
+/// The wordmark block for a glyph capability.
+pub fn wordmark_block(unicode: bool) -> Art {
+    if unicode {
+        WORDMARK_BLOCK
+    } else {
+        WORDMARK_BLOCK_ASCII
+    }
+}
+
+/// ASCII twins, used when the terminal cannot be trusted with box art.
+///
+/// The same geometry in `.`, `-`, `'`, `/` and `|`, so the mark keeps its
+/// identity on a terminal that would otherwise render a row of question
+/// marks.
+pub const KNOT_LARGE_ASCII: Art = Art {
+    lines: &[
+        "  .---.     .---.  ",
+        "  |   '-----'   |  ",
+        " .'             '. ",
+        ".'  .--.   .--.  '.",
+        "|   |  '---'  |   |",
+        "'.  '--.   .--'  .'",
+        " '.    |   |    .' ",
+        "  |   .'   '.   |  ",
+        "  '---'     '---'  ",
+    ],
+};
+
+pub const KNOT_MEDIUM_ASCII: Art = Art {
+    lines: &[
+        " .--.   .--. ",
+        " |  '---'  | ",
+        " '--.   .--' ",
+        "    |   |    ",
+        " .--'   '--. ",
+        " |  .---.  | ",
+        " '--'   '--' ",
+    ],
+};
+
+pub const KNOT_SMALL_ASCII: Art = Art {
+    lines: &[
+        " .-. .-. ",
+        " | '-' | ",
+        " '-. .-' ",
+        "   | |   ",
+        " .-' '-. ",
+        " | .-. | ",
+        " '-' '-' ",
+    ],
+};
 
 /// Choose the art block for a width and glyph capability.
 ///
@@ -175,31 +215,10 @@ pub fn logo_lines(theme: &Theme, width: usize) -> Vec<ratatui::text::Line<'stati
         lines.push(padded);
     }
 
-    // The wordmark and its tagline sit under the mark, centred.
-    lines.push(Line::from(""));
-    lines.push(centered_spans(theme.brand_gradient(WORDMARK), width));
-    lines.push(Line::from(""));
-    lines.push(centered_spans(
-        vec![ratatui::text::Span::styled(
-            TAGLINE.to_owned(),
-            theme.dim().add_modifier(ratatui::style::Modifier::ITALIC),
-        )],
-        width,
-    ));
-
+    // Only the mark: the wordmark and tagline are the caller's business,
+    // so a screen can choose its own hierarchy instead of inheriting one
+    // and repeating it.
     lines
-}
-
-/// Centre a span run inside a width, padding with unstyled spaces.
-fn centered_spans(
-    spans: Vec<ratatui::text::Span<'static>>,
-    width: usize,
-) -> ratatui::text::Line<'static> {
-    let content: usize = spans.iter().map(|span| span.content.chars().count()).sum();
-    let pad = width.saturating_sub(content) / 2;
-    let mut out = vec![ratatui::text::Span::raw(" ".repeat(pad))];
-    out.extend(spans);
-    ratatui::text::Line::from(out)
 }
 
 /// Pad a line to exactly `width` so centring is stable frame to frame.
@@ -442,17 +461,24 @@ mod tests {
     }
 
     #[test]
-    fn the_wordmark_is_gradient_tinted_on_a_colour_terminal() {
+    fn the_mark_is_gradient_tinted_on_a_colour_terminal() {
         let theme = Theme::for_level(ColorLevel::TrueColor);
         let lines = logo_lines(&theme, 120);
-        // Find the wordmark line: it is the one carrying the brand hues.
-        let coloured = lines.iter().find(|line| {
-            line.spans
-                .iter()
-                .any(|span| span.content.contains('K') && span.style.fg.is_some())
-        });
-        let line = coloured.expect("wordmark line is colour-tinted");
-        assert!(line.spans.len() >= 4, "one span per letter, at least");
+        // The mark itself carries the ramp: every drawn cell is styled, so
+        // the logo reads as one object rather than as plain text.
+        let styled = lines
+            .iter()
+            .flat_map(|line| line.spans.iter())
+            .filter(|span| span.style.fg.is_some())
+            .count();
+        assert!(styled > 20, "the mark should be tinted, got {styled} spans");
+        // And it spans more than one hue: a single flat colour is not a ramp.
+        let hues: std::collections::HashSet<_> = lines
+            .iter()
+            .flat_map(|line| line.spans.iter())
+            .filter_map(|span| span.style.fg)
+            .collect();
+        assert!(hues.len() > 2, "the mark should span a ramp, got {hues:?}");
     }
 
     #[test]
@@ -465,7 +491,8 @@ mod tests {
             .flat_map(|line| line.spans.iter())
             .map(|span| span.content.to_string())
             .collect();
-        assert!(text.contains("agentic harness"));
+        // The mark's own glyphs are drawn, whatever the theme.
+        assert!(text.contains('╭') || text.contains('|') || text.contains('-'));
         // No colour is emitted at all.
         assert!(
             lines
