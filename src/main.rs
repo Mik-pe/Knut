@@ -29,7 +29,12 @@ use knut::{
 fn main() -> std::process::ExitCode {
     let args: Vec<String> = std::env::args().skip(1).collect();
 
-    let runtime = tokio::runtime::Builder::new_current_thread()
+    // The workbench shell polls the terminal on the main task, so session
+    // work runs on a separate worker: a slow provider must never block
+    // typing. Other commands do not need threads, but the cost is
+    // negligible and one runtime keeps the binary simple.
+    let runtime = tokio::runtime::Builder::new_multi_thread()
+        .worker_threads(2)
         .enable_all()
         .build()
         .expect("tokio runtime");
@@ -114,6 +119,7 @@ async fn run(args: Vec<String>) -> Result<(), KnutError> {
         "eval" => eval().await,
         "doctor" => doctor(live_from_flags(&positionals)).await,
         "verify" => verify_workspace(verbose, as_json).await,
+        "tui" | "workbench" => tui().await,
         "--help" | "-h" | "help" => {
             println!("{}", usage());
             Ok(())
@@ -135,6 +141,7 @@ USAGE:
   knut eval
   knut doctor [--live]
   knut verify [--json]     run the workspace's real checks for the current revision
+  knut tui                 open the workbench shell (Ratatui)
 
 System One backends (--backend):
   static (default)   deterministic mock, fully offline
@@ -491,6 +498,73 @@ async fn demo_tree(verbose: bool) -> Result<(), KnutError> {
     }
 
     Ok(())
+}
+
+/// `tui`: the workbench shell over the shared session event stream.
+///
+/// The shell renders events the runtime publishes; it never executes
+/// tools or runs its own agent loop. Session work happens on a background
+/// task, so a slow provider cannot block typing or navigation.
+async fn tui() -> Result<(), KnutError> {
+    let workspace = knut::Workspace::open(".")?;
+    let mut state = knut::WorkbenchState::new(workspace.root().to_string_lossy().into_owned());
+    state.mode = std::env::var("KNUT_MODE").unwrap_or_else(|_| "quality".to_owned());
+    state.model = std::env::var("KNUT_PROVIDER_MODEL").ok().or_else(|| {
+        std::env::var("KNUT_PROVIDER_API_KEY")
+            .ok()
+            .map(|_| "configured".to_owned())
+    });
+
+    // A demo session drives the shell when no live backend is configured,
+    // so the workbench is useful (and testable) without credentials.
+    let (event_tx, event_rx) = tokio::sync::mpsc::unbounded_channel();
+    let (command_tx, mut command_rx) = tokio::sync::mpsc::unbounded_channel();
+
+    tokio::spawn(async move {
+        let _ = event_tx.send(knut::SessionEvent::SessionStarted {
+            protocol_version: knut::SESSION_PROTOCOL_VERSION,
+        });
+
+        // The shell is over scripted events by default; a live session
+        // replaces this loop when providers are configured (#18/#21).
+        while let Some(command) = command_rx.recv().await {
+            match command {
+                knut::SessionCommand::Submit { prompt } => {
+                    let _ = event_tx.send(knut::SessionEvent::TaskStarted {
+                        task: knut::TaskId(1),
+                        prompt: prompt.clone(),
+                    });
+                    let _ = event_tx.send(knut::SessionEvent::Routed {
+                        task: knut::TaskId(1),
+                        turn: knut::TurnId(1),
+                        revision: knut::TaskRevision(1),
+                        source: knut::DecisionSource::SystemOne,
+                        action: knut::Action::Discover,
+                        confidence: 0.9,
+                    });
+                    let _ = event_tx.send(knut::SessionEvent::WaitingForUser {
+                        task: knut::TaskId(1),
+                        turn: knut::TurnId(1),
+                        wait: knut::WaitKind::Question,
+                        message:
+                            "no reasoner configured: set KNUT_PROVIDER_API_KEY to run tasks end to end"
+                                .to_owned(),
+                    });
+                    let _ = prompt;
+                }
+                knut::SessionCommand::Cancel => {
+                    let _ = event_tx.send(knut::SessionEvent::TaskCancelled {
+                        task: knut::TaskId(1),
+                    });
+                }
+                _ => {}
+            }
+        }
+    });
+
+    knut::run_shell(state, event_rx, command_tx)
+        .await
+        .map_err(|err| KnutError::Tool(format!("terminal: {err}")))
 }
 
 /// `verify`: run the workspace's real checks and report revision-bound

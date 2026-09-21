@@ -17,6 +17,9 @@ mod system_one;
 mod system_zero;
 mod tool;
 mod tree;
+mod tui;
+mod tui_render;
+mod tui_state;
 mod typesafe;
 mod verify;
 mod workspace;
@@ -86,6 +89,12 @@ pub use tool::{
 pub use tree::{
     ArtifactKind, ArtifactRef, ArtifactStore, AskUserHandler, CancelFlag, NodeStatus, PlanError,
     PlanNode, TreeExecutor, TreeRunResult, collect_refs, resolve_input, validate_plan,
+};
+pub use tui::{ShellAction, TerminalGuard, handle_key, run_shell};
+pub use tui_render::{LayoutPlan, NARROW_WIDTH, Tab, plan_layout, render};
+pub use tui_state::{
+    Focus, MAX_ENTRY_CHARS, MAX_TIMELINE, PendingPrompt, TimelineEntry, TimelineKind,
+    WorkbenchState, WorkbenchStats,
 };
 pub use typesafe::{
     Answer, DEFAULT_BASE_URL, DEFAULT_MODEL, DEFAULT_TIMEOUT, JevSystemOne, Question,
