@@ -2,6 +2,7 @@ mod attach;
 mod cards;
 mod completion;
 mod composer;
+mod context;
 mod decision;
 mod edge;
 mod error;
@@ -43,6 +44,11 @@ pub use completion::{
     gather_evidence,
 };
 pub use composer::{Composer, MAX_COMPOSER_CHARS, MAX_HISTORY, MAX_PASTE_CHARS};
+pub use context::{
+    AcceptanceRequirement, ArtifactIndex, Constraint, ContextReport, DecisionProjection,
+    DiagnosticRef, MAX_FRAME_CANDIDATES, MAX_FRAME_TEXT, ReasonerProjection, SourceExcerpt,
+    TokenBudget, budget_turn, fits_budget,
+};
 pub use decision::{Action, Decision, DecisionInput, ModelTier, RetrievalSource, Risk, Route};
 pub use edge::{
     EdgeChoice, EdgeJudgment, EdgeRouter, EdgeSelector, EdgeState, MAX_STEP_ATTEMPTS, NodeOutcome,
