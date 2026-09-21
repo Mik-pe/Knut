@@ -861,10 +861,19 @@ async fn eval() -> Result<(), KnutError> {
         b.with_task(DecisionInput::new(*prompt, vec![]), None)
     });
 
+    // Illustrative rates for the offline playground only. They are
+    // *example* prices with their source recorded, not measured costs, and
+    // the token counts behind them come from a scripted mock router.
     let cost = CostModel {
-        fast: 0.05,
-        standard: 0.2,
-        reasoner: 2.0,
+        fast_input: 0.05,
+        fast_output: 0.05,
+        standard_input: 0.2,
+        standard_output: 0.2,
+        reasoner_input: 2.0,
+        reasoner_output: 2.0,
+        source: "illustrative example, not a provider price list".to_owned(),
+        as_of: "2026-09-21".to_owned(),
+        config_version: "playground-1".to_owned(),
     };
 
     let routed = |task: BenchmarkTask| {
@@ -972,21 +981,16 @@ fn trace_for(
         Route::Generate => Action::Generate(decision.model_tier),
     };
 
-    TurnTrace {
-        prompt: prompt.to_owned(),
-        source: DecisionSource::SystemOne,
-        judgments: None,
-        action,
+    TurnTrace::new(
+        prompt,
+        DecisionSource::SystemOne,
         decision,
-        shadow: None,
-        edges: vec![],
-        escalation_reasons: vec![],
-        latency_ms: latency.as_millis() as u64,
+        action,
+        latency.as_millis() as u64,
         input_tokens,
         output_tokens,
         outcome,
-        expected: None,
-    }
+    )
 }
 
 fn print_metrics(label: &str, metrics: &Metrics) {
