@@ -12,6 +12,7 @@
 //! or invents progress the runtime did not report.
 
 use crate::session::{SessionEvent, TaskState, WaitKind};
+use crate::theme::Theme;
 use crate::tree::NodeStatus;
 use crate::{EdgeChoice, FrameKind};
 
@@ -81,6 +82,22 @@ pub struct WorkbenchState {
     pub mode: String,
     /// Provider/model label, when configured.
     pub model: Option<String>,
+    /// The provider endpoint's host, when configured.
+    pub endpoint: Option<String>,
+    /// Why live work is unavailable, when it is.
+    pub unavailable: Option<String>,
+    /// How many completion checks gate this session.
+    pub checks: usize,
+    /// Model calls observed by the runtime.
+    pub model_calls: u64,
+    /// Wall-clock start of the current task, for the header ticker.
+    task_started: Option<std::time::Instant>,
+    /// Final duration of the last task, so a finished run still shows one.
+    last_duration_secs: u64,
+    /// Monotonic frame counter, used to animate spinners without a clock.
+    pub tick: u64,
+    /// The resolved theme: colour capability and glyph set.
+    pub theme: Theme,
     pub task_state: Option<TaskState>,
     pub focus: Focus,
     /// The multiline composer (issue #28): grapheme-aware editing,
@@ -145,6 +162,14 @@ impl WorkbenchState {
             branch: None,
             mode: "quality".to_owned(),
             model: None,
+            endpoint: None,
+            unavailable: None,
+            checks: 0,
+            model_calls: 0,
+            task_started: None,
+            last_duration_secs: 0,
+            tick: 0,
+            theme: Theme::detect(),
             task_state: None,
             focus: Focus::Composer,
             composer: crate::composer::Composer::new(),
@@ -164,6 +189,52 @@ impl WorkbenchState {
             inspector: crate::inspector::DecisionInspector::new(),
             status: None,
             stats: WorkbenchStats::default(),
+        }
+    }
+
+    /// A state with an explicit theme: used by tests and by callers that
+    /// have already resolved the terminal's capability.
+    pub fn with_theme(mut self, theme: Theme) -> Self {
+        self.theme = theme;
+        self
+    }
+
+    /// Advance the animation tick. The shell calls this once per frame;
+    /// spinners read from it so rendering stays a pure function of state.
+    pub fn advance(&mut self) {
+        self.tick = self.tick.wrapping_add(1);
+    }
+
+    /// Seconds since the current task started (0 when idle).
+    pub fn elapsed_secs(&self) -> u64 {
+        match &self.task_started {
+            Some(started) => started.elapsed().as_secs(),
+            None => self.last_duration_secs,
+        }
+    }
+
+    /// A short label for the configured reasoner.
+    pub fn reasoner_label(&self) -> String {
+        self.model.clone().unwrap_or_else(|| "offline".to_owned())
+    }
+
+    /// One line describing the engine's configuration, for the footer and
+    /// the `doctor` palette entry. Everything here is already known to the
+    /// shell, so it costs no calls and cannot drift from what the header
+    /// shows.
+    pub fn setup_summary(&self) -> String {
+        match &self.model {
+            Some(model) => {
+                let endpoint = self.endpoint.as_deref().unwrap_or("default endpoint");
+                format!(
+                    "{model} via {endpoint}, {} checks, mode {}",
+                    self.checks, self.mode
+                )
+            }
+            None => self
+                .unavailable
+                .clone()
+                .unwrap_or_else(|| "no reasoner configured".to_owned()),
         }
     }
 
@@ -257,6 +328,9 @@ impl WorkbenchState {
                 self.push(TimelineKind::User, prompt.clone(), false);
                 self.task_state = Some(TaskState::Running);
                 self.pending = None;
+                // The header ticker measures the *current* task; a finished
+                // task keeps its last duration instead of counting forever.
+                self.task_started = Some(std::time::Instant::now());
             }
             SessionEvent::TaskSteered {
                 prompt, revision, ..
@@ -414,14 +488,17 @@ impl WorkbenchState {
                 self.status = Some("resumed".to_owned());
             }
             SessionEvent::TaskCompleted { summary, .. } => {
+                self.finish_timing();
                 self.task_state = Some(TaskState::Completed);
                 self.push(TimelineKind::Terminal, summary.clone(), false);
             }
             SessionEvent::TaskFailed { reason, .. } => {
+                self.finish_timing();
                 self.task_state = Some(TaskState::Failed);
                 self.push(TimelineKind::Error, reason.clone(), false);
             }
             SessionEvent::TaskCancelled { .. } => {
+                self.finish_timing();
                 self.task_state = Some(TaskState::Cancelled);
                 self.push(TimelineKind::Terminal, "cancelled", false);
             }
@@ -452,6 +529,13 @@ impl WorkbenchState {
     /// Open the palette.
     pub fn open_palette(&mut self) {
         self.palette = Some(String::new());
+    }
+
+    /// Stop the header ticker and remember how long the task took.
+    fn finish_timing(&mut self) {
+        if let Some(started) = self.task_started.take() {
+            self.last_duration_secs = started.elapsed().as_secs();
+        }
     }
 
     /// Close the palette.
@@ -499,6 +583,73 @@ impl WorkbenchState {
     pub fn note_dropped(&mut self, dropped: u64) {
         self.stats.dropped = dropped;
     }
+
+    /// Checks the session has already run, in review-row form.
+    ///
+    /// These are the *real* rows recorded by a check run; the session never
+    /// synthesizes a row for a check that did not happen.
+    pub fn known_checks(&self) -> Vec<crate::review::CheckRow> {
+        self.review
+            .as_ref()
+            .map(|view| view.checks.clone())
+            .unwrap_or_default()
+    }
+
+    /// The change set the session is reviewing, if one was recorded.
+    pub fn review_changes(&self) -> crate::review::ChangeSet {
+        self.review
+            .as_ref()
+            .map(|view| view.changes.clone())
+            .unwrap_or_else(crate::review::ChangeSet::empty)
+    }
+
+    /// Record a validated change set for review.
+    pub fn set_review_changes(&mut self, changes: crate::review::ChangeSet) {
+        match &mut self.review {
+            Some(view) => view.changes = changes,
+            None => self.review = Some(crate::review::ReviewView::new(changes)),
+        }
+    }
+
+    /// Apply the outcome of an on-demand check run.
+    ///
+    /// A run that could not happen says so; it never becomes "no checks
+    /// reported", which would read as success.
+    pub fn apply_check_outcome(&mut self, outcome: crate::tui::CheckOutcome) {
+        match outcome {
+            crate::tui::CheckOutcome::Ran { rows, revision } => {
+                self.checks = rows.len();
+                let green = rows.iter().filter(|row| row.is_green()).count();
+                self.status = Some(format!("checks {green}/{}", rows.len()));
+                self.push(
+                    TimelineKind::Evidence,
+                    format!(
+                        "checks for {}: {}",
+                        short_revision(&revision),
+                        summarize_checks(&rows)
+                    ),
+                    false,
+                );
+                match &mut self.review {
+                    Some(view) => view.checks = rows,
+                    None => {
+                        let mut view =
+                            crate::review::ReviewView::new(crate::review::ChangeSet::empty());
+                        view.checks = rows;
+                        self.review = Some(view);
+                    }
+                }
+            }
+            crate::tui::CheckOutcome::Unavailable(reason) => {
+                self.status = Some("checks unavailable".to_owned());
+                self.push(
+                    TimelineKind::Error,
+                    format!("checks unavailable: {reason}"),
+                    false,
+                );
+            }
+        }
+    }
 }
 
 /// A short, single-line summary of structured output.
@@ -509,6 +660,43 @@ fn summarize(output: &serde_json::Value) -> String {
     let text = output.to_string();
     let bounded: String = text.chars().take(160).collect();
     format!(" {bounded}")
+}
+
+/// A short label for a revision identity, so the transcript does not carry
+/// a full content hash.
+fn short_revision(revision: &str) -> String {
+    revision.chars().take(12).collect()
+}
+
+/// One line summarizing check rows, counting real outcomes only.
+fn summarize_checks(rows: &[crate::review::CheckRow]) -> String {
+    if rows.is_empty() {
+        return "no checks were reported".to_owned();
+    }
+    let green = rows.iter().filter(|row| row.is_green()).count();
+    let failed = rows
+        .iter()
+        .filter(|row| row.state == crate::verify::CheckOutcome::Failed)
+        .count();
+    let names: Vec<String> = rows
+        .iter()
+        .map(|row| format!("{} {}", row.name, row.label()))
+        .collect();
+    format!(
+        "{green}/{} passed{}{} — {}",
+        rows.len(),
+        if failed > 0 {
+            format!(", {failed} failed")
+        } else {
+            String::new()
+        },
+        if rows.len() > green + failed {
+            format!(", {} other", rows.len() - green - failed)
+        } else {
+            String::new()
+        },
+        names.join(", ")
+    )
 }
 
 #[cfg(test)]
@@ -531,6 +719,100 @@ mod tests {
             node: crate::session::NodeId(1),
             text: text.to_owned(),
         }
+    }
+
+    #[test]
+    fn the_header_clock_measures_the_task_and_stops_at_its_end() {
+        let mut state = WorkbenchState::new("/tmp/ws");
+        assert_eq!(state.elapsed_secs(), 0, "idle before any task");
+
+        state.apply(&task_started("x"));
+        assert!(state.task_started.is_some());
+
+        state.apply(&SessionEvent::TaskCompleted {
+            task: TaskId(1),
+            summary: "done".to_owned(),
+        });
+        // A finished task stops counting: the ticker must not run forever
+        // on a task that ended.
+        assert!(state.task_started.is_none());
+        assert_eq!(state.elapsed_secs(), state.last_duration_secs);
+    }
+
+    #[test]
+    fn a_check_run_never_fabricates_a_result() {
+        let mut state = WorkbenchState::new("/tmp/ws");
+        // A run that could not happen says so, and reports no checks.
+        state.apply_check_outcome(crate::tui::CheckOutcome::Unavailable(
+            "no workspace".to_owned(),
+        ));
+        assert!(
+            state.timeline.iter().any(
+                |entry| entry.kind == TimelineKind::Error && entry.text.contains("unavailable")
+            ),
+            "an unavailable run is reported as an error, not silence"
+        );
+        assert!(state.known_checks().is_empty());
+    }
+
+    #[test]
+    fn a_check_run_records_real_rows_and_summarizes_them() {
+        let mut state = WorkbenchState::new("/tmp/ws");
+        let rows = vec![
+            crate::review::CheckRow {
+                name: "build".to_owned(),
+                state: crate::verify::CheckOutcome::Passed,
+                revision: "abc123".to_owned(),
+                current_revision: true,
+                summary: "ok".to_owned(),
+                diagnostics: Vec::new(),
+                output_truncated: false,
+            },
+            crate::review::CheckRow {
+                name: "test".to_owned(),
+                state: crate::verify::CheckOutcome::Failed,
+                revision: "abc123".to_owned(),
+                current_revision: true,
+                summary: "3 failed".to_owned(),
+                diagnostics: vec!["error[E0308]".to_owned()],
+                output_truncated: false,
+            },
+        ];
+        state.apply_check_outcome(crate::tui::CheckOutcome::Ran {
+            rows,
+            revision: "abcdef0123456789".to_owned(),
+        });
+
+        assert_eq!(state.checks, 2);
+        assert_eq!(state.known_checks().len(), 2);
+        // The summary must not report a failing suite as green.
+        let summary = state.timeline.last().unwrap();
+        assert!(summary.text.contains("1/2"));
+        assert!(summary.text.contains("test failed"));
+    }
+
+    #[test]
+    fn a_review_with_no_content_says_so_rather_than_opening_empty() {
+        let state = WorkbenchState::new("/tmp/ws");
+        assert!(state.known_checks().is_empty());
+        assert!(state.review_changes().is_empty());
+    }
+
+    #[test]
+    fn the_setup_summary_states_the_configuration_it_has() {
+        let mut state = WorkbenchState::new("/tmp/ws");
+        state.model = Some("glm-5.3-flash".to_owned());
+        state.endpoint = Some("api.z.ai".to_owned());
+        state.checks = 3;
+        let summary = state.setup_summary();
+        assert!(summary.contains("glm-5.3-flash"));
+        assert!(summary.contains("api.z.ai"));
+        assert!(summary.contains('3'));
+
+        // Without a model the summary explains what is missing.
+        let mut offline = WorkbenchState::new("/tmp/ws");
+        offline.unavailable = Some("set KNUT_PROVIDER_API_KEY".to_owned());
+        assert!(offline.setup_summary().contains("KNUT_PROVIDER_API_KEY"));
     }
 
     #[test]

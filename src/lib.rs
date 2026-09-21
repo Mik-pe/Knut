@@ -8,12 +8,14 @@ mod concurrency;
 mod context;
 mod decision;
 mod edge;
+mod engine;
 mod error;
 mod evals;
 mod frame;
 mod headless;
 mod inspector;
 mod judgment;
+mod knot;
 mod lsp;
 mod matrix;
 mod mcp;
@@ -29,6 +31,7 @@ mod sandbox;
 mod session;
 mod system_one;
 mod system_zero;
+mod theme;
 mod tool;
 mod tree;
 mod tui;
@@ -76,6 +79,7 @@ pub use decision::{Action, Decision, DecisionInput, ModelTier, RetrievalSource, 
 pub use edge::{
     EdgeChoice, EdgeJudgment, EdgeRouter, EdgeSelector, EdgeState, MAX_STEP_ATTEMPTS, NodeOutcome,
 };
+pub use engine::{Engine, EngineReport, action_label, build_here, run_engine, source_label};
 pub use error::{KnutError, SystemOneFailure, redacted};
 pub use evals::{
     Benchmark, BenchmarkComparison, BenchmarkTask, CostModel, Expectation, Metrics,
@@ -101,6 +105,7 @@ pub use judgment::{
     Complexity, Handler, IngressJudgments, Judgment, JudgmentRouter, JudgmentSystemOne,
     RetrievalJudgment, StaticJudgments, TierJudgment, YesNo,
 };
+pub use knot::{Art, KNOT_LARGE, KNOT_MEDIUM, KNOT_SMALL, TAGLINE, WORDMARK, art_for, logo_lines};
 pub use lsp::{
     Degradation, Diagnostic, DiagnosticSeverity, DiagnosticsState, DocumentVersions,
     LSP_PROTOCOL_VERSION, LanguageServerManager, Location, LspFeature, MAX_NAVIGATION_RESULTS,
@@ -165,6 +170,7 @@ pub use system_zero::{
     ExplicitCapabilityRule, InvalidInputRule, RoutingCache, RuleVerdict, SystemZero,
     SystemZeroOutcome, SystemZeroRule, UnavailableCapabilityRule,
 };
+pub use theme::{ColorLevel, Glyphs, Palette, Rgb, Theme};
 pub use tool::{
     SchemaError, SideEffect, Tool, ToolMetadata, ToolRegistry, validate_arguments,
     validate_schema_supported,
@@ -174,7 +180,10 @@ pub use tree::{
     PlanNode, TreeExecutor, TreeRunResult, collect_refs, resolve_input, validate_plan,
 };
 pub use tui::{ShellAction, TerminalGuard, handle_key, run_shell};
-pub use tui_render::{LayoutPlan, NARROW_WIDTH, Tab, plan_layout, render, render_review};
+pub use tui_render::{
+    LayoutPlan, NARROW_WIDTH, Tab, plan_layout, render, render_review, render_review_themed,
+    render_themed,
+};
 pub use tui_state::{
     Focus, MAX_ENTRY_CHARS, MAX_TIMELINE, PendingPrompt, TimelineEntry, TimelineKind,
     WorkbenchState, WorkbenchStats,

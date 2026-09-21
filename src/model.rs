@@ -481,6 +481,15 @@ impl ComputeCascade {
         }
     }
 
+    /// Whether this cascade can serve a given tier.
+    ///
+    /// Public because "the reasoner is configured" and "the runtime can
+    /// actually generate" are different claims, and a client that shows
+    /// the first should be able to check the second.
+    pub fn has_model_for(&self, tier: ModelTier) -> bool {
+        self.model_for(tier).is_some()
+    }
+
     fn next_tier(tier: ModelTier) -> Option<ModelTier> {
         match tier {
             ModelTier::Fast => Some(ModelTier::Standard),

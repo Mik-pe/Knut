@@ -725,6 +725,11 @@ impl DecisionInspector {
 
     /// A summary of the graph.
     pub fn graph_summary(&self) -> String {
+        if self.nodes.is_empty() {
+            // No nodes yet is a fact about the session, not an incomplete
+            // sentence: "0 node(s): " reads as a truncated label.
+            return "no nodes yet".to_owned();
+        }
         let mut counts: BTreeMap<&str, usize> = BTreeMap::new();
         for node in &self.nodes {
             *counts.entry(node.state_label()).or_default() += 1;

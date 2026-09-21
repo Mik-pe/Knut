@@ -108,6 +108,24 @@ pub struct ChangeSet {
 }
 
 impl ChangeSet {
+    /// An empty change set: no files were changed.
+    ///
+    /// Legal and useful — a review with checks but no diff is exactly what
+    /// a verification-only session produces, and it must not be confused
+    /// with a review that failed to load.
+    pub fn empty() -> Self {
+        Self {
+            files: Vec::new(),
+            proposal_identity: "workspace".to_owned(),
+            preconditions: Vec::new(),
+        }
+    }
+
+    /// Whether any file changed in this proposal.
+    pub fn is_empty(&self) -> bool {
+        self.files.is_empty()
+    }
+
     /// Build a change set from a validated patch and the current file
     /// contents.
     pub fn from_patch(patch: &ValidatedPatch, contents: &BTreeMap<String, String>) -> Self {

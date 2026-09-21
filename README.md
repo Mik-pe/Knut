@@ -102,6 +102,62 @@ repository:
 `knut doctor` reports what is missing with actionable guidance, and makes
 no paid request unless you pass `--live`.
 
+## The workbench (`knut tui`)
+
+`knut tui` opens the shell over the same `SessionRuntime` that `knut run`
+uses: the real provider, the real workspace tools, the same approval gate
+and the same revision-bound checks. Nothing in the UI is a simulation of
+work; the shell renders what the runtime published and nothing else.
+
+```text
+ ──────────────────────────────────────────────────────────────
+  ⟠ knut  ~/Work/Knut  ▏ main                        01:24
+  ▸ running ▏ quality  ▏ glm-5.3-flash  ▏ api.z.ai  ▏ 3 checks
+ ╭─ transcript ─────────────────────────╮╭─ jobs ────────────────╮
+ │ ❯ fix the failing test in src/lib.rs ││ active                │
+ │ ▏ ▸ reading src/lib.rs               ││  ⠹ run cargo test     │
+ │   ✔ read: ok {"lines": 42}           ││ recent                │
+ │ ◆ system one [recovery v1]: verify   ││  ✔ read       120ms   │
+ ╰──────────────────────────────────────╯╰───────────────────────╯
+ ╭─ enter submit | ctrl+j newline | : commands ─────────────────╮
+ │ ❯ █                                                          │
+ ╰──────────────────────────────────────────────────────────────╯
+```
+
+What is deliberate:
+
+- **Degrade, never lie.** Colour is detected (`COLORTERM`, `TERM`,
+  `NO_COLOR`, or an explicit `KNUT_TUI_COLORS=truecolor|256|16|none`).
+  A 256-colour terminal gets the nearest cube entry, a 16-colour terminal
+  gets the nearest classic colour, and a terminal with no colour gets
+  weight and glyph contrast instead. Status is always carried by a word
+  *and* a glyph, so nothing becomes unreadable when the palette collapses.
+- **The transcript is a rail, not a wall.** Each entry kind has its own
+  glyph and colour, and a streaming turn shows a live cursor block, so a
+  stalled stream and a live one look different.
+- **Jobs are honest.** A card that stopped says *how*: cancelled, timed
+  out and failed are distinct words, and a narrow pane drops the summary
+  before it drops the state.
+- **Nothing runs on the keystroke path.** Checks run on a worker and come
+  back as messages; a slow provider cannot block typing, scrolling or the
+  decision inspector.
+
+| key | action |
+| --- | --- |
+| `Enter` | submit the composed task |
+| `Ctrl+J` | newline in the composer |
+| `Tab` | cycle focus (composer → transcript → state) |
+| `↑` `↓` `PgUp` `PgDn` `Home` `End` | scroll the transcript |
+| `a` / `d` | approve or deny a gated action |
+| `c` / `p` / `r` | cancel / pause / resume the running task |
+| `v` | review: recorded changes and check evidence |
+| `V` | run the workspace's real checks now |
+| `i` | decision inspector (System 0/1 provenance) |
+| `:` | command palette (every entry states whether it exists) |
+| `1` `2` `3` | transcript / state / jobs on narrow terminals |
+| `F1` / `?` | help |
+| `q` / `Ctrl+C` | quit, restoring the terminal |
+
 ## Commands
 
 ```console

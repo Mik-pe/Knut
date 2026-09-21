@@ -29,6 +29,11 @@ use knut::{
 fn main() -> std::process::ExitCode {
     let args: Vec<String> = std::env::args().skip(1).collect();
 
+    // Load a nearby `.env` before anything reads credentials. Values are
+    // *added* to the environment and never overwrite what the operator set,
+    // so an exported key always wins over a file.
+    load_env_file();
+
     // The workbench shell polls the terminal on the main task, so session
     // work runs on a separate worker: a slow provider must never block
     // typing. Other commands do not need threads, but the cost is
@@ -45,6 +50,42 @@ fn main() -> std::process::ExitCode {
             eprintln!("error: {err}");
             std::process::ExitCode::from(2)
         }
+    }
+}
+
+/// Load `.env` from the working directory, if present.
+///
+/// Deliberately minimal and non-destructive:
+///
+/// - only `KEY=value` lines are read, with `#` comments and optional
+///   surrounding quotes;
+/// - a variable already present in the environment is never overwritten,
+///   so an explicitly exported credential always wins over the file;
+/// - values are never logged, echoed or reported, only set.
+///
+/// This exists because the shell's first question is "is a reasoner
+/// configured?", and answering "no" while a `.env` sits in the checkout
+/// would be wrong.
+fn load_env_file() {
+    let Ok(contents) = std::fs::read_to_string(".env") else {
+        return;
+    };
+    for line in contents.lines() {
+        let line = line.trim();
+        if line.is_empty() || line.starts_with('#') {
+            continue;
+        }
+        let Some((key, value)) = line.split_once('=') else {
+            continue;
+        };
+        let key = key.trim();
+        if key.is_empty() || std::env::var_os(key).is_some() {
+            continue;
+        }
+        let value = value.trim().trim_matches('"').trim_matches('\'');
+        // SAFETY: this runs before any worker thread starts, so there is
+        // no concurrent reader of the environment.
+        unsafe { std::env::set_var(key, value) };
     }
 }
 
@@ -525,62 +566,28 @@ async fn demo_tree(verbose: bool) -> Result<(), KnutError> {
 /// The shell renders events the runtime publishes; it never executes
 /// tools or runs its own agent loop. Session work happens on a background
 /// task, so a slow provider cannot block typing or navigation.
+///
+/// The engine is the *real* one: the same provider, workspace tools,
+/// approval gate, sandbox and completion checks `knut run` uses. When a
+/// provider is missing the shell still opens — it says what is missing and
+/// fails submitted tasks with that reason, rather than staging a demo.
 async fn tui() -> Result<(), KnutError> {
     let workspace = knut::Workspace::open(".")?;
-    let mut state = knut::WorkbenchState::new(workspace.root().to_string_lossy().into_owned());
+    let root = workspace.root().to_string_lossy().into_owned();
+
+    let (engine, report) = knut::build_here();
+    let mut state = knut::WorkbenchState::new(root).with_theme(knut::Theme::detect());
     state.mode = std::env::var("KNUT_MODE").unwrap_or_else(|_| "quality".to_owned());
-    state.model = std::env::var("KNUT_PROVIDER_MODEL").ok().or_else(|| {
-        std::env::var("KNUT_PROVIDER_API_KEY")
-            .ok()
-            .map(|_| "configured".to_owned())
-    });
+    state.model = report.model.clone();
+    state.endpoint = report.endpoint_label();
+    state.unavailable = report.unavailable.clone();
+    state.checks = report.checks.len();
 
-    // A demo session drives the shell when no live backend is configured,
-    // so the workbench is useful (and testable) without credentials.
+    // Session work runs behind the display so a slow provider can never
+    // block a keystroke.
     let (event_tx, event_rx) = tokio::sync::mpsc::unbounded_channel();
-    let (command_tx, mut command_rx) = tokio::sync::mpsc::unbounded_channel();
-
-    tokio::spawn(async move {
-        let _ = event_tx.send(knut::SessionEvent::SessionStarted {
-            protocol_version: knut::SESSION_PROTOCOL_VERSION,
-        });
-
-        // The shell is over scripted events by default; a live session
-        // replaces this loop when providers are configured (#18/#21).
-        while let Some(command) = command_rx.recv().await {
-            match command {
-                knut::SessionCommand::Submit { prompt } => {
-                    let _ = event_tx.send(knut::SessionEvent::TaskStarted {
-                        task: knut::TaskId(1),
-                        prompt: prompt.clone(),
-                    });
-                    let _ = event_tx.send(knut::SessionEvent::Routed {
-                        task: knut::TaskId(1),
-                        turn: knut::TurnId(1),
-                        revision: knut::TaskRevision(1),
-                        source: knut::DecisionSource::SystemOne,
-                        action: knut::Action::Discover,
-                        confidence: 0.9,
-                    });
-                    let _ = event_tx.send(knut::SessionEvent::WaitingForUser {
-                        task: knut::TaskId(1),
-                        turn: knut::TurnId(1),
-                        wait: knut::WaitKind::Question,
-                        message:
-                            "no reasoner configured: set KNUT_PROVIDER_API_KEY to run tasks end to end"
-                                .to_owned(),
-                    });
-                    let _ = prompt;
-                }
-                knut::SessionCommand::Cancel => {
-                    let _ = event_tx.send(knut::SessionEvent::TaskCancelled {
-                        task: knut::TaskId(1),
-                    });
-                }
-                _ => {}
-            }
-        }
-    });
+    let (command_tx, command_rx) = tokio::sync::mpsc::unbounded_channel();
+    tokio::spawn(knut::run_engine(engine, command_rx, event_tx));
 
     knut::run_shell(state, event_rx, command_tx)
         .await
@@ -1278,10 +1285,21 @@ async fn doctor(live: bool) -> Result<(), KnutError> {
         _ => println!("  system one:  not configured (TYPESAFE_API_KEY unset)"),
     }
 
-    // Reasoner (BYOK provider) configuration.
-    match std::env::var("KNUT_PROVIDER_API_KEY") {
-        Ok(key) if !key.trim().is_empty() => {
-            let config = knut::ProviderConfig::from_env()?;
+    // Reasoner (BYOK provider) configuration. The Z.ai coding key is
+    // accepted as a fallback, exactly as `knut run` and the shell accept
+    // it: doctor must not report "not configured" for a setup that works.
+    let reasoner_key = std::env::var("KNUT_PROVIDER_API_KEY")
+        .ok()
+        .filter(|key| !key.trim().is_empty())
+        .or_else(|| {
+            std::env::var("ZAI_API_KEY")
+                .ok()
+                .filter(|key| !key.trim().is_empty())
+        });
+    match reasoner_key {
+        Some(_) => {
+            let config = knut::ProviderConfig::from_env()
+                .unwrap_or_else(|_| knut::ProviderConfig::glm_coding(String::new()));
             let summary = config.summary();
             println!(
                 "  reasoner:    configured (model {}, tier {:?}, billing {:?})",
@@ -1322,7 +1340,7 @@ async fn doctor(live: bool) -> Result<(), KnutError> {
                 }
             }
         }
-        _ => println!("  reasoner:    not configured (KNUT_PROVIDER_API_KEY unset)"),
+        _ => println!("  reasoner:    not configured (set KNUT_PROVIDER_API_KEY or ZAI_API_KEY)"),
     }
 
     // The offline playground always works.

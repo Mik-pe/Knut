@@ -603,8 +603,30 @@ where
         self.model_calls.load(Ordering::SeqCst)
     }
 
+    /// The compute cascade this runtime uses for generation.
+    ///
+    /// Exposed so a client can verify that a configured model is reachable
+    /// from every tier a routed action may ask for, rather than
+    /// discovering the gap only when a task fails.
+    pub fn cascade(&self) -> &crate::ComputeCascade {
+        self.cascade.as_ref()
+    }
+
     fn emit(&mut self, event: SessionEvent) {
         self.events.push(event);
+    }
+
+    /// Publish a runtime error from outside the drive loop.
+    ///
+    /// Used by adapters that own a command path the runtime rejected: the
+    /// user must see *why* a keystroke did nothing, and the event log is
+    /// the only transcript every client reads.
+    pub fn emit_runtime_error(&mut self, message: impl Into<String>) {
+        let task = self.task.as_ref().map(|task| task.id);
+        self.emit(SessionEvent::RuntimeError {
+            task,
+            message: message.into(),
+        });
     }
 
     /// The revision identity a completion decision is bound to.

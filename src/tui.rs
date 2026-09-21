@@ -23,7 +23,7 @@ use ratatui::Terminal;
 use ratatui::backend::CrosstermBackend;
 
 use crate::session::{SessionCommand, SessionEvent};
-use crate::tui_render::{Tab, render};
+use crate::tui_render::Tab;
 use crate::tui_state::{Focus, WorkbenchState};
 
 /// What the shell should do after handling input.
@@ -37,6 +37,10 @@ pub enum ShellAction {
     Command(SessionCommand),
     /// Run an implemented palette command by id.
     PaletteCommand(&'static str),
+    /// Run the workspace's real checks and show what they proved.
+    Verify,
+    /// Open the review workspace over the session's recorded changes.
+    Review,
 }
 
 /// Apply one keystroke to the state, returning the next action.
@@ -165,10 +169,12 @@ pub fn handle_key(state: &mut WorkbenchState, key: KeyEvent, tab: &mut Tab) -> S
             }
             ShellAction::Continue
         }
-        KeyCode::Char('v') if state.focus != Focus::Composer => {
-            state.review = None;
-            ShellAction::Continue
-        }
+        // `v` toggles the review workspace: it shows the session's recorded
+        // changes and checks, and closes when already open.
+        KeyCode::Char('v') if state.focus != Focus::Composer => ShellAction::Review,
+        // `V` runs the workspace's real checks now, so the user can verify
+        // the current revision without waiting for the agent to ask.
+        KeyCode::Char('V') if state.focus != Focus::Composer => ShellAction::Verify,
         KeyCode::Esc => {
             state.focus = Focus::Timeline;
             ShellAction::Continue
@@ -239,6 +245,18 @@ pub fn handle_key(state: &mut WorkbenchState, key: KeyEvent, tab: &mut Tab) -> S
             }
             ShellAction::Continue
         }
+        KeyCode::PageUp if state.focus != Focus::Composer => {
+            state.follow = false;
+            state.selection = state.selection.saturating_sub(10);
+            ShellAction::Continue
+        }
+        KeyCode::PageDown if state.focus != Focus::Composer => {
+            state.selection = (state.selection + 10).min(state.timeline.len().saturating_sub(1));
+            if state.selection + 1 >= state.timeline.len() {
+                state.follow = true;
+            }
+            ShellAction::Continue
+        }
         KeyCode::Left => {
             if state.focus == Focus::Composer {
                 state.composer.left();
@@ -254,12 +272,19 @@ pub fn handle_key(state: &mut WorkbenchState, key: KeyEvent, tab: &mut Tab) -> S
         KeyCode::Home => {
             if state.focus == Focus::Composer {
                 state.composer.home();
+            } else {
+                // Outside the composer, Home/End jump to the ends of the
+                // transcript; End also re-arms following the tail.
+                state.follow = false;
+                state.selection = 0;
             }
             ShellAction::Continue
         }
         KeyCode::End => {
             if state.focus == Focus::Composer {
                 state.composer.end();
+            } else {
+                state.resume_follow();
             }
             ShellAction::Continue
         }
@@ -450,6 +475,86 @@ static INSTALLED: std::sync::Once = std::sync::Once::new();
 /// The process-wide shutdown flag, signal-safe to set.
 static SHUTDOWN: AtomicBool = AtomicBool::new(false);
 
+/// Whether an on-demand check run is in flight.
+///
+/// A tiny state machine rather than a shared `Option` behind a lock: the
+/// shell is single-threaded over its state, so a plain flag is enough and
+/// two `v` presses cannot start two check runs.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+struct CheckGate {
+    running: bool,
+}
+
+impl CheckGate {
+    fn idle() -> Self {
+        Self { running: false }
+    }
+
+    fn get(&self) -> Option<()> {
+        self.running.then_some(())
+    }
+
+    fn start(&mut self) {
+        self.running = true;
+    }
+
+    fn finish(&mut self) {
+        self.running = false;
+    }
+}
+
+/// The result of an on-demand check run.
+///
+/// Deliberately a plain message rather than a shared future: the shell
+/// renders it in the review pane and the status line, and a failed run is
+/// reported as a failure rather than as an empty set of checks.
+#[derive(Debug, Clone, PartialEq)]
+pub enum CheckOutcome {
+    /// Real checks ran; each row is one check with its evidence.
+    Ran {
+        rows: Vec<crate::review::CheckRow>,
+        revision: String,
+    },
+    /// The checks could not run at all, with the reason.
+    Unavailable(String),
+}
+
+/// Run the workspace's checks on a blocking thread.
+///
+/// `run_all` is async and spawns processes; the shell is a separate
+/// runtime task, so this hops to a blocking worker and returns a plain
+/// message.
+async fn run_checks_blocking() -> CheckOutcome {
+    let result = tokio::task::spawn_blocking(|| {
+        let runtime = tokio::runtime::Builder::new_current_thread()
+            .enable_all()
+            .build()
+            .map_err(|err| format!("cannot start the check runtime: {err}"))?;
+        let workspace =
+            crate::Workspace::open(".").map_err(|err| format!("no workspace to check: {err}"))?;
+        let supervisor = Arc::new(crate::Supervisor::new(workspace.clone()));
+        let runner = crate::CheckRunner::new(workspace, supervisor, crate::CheckProfile::rust());
+        let revision = runner
+            .current_revision("workspace")
+            .map_err(|err| format!("cannot identify the current revision: {err}"))?;
+        let evidence = runtime.block_on(runner.run_all(&revision));
+        Ok::<_, String>((
+            evidence
+                .iter()
+                .map(|check| crate::review::CheckRow::from_evidence(check, &revision.revision))
+                .collect::<Vec<_>>(),
+            revision.revision,
+        ))
+    })
+    .await;
+
+    match result {
+        Ok(Ok((rows, revision))) => CheckOutcome::Ran { rows, revision },
+        Ok(Err(reason)) => CheckOutcome::Unavailable(reason),
+        Err(err) => CheckOutcome::Unavailable(format!("the check task failed: {err}")),
+    }
+}
+
 /// Run the shell over a channel of session events.
 ///
 /// `events` is drained without blocking: a slow provider cannot stop
@@ -468,14 +573,28 @@ pub async fn run_shell(
     let mut guard = TerminalGuard::enter()?;
     let mut tab = Tab::Timeline;
 
+    // Checks run on demand and are *not* on the keystroke path: the loop
+    // stays responsive, and a finished run arrives as a message.
+    let (check_tx, mut check_rx) = tokio::sync::mpsc::unbounded_channel::<CheckOutcome>();
+    let mut checks = CheckGate::idle();
+
     loop {
         // Drain every event already published, then draw once: coalescing
         // high-frequency updates instead of painting per event.
         while let Ok(event) = events.try_recv() {
             state.apply(&event);
         }
+        while let Ok(outcome) = check_rx.try_recv() {
+            checks.finish();
+            state.apply_check_outcome(outcome);
+        }
 
-        guard.terminal().draw(|frame| render(frame, &state, tab))?;
+        // The tick drives the spinner and the header clock; state stays
+        // pure, so a frame is still a function of (state, tick).
+        state.advance();
+        guard
+            .terminal()
+            .draw(|frame| crate::tui_render::render_themed(frame, &state, tab, &state.theme))?;
 
         if crossterm::event::poll(Duration::from_millis(50))? {
             match crossterm::event::read()? {
@@ -513,6 +632,73 @@ pub async fn run_shell(
                         }
                         ShellAction::PaletteCommand("help") => {
                             state.help = true;
+                        }
+                        ShellAction::PaletteCommand("verify") => {
+                            if checks.get().is_none() {
+                                checks.start();
+                                state.status = Some("running checks…".to_owned());
+                                let tx = check_tx.clone();
+                                tokio::spawn(async move {
+                                    let outcome = run_checks_blocking().await;
+                                    let _ = tx.send(outcome);
+                                });
+                            }
+                        }
+                        ShellAction::PaletteCommand("review") => {
+                            let known = state.known_checks();
+                            let files = state.review_changes();
+                            if known.is_empty() && files.is_empty() {
+                                state.status =
+                                    Some("no changes or checks to review yet".to_owned());
+                            } else {
+                                let mut view = crate::review::ReviewView::new(files);
+                                view.checks = known;
+                                state.review = Some(view);
+                            }
+                        }
+                        ShellAction::PaletteCommand("doctor") => {
+                            // The shell already knows its own engine
+                            // configuration; reporting it needs no
+                            // subprocess and no invented task.
+                            state.status = Some(state.setup_summary());
+                        }
+                        ShellAction::Verify => {
+                            // The checks are the binary's real ones, run
+                            // off the paint path; the result comes back as
+                            // a message, never as a blocking call here.
+                            if checks.get().is_none() {
+                                checks.start();
+                                state.status = Some("running checks…".to_owned());
+                                let tx = check_tx.clone();
+                                tokio::spawn(async move {
+                                    let outcome = run_checks_blocking().await;
+                                    let _ = tx.send(outcome);
+                                });
+                            }
+                        }
+                        ShellAction::Review => {
+                            // Review opens over whatever the session has
+                            // actually recorded; with nothing recorded it
+                            // says so rather than opening an empty diff.
+                            // Review shows what the session actually
+                            // recorded: its checks always, and its diff
+                            // when a change was validated. With neither,
+                            // it says so rather than opening an empty pane.
+                            match state.review.take() {
+                                Some(_) => {}
+                                None => {
+                                    let checks = state.known_checks();
+                                    let files = state.review_changes();
+                                    if checks.is_empty() && files.is_empty() {
+                                        state.status =
+                                            Some("no changes or checks to review yet".to_owned());
+                                    } else {
+                                        let mut view = crate::review::ReviewView::new(files);
+                                        view.checks = checks;
+                                        state.review = Some(view);
+                                    }
+                                }
+                            }
                         }
                         // The remaining palette entries are honest no-ops
                         // in this increment: they either map to a command
