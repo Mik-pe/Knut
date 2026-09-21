@@ -24,6 +24,7 @@
 
 use std::collections::VecDeque;
 use std::sync::Arc;
+use std::sync::Mutex;
 use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
 
 use serde::{Deserialize, Serialize};
@@ -191,6 +192,29 @@ pub enum SessionEvent {
         output: Value,
     },
 
+    /// Incremental assistant text within one turn.
+    ///
+    /// Droppable: losing a delta must never lose the final artifact. What
+    /// the user sees mid-turn is a stream; what the task acts on is the
+    /// completed response published as a `NodeResult`.
+    TextDelta {
+        task: TaskId,
+        turn: TurnId,
+        node: NodeId,
+        text: String,
+    },
+
+    /// A tool call the model requested, arguments already complete and
+    /// parsed. Partial argument JSON is never published here: a partial
+    /// stream is not an executable command.
+    ToolCallProposed {
+        task: TaskId,
+        turn: TurnId,
+        call_id: String,
+        name: String,
+        arguments: Value,
+    },
+
     /// Edge decision after a meaningful node result.
     EdgeDecided {
         task: TaskId,
@@ -247,7 +271,10 @@ impl SessionEvent {
     /// Critical events (approvals, terminal states, artifacts, routing)
     /// are never droppable.
     fn droppable(&self) -> bool {
-        matches!(self, SessionEvent::RuntimeError { .. })
+        matches!(
+            self,
+            SessionEvent::RuntimeError { .. } | SessionEvent::TextDelta { .. }
+        )
     }
 
     /// The task an event belongs to, when it has one.
@@ -268,7 +295,9 @@ impl SessionEvent {
             | SessionEvent::TaskCompleted { task, .. }
             | SessionEvent::TaskFailed { task, .. }
             | SessionEvent::TaskCancelled { task } => Some(*task),
-            SessionEvent::NodeResult { task, .. } => Some(*task),
+            SessionEvent::NodeResult { task, .. }
+            | SessionEvent::TextDelta { task, .. }
+            | SessionEvent::ToolCallProposed { task, .. } => Some(*task),
         }
     }
 }
@@ -1322,15 +1351,46 @@ where
         });
 
         let request = ModelRequest::new(prompt.to_owned(), crate::ExpectedArtifact::Text);
+
+        // Stream the turn through the cascade: incremental text is
+        // published as it arrives, while the task only ever acts on the
+        // *completed* response. Events are emitted from a sink that
+        // copies them into the runtime's own log, so ordering stays in
+        // the runtime's hands.
+        let node = self.next_node_id();
+        let events: Arc<Mutex<Vec<SessionEvent>>> = Arc::new(Mutex::new(Vec::new()));
+        let mut sink = SessionSink {
+            task: task_id,
+            turn,
+            node,
+            events: Arc::clone(&events),
+        };
         let outcome = self
             .cascade
-            .run(&request, tier, self.verifier.as_ref())
+            .run_streaming(&request, tier, self.verifier.as_ref(), &mut sink)
             .await;
+
+        for event in events.lock().expect("sink lock").drain(..) {
+            self.emit(event);
+        }
 
         match outcome {
             Ok(outcome) => {
                 self.model_calls.fetch_add(1, Ordering::SeqCst);
                 let content = outcome.response.content;
+
+                // Tool calls the model requested are surfaced as proposals
+                // for *bounded* dispatch; arguments are already complete
+                // and parsed here, never a partial JSON fragment.
+                for call in &outcome.response.tool_calls {
+                    self.emit(SessionEvent::ToolCallProposed {
+                        task: task_id,
+                        turn,
+                        call_id: call.id.clone(),
+                        name: call.name.clone(),
+                        arguments: call.arguments.clone(),
+                    });
+                }
 
                 // Generation satisfies the turn only when completion is
                 // permitted; an *unmet* deterministic requirement keeps
@@ -1349,7 +1409,6 @@ where
                 } else {
                     // Generated content is a turn result; publish it and
                     // continue to the next decision.
-                    let node = self.next_node_id();
                     self.emit(SessionEvent::NodeResult {
                         task: task_id,
                         turn,
@@ -1397,6 +1456,48 @@ fn find_node<'a>(plan: &'a PlanNode, node_id: &str) -> Option<&'a PlanNode> {
     plan.children()
         .iter()
         .find_map(|child| find_node(child, node_id))
+}
+
+/// Copies stream events into the session's event vocabulary.
+///
+/// The sink only translates; the runtime decides when the events are
+/// published, so the transcript stays totally ordered.
+struct SessionSink {
+    task: TaskId,
+    turn: TurnId,
+    node: NodeId,
+    events: Arc<Mutex<Vec<SessionEvent>>>,
+}
+
+impl crate::ModelStreamSink for SessionSink {
+    fn on_event(&self, event: crate::ModelStreamEvent) {
+        let translated = match event {
+            crate::ModelStreamEvent::TextDelta { text } => Some(SessionEvent::TextDelta {
+                task: self.task,
+                turn: self.turn,
+                node: self.node,
+                text,
+            }),
+            // Reasoning text is provider state: preserved for
+            // continuation, never published as if it were assistant
+            // output the user or the task should act on.
+            crate::ModelStreamEvent::ReasoningDelta { .. } => None,
+            // Partial tool arguments are deliberately not published: a
+            // fragment is not an executable command. Complete calls are
+            // published by the runtime after the turn finishes.
+            crate::ModelStreamEvent::ToolCallStarted { .. }
+            | crate::ModelStreamEvent::ToolCallArgumentsDelta { .. }
+            | crate::ModelStreamEvent::ToolCallEnded { .. } => None,
+            crate::ModelStreamEvent::Completed { .. }
+            | crate::ModelStreamEvent::Incomplete { .. } => None,
+        };
+
+        if let Some(event) = translated
+            && let Ok(mut events) = self.events.lock()
+        {
+            events.push(event);
+        }
+    }
 }
 
 /// Find the first tool node in a plan (pre-order), destructured to its
@@ -1449,8 +1550,8 @@ mod tests {
     use crate::tool::{SideEffect, Tool, ToolMetadata};
     use crate::{
         ComputeCascade, Decision, DecisionInput, ExecutionGate, KnutError, ModelIdentity,
-        ModelRequest, ModelResponse, ModelTier, Risk, Route, SystemOne, Usage, VerificationVerdict,
-        Verifier,
+        ModelRequest, ModelResponse, ModelStreamSink, ModelTier, Risk, Route, SystemOne, Usage,
+        VerificationVerdict, Verifier,
     };
 
     use super::*;
@@ -1493,15 +1594,12 @@ mod tests {
             } else {
                 queue.remove(0)
             };
-            Ok(ModelResponse {
+            Ok(ModelResponse::text(
                 content,
-                identity: self.identity(),
-                usage: Usage {
-                    input_tokens: 10,
-                    output_tokens: 10,
-                },
-                latency: std::time::Duration::ZERO,
-            })
+                self.identity(),
+                Usage::known(10, 10),
+                std::time::Duration::ZERO,
+            ))
         }
     }
 
@@ -1924,6 +2022,208 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn streaming_deltas_and_tool_call_proposals_reach_the_transcript() {
+        // A streaming adapter: fragments become TextDelta events as they
+        // arrive, and a completed tool call becomes a proposal with
+        // parsed arguments (never a partial JSON fragment).
+        struct StreamingReasoner;
+
+        #[async_trait]
+        impl crate::Model for StreamingReasoner {
+            fn identity(&self) -> ModelIdentity {
+                ModelIdentity {
+                    provider: "fake".to_owned(),
+                    model: "streaming".to_owned(),
+                    tier: ModelTier::Reasoner,
+                }
+            }
+
+            async fn complete(&self, _r: &ModelRequest) -> Result<ModelResponse, KnutError> {
+                unimplemented!("this fake streams")
+            }
+
+            fn capabilities(&self) -> crate::ModelCapabilities {
+                crate::ModelCapabilities {
+                    streaming: true,
+                    tools: true,
+                    reasoning: true,
+                    continuation: true,
+                    usage: true,
+                }
+            }
+
+            async fn stream(
+                &self,
+                _request: &ModelRequest,
+                sink: &mut (dyn crate::ModelStreamSink + Send),
+            ) -> Result<ModelResponse, KnutError> {
+                sink.on_event(crate::ModelStreamEvent::TextDelta {
+                    text: "wor".to_owned(),
+                });
+                sink.on_event(crate::ModelStreamEvent::TextDelta {
+                    text: "king".to_owned(),
+                });
+                sink.on_event(crate::ModelStreamEvent::ToolCallStarted {
+                    id: "call_7".to_owned(),
+                    name: "read".to_owned(),
+                });
+                sink.on_event(crate::ModelStreamEvent::ToolCallArgumentsDelta {
+                    id: "call_7".to_owned(),
+                    delta: "{\"path\":\"a.rs\"}".to_owned(),
+                });
+                sink.on_event(crate::ModelStreamEvent::ToolCallEnded {
+                    id: "call_7".to_owned(),
+                });
+                sink.on_event(crate::ModelStreamEvent::Completed {
+                    usage: Usage::known(5, 2),
+                });
+
+                let buffered = crate::BufferedSink::new();
+                buffered.on_event(crate::ModelStreamEvent::TextDelta {
+                    text: "working".to_owned(),
+                });
+                buffered.on_event(crate::ModelStreamEvent::ToolCallStarted {
+                    id: "call_7".to_owned(),
+                    name: "read".to_owned(),
+                });
+                buffered.on_event(crate::ModelStreamEvent::ToolCallArgumentsDelta {
+                    id: "call_7".to_owned(),
+                    delta: "{\"path\":\"a.rs\"}".to_owned(),
+                });
+                buffered.on_event(crate::ModelStreamEvent::Completed {
+                    usage: Usage::known(5, 2),
+                });
+                Ok(buffered
+                    .into_response(self.identity(), std::time::Duration::ZERO)
+                    .expect("complete stream"))
+            }
+        }
+
+        let router = Arc::new(Knut::new(Arc::new(AlwaysGenerate)));
+        let cascade = Arc::new(ComputeCascade::empty().with_reasoner(StreamingReasoner));
+        let planner = Planner::new(Arc::clone(&cascade));
+        let gate = Arc::new(ExecutionGate::new(
+            crate::SideEffectPolicy::new().allow(SideEffect::ReadOnly),
+        ));
+        let mut runtime = SessionRuntime::new(
+            router,
+            planner,
+            registry(),
+            gate,
+            cascade,
+            Arc::new(AcceptAll),
+        )
+        .with_requirements(CompletionRequirements::none().require(
+            "tests",
+            "tests pass",
+            true,
+        ));
+
+        runtime
+            .command(SessionCommand::Submit {
+                prompt: "fix the bug".to_owned(),
+            })
+            .await
+            .unwrap();
+        let state = drive_until_stable(&mut runtime, 6).await.unwrap();
+        assert_ne!(state, TaskState::Completed);
+
+        let events: Vec<&SessionEvent> = runtime.events().events().collect();
+
+        // Incremental text arrived as separate deltas, in order. The
+        // unmet requirement keeps the task running, so the stream is
+        // per-turn: assert the first turn's deltas exactly.
+        let first_turn = runtime
+            .events()
+            .events()
+            .filter_map(|e| match e {
+                SessionEvent::Routed { turn, .. } => Some(*turn),
+                _ => None,
+            })
+            .next()
+            .expect("a routing decision");
+        let deltas: Vec<&str> = events
+            .iter()
+            .filter_map(|e| match e {
+                SessionEvent::TextDelta { text, turn, .. } if *turn == first_turn => {
+                    Some(text.as_str())
+                }
+                _ => None,
+            })
+            .collect();
+        assert_eq!(deltas, vec!["wor", "king"]);
+
+        // The completed tool call is a proposal with parsed arguments.
+        let proposals: Vec<(&str, &Value)> = events
+            .iter()
+            .filter_map(|e| match e {
+                SessionEvent::ToolCallProposed {
+                    call_id, arguments, ..
+                } => Some((call_id.as_str(), arguments)),
+                _ => None,
+            })
+            .collect();
+        assert!(!proposals.is_empty());
+        assert_eq!(proposals[0].0, "call_7");
+        assert_eq!(*proposals[0].1, json!({ "path": "a.rs" }));
+
+        // No event ever carries partial argument JSON.
+        assert!(!events.iter().any(|e| matches!(
+            e,
+            SessionEvent::ToolCallProposed { arguments, .. } if arguments.is_null()
+        )));
+    }
+
+    #[tokio::test]
+    async fn dropped_deltas_never_lose_the_terminal_result() {
+        // Delta events are droppable under pressure; the completed
+        // artifact is not. Force heavy churn and confirm the outcome and
+        // node result survive.
+        let mut runtime = runtime_with(
+            Arc::new(AlwaysGenerate),
+            vec!["answer".to_owned()],
+            crate::SideEffectPolicy::new().allow(SideEffect::ReadOnly),
+        )
+        .with_requirements(CompletionRequirements::none().require(
+            "tests",
+            "tests pass",
+            true,
+        ));
+
+        runtime
+            .command(SessionCommand::Submit {
+                prompt: "go".to_owned(),
+            })
+            .await
+            .unwrap();
+        runtime.drive().await.unwrap();
+
+        // Flood the log with droppable deltas.
+        for i in 0..(EVENT_LOG_CAPACITY * 2) {
+            runtime.emit(SessionEvent::TextDelta {
+                task: TaskId(1),
+                turn: TurnId(1),
+                node: NodeId(1),
+                text: format!("chunk {i}"),
+            });
+        }
+
+        assert!(runtime.events().dropped() > 0);
+        assert!(
+            runtime
+                .events()
+                .events()
+                .any(|e| matches!(e, SessionEvent::NodeResult { .. }))
+        );
+        assert!(
+            !runtime
+                .events()
+                .events()
+                .any(|e| matches!(e, SessionEvent::TextDelta { text, .. } if text == "chunk 0"))
+        );
+    }
+
+    #[tokio::test]
     async fn denial_fails_the_task_without_bypass() {
         let mut runtime = runtime_with(
             Arc::new(ActFiles),
@@ -2323,12 +2623,12 @@ mod tests {
             }
 
             async fn complete(&self, _r: &ModelRequest) -> Result<ModelResponse, KnutError> {
-                Ok(ModelResponse {
-                    content: "not json".to_owned(),
-                    identity: self.identity(),
-                    usage: Usage::default(),
-                    latency: std::time::Duration::ZERO,
-                })
+                Ok(ModelResponse::text(
+                    "not json".to_owned(),
+                    self.identity(),
+                    Usage::default(),
+                    std::time::Duration::ZERO,
+                ))
             }
         }
 

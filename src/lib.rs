@@ -33,8 +33,9 @@ pub use judgment::{
     RetrievalJudgment, StaticJudgments, TierJudgment, YesNo,
 };
 pub use model::{
-    CascadeOutcome, ComputeCascade, ExpectedArtifact, Model, ModelAttempt, ModelIdentity,
-    ModelRequest, ModelResponse, Usage, VerificationVerdict, Verifier,
+    BufferedSink, CascadeOutcome, ComputeCascade, Continuation, ContinuationPart, ExpectedArtifact,
+    Model, ModelAttempt, ModelCapabilities, ModelIdentity, ModelRequest, ModelResponse,
+    ModelStreamEvent, ModelStreamSink, ToolCall, Usage, VerificationVerdict, Verifier,
 };
 pub use planner::{MAX_DEPTH, MAX_NODES, PlanRejection, Planner, PlanningContext, ValidatedPlan};
 pub use policy::{

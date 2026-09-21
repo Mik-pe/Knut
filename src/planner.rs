@@ -388,15 +388,12 @@ mod tests {
                 queue.remove(0)
             };
 
-            Ok(ModelResponse {
+            Ok(ModelResponse::text(
                 content,
-                identity: self.identity(),
-                usage: Usage {
-                    input_tokens: 10,
-                    output_tokens: 10,
-                },
-                latency: std::time::Duration::ZERO,
-            })
+                self.identity(),
+                Usage::known(10, 10),
+                std::time::Duration::ZERO,
+            ))
         }
     }
 

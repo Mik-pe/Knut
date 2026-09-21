@@ -394,15 +394,12 @@ async fn demo_tree(verbose: bool) -> Result<(), KnutError> {
         }
 
         async fn complete(&self, _request: &ModelRequest) -> Result<ModelResponse, KnutError> {
-            Ok(ModelResponse {
-                content: self.content.clone(),
-                identity: self.identity(),
-                usage: Usage {
-                    input_tokens: 12,
-                    output_tokens: 8,
-                },
-                latency: std::time::Duration::from_millis(2),
-            })
+            Ok(ModelResponse::text(
+                self.content.clone(),
+                self.identity(),
+                Usage::known(12, 8),
+                std::time::Duration::from_millis(2),
+            ))
         }
     }
 

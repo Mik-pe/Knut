@@ -910,15 +910,12 @@ mod tests {
 
         async fn complete(&self, _request: &ModelRequest) -> Result<ModelResponse, KnutError> {
             *self.calls.lock().unwrap() += 1;
-            Ok(ModelResponse {
-                content: self.content.clone(),
-                identity: self.identity(),
-                usage: Usage {
-                    input_tokens: 1,
-                    output_tokens: 1,
-                },
-                latency: std::time::Duration::ZERO,
-            })
+            Ok(ModelResponse::text(
+                self.content.clone(),
+                self.identity(),
+                Usage::known(1, 1),
+                std::time::Duration::ZERO,
+            ))
         }
     }
 
@@ -966,15 +963,12 @@ mod tests {
 
         async fn complete(&self, request: &ModelRequest) -> Result<ModelResponse, KnutError> {
             self.seen.lock().unwrap().push(request.input.clone());
-            Ok(ModelResponse {
-                content: self.content.clone(),
-                identity: self.identity(),
-                usage: Usage {
-                    input_tokens: 1,
-                    output_tokens: 1,
-                },
-                latency: std::time::Duration::ZERO,
-            })
+            Ok(ModelResponse::text(
+                self.content.clone(),
+                self.identity(),
+                Usage::known(1, 1),
+                std::time::Duration::ZERO,
+            ))
         }
     }
 
