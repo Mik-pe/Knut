@@ -533,6 +533,12 @@ where
         self
     }
 
+    /// Bind completion checks to an explicit artifact revision.
+    pub fn with_artifact_revision(mut self, revision: crate::ArtifactRevision) -> Self {
+        self.artifact = Some(revision);
+        self
+    }
+
     /// Seed evidence for the current artifact revision (test/seam for
     /// evidence-gated completion; real verifiers arrive with #26).
     pub fn seed_evidence(&mut self, evidence: Evidence) {
@@ -2755,6 +2761,133 @@ mod tests {
             e,
             SessionEvent::NodeResult { .. } | SessionEvent::Generating { .. }
         )));
+    }
+
+    #[tokio::test]
+    async fn only_real_check_evidence_completes_a_coding_task() {
+        // The coding slice's completion path is the check runner's
+        // revision-bound evidence: a plan that produced a valid artifact
+        // (schema-valid JSON, accepted by the shape verifier) still does
+        // not complete the task.
+        let fixture = std::env::temp_dir().join(format!(
+            "knut-session-evidence-{}-{:?}",
+            std::process::id(),
+            std::time::SystemTime::now()
+                .duration_since(std::time::UNIX_EPOCH)
+                .unwrap()
+                .as_nanos()
+        ));
+        std::fs::create_dir_all(fixture.join("src")).unwrap();
+        std::fs::write(fixture.join("Cargo.toml"), "[package]\nname = \"x\"\n").unwrap();
+        std::fs::write(fixture.join("src/lib.rs"), "pub fn x() {}\n").unwrap();
+        let workspace = crate::Workspace::open(&fixture).unwrap();
+
+        let supervisor = Arc::new(crate::Supervisor::new(workspace.clone()));
+        let runner = crate::CheckRunner::new(
+            workspace.clone(),
+            supervisor,
+            crate::CheckProfile {
+                name: "fixture".to_owned(),
+                checks: vec![crate::CheckSpec::new(
+                    "test",
+                    "the test suite passes",
+                    "/bin/sh",
+                    vec![
+                        "-c".to_owned(),
+                        "echo 'test result: FAILED. 0 passed; 1 failed'; exit 101".to_owned(),
+                    ],
+                )],
+            },
+        );
+
+        let revision = runner.current_revision("src").unwrap();
+        let checks = runner.run_all(&revision).await;
+        assert_eq!(checks[0].outcome, crate::CheckOutcome::Failed);
+
+        // The session's completion contract, fed with that evidence.
+        let (runtime, _reasoner) = runtime_with_reasoner(
+            Arc::new(AlwaysGenerate),
+            vec!["attempt 1".to_owned(), "attempt 2".to_owned()],
+            crate::SideEffectPolicy::new().allow(SideEffect::ReadOnly),
+        );
+        let mut runtime = runtime
+            .with_requirements(runner.requirements())
+            .with_artifact_revision(revision.clone());
+
+        // Even a passing *shape* check cannot satisfy the requirement.
+        for check in &checks {
+            runtime.seed_evidence(check.to_evidence());
+        }
+
+        runtime
+            .command(SessionCommand::Submit {
+                prompt: "fix the failing test".to_owned(),
+            })
+            .await
+            .unwrap();
+        let state = drive_until_stable(&mut runtime, 4).await.unwrap();
+        assert_ne!(
+            state,
+            TaskState::Completed,
+            "a failing check produced completion"
+        );
+
+        // Once the check genuinely passes at the same revision, it does.
+        let mut passing_checks = checks.clone();
+        passing_checks[0].outcome = crate::CheckOutcome::Passed;
+        passing_checks[0].reason = "passed".to_owned();
+        passing_checks[0].test_counts = crate::TestCounts {
+            passed: Some(1),
+            failed: Some(0),
+            ignored: Some(0),
+        };
+
+        let mut runtime = runtime_with(
+            Arc::new(AlwaysGenerate),
+            vec!["done".to_owned()],
+            crate::SideEffectPolicy::new().allow(SideEffect::ReadOnly),
+        )
+        .with_requirements(runner.requirements())
+        .with_artifact_revision(revision.clone());
+        for check in &passing_checks {
+            runtime.seed_evidence(check.to_evidence());
+        }
+        runtime
+            .command(SessionCommand::Submit {
+                prompt: "fix the failing test".to_owned(),
+            })
+            .await
+            .unwrap();
+        let state = drive_until_stable(&mut runtime, 4).await.unwrap();
+        assert_eq!(state, TaskState::Completed);
+
+        let _ = std::fs::remove_dir_all(&fixture);
+    }
+
+    #[tokio::test]
+    async fn a_review_verdict_is_evidence_but_never_replaces_checks() {
+        // An accepting review is recorded, and a blocking requirement
+        // without checks still blocks: semantic review is additional
+        // evidence, not a substitute.
+        let review = crate::parse_review(r#"{"verdict":"accept","concerns":[]}"#, "reasoner");
+        assert!(review.is_acceptance());
+
+        let mut runtime = runtime_with(
+            Arc::new(AlwaysGenerate),
+            vec!["done".to_owned()],
+            crate::SideEffectPolicy::new().allow(SideEffect::ReadOnly),
+        )
+        .with_requirements(CompletionRequirements::none().require("test", "tests pass", true))
+        .with_artifact_revision(crate::ArtifactRevision::new("patch", "r1"));
+
+        runtime
+            .command(SessionCommand::Submit {
+                prompt: "fix it".to_owned(),
+            })
+            .await
+            .unwrap();
+        let state = drive_until_stable(&mut runtime, 4).await.unwrap();
+        assert_ne!(state, TaskState::Completed);
     }
 
     #[tokio::test]

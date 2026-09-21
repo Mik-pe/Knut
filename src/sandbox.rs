@@ -127,6 +127,10 @@ pub struct CommandRequest {
     pub env: BTreeMap<String, String>,
     pub timeout_secs: u64,
     pub spec: SandboxSpec,
+    /// Read-only host directories the command needs (toolchain roots such
+    /// as `~/.cargo`, `~/.rustup`, `~/.local/share/mise`). Never the home
+    /// directory itself: the caller names exactly what is needed.
+    pub toolchain_paths: Vec<String>,
 }
 
 impl CommandRequest {
@@ -138,7 +142,13 @@ impl CommandRequest {
             env: BTreeMap::new(),
             timeout_secs: DEFAULT_TIMEOUT.as_secs(),
             spec: SandboxSpec::default(),
+            toolchain_paths: default_toolchain_paths(),
         }
+    }
+
+    pub fn with_toolchain_paths(mut self, paths: Vec<String>) -> Self {
+        self.toolchain_paths = paths;
+        self
     }
 
     pub fn with_working_dir(mut self, dir: impl Into<String>) -> Self {
@@ -405,6 +415,78 @@ fn refused_outcome(request: &CommandRequest, reason: String) -> CommandOutcome {
     }
 }
 
+/// Environment a toolchain needs inside the sandbox.
+///
+/// Only variables that point the toolchain at roots this request already
+/// exposes read-only. Nothing else from the parent environment is passed.
+pub fn toolchain_env(request: &CommandRequest) -> Vec<(String, String)> {
+    let mut env = Vec::new();
+    let find = |suffix: &str| {
+        request
+            .toolchain_paths
+            .iter()
+            .find(|path| path.ends_with(suffix))
+            .cloned()
+    };
+    if let Some(cargo_home) = find("/.cargo") {
+        env.push(("CARGO_HOME".to_owned(), cargo_home));
+    }
+    if let Some(rustup_home) = find("/.rustup") {
+        env.push(("RUSTUP_HOME".to_owned(), rustup_home));
+    }
+    // A writable target dir is supplied by the workspace bind; a
+    // read-only cache would break incremental builds, so builds write
+    // inside the workspace instead.
+    env
+}
+
+/// The PATH a sandboxed command runs with.
+///
+/// System locations plus the `bin` directories of the toolchain roots this
+/// request exposes: a toolchain installed under `$HOME` is reachable
+/// without putting the whole home directory on PATH (or in the sandbox).
+pub fn sandbox_path(request: &CommandRequest) -> String {
+    let mut entries = vec![
+        "/usr/local/bin".to_owned(),
+        "/usr/bin".to_owned(),
+        "/bin".to_owned(),
+    ];
+    for toolchain in &request.toolchain_paths {
+        for suffix in ["/bin", ""] {
+            let candidate = format!("{toolchain}{suffix}");
+            let path = std::path::Path::new(&candidate);
+            if path.is_dir() && !entries.contains(&candidate) {
+                entries.push(candidate);
+            }
+        }
+    }
+    entries.join(":")
+}
+
+/// Conventional toolchain roots under the user's home, if they exist.
+///
+/// These are *read-only* mounts. Nothing else from the home directory is
+/// exposed, and the paths are absolute so they work under bubblewrap.
+pub fn default_toolchain_paths() -> Vec<String> {
+    let Some(home) = std::env::var_os("HOME") else {
+        return Vec::new();
+    };
+    let home = std::path::PathBuf::from(home);
+    [
+        "/.cargo",
+        "/.rustup",
+        "/.local/share/mise",
+        "/.bun",
+        "/.nvm",
+        "/.cache",
+    ]
+    .iter()
+    .map(|suffix| home.join(suffix.trim_start_matches('/')))
+    .filter(|path| path.is_dir())
+    .map(|path| path.to_string_lossy().into_owned())
+    .collect()
+}
+
 /// Find an executable on PATH.
 fn which(program: &str) -> Option<PathBuf> {
     let path = std::env::var_os("PATH")?;
@@ -455,8 +537,19 @@ fn sandboxed_command(
     }
 
     // Everything outside the workspace that is not a system root is
-    // hidden: /tmp is a private tmpfs, and home is not mounted at all.
+    // hidden: /tmp is a private tmpfs, and home is not mounted wholesale.
     command.args(["--tmpfs", "/tmp"]);
+
+    // Toolchains that a developer installed under $HOME must still be
+    // reachable, or every build fails for the wrong reason. Only the
+    // specific toolchain roots are exposed, read-only, and only when they
+    // are named in the request: never the home directory itself.
+    for toolchain in &request.toolchain_paths {
+        let path = std::path::Path::new(toolchain);
+        if path.is_dir() {
+            command.arg("--ro-bind").arg(toolchain).arg(toolchain);
+        }
+    }
 
     // The workspace: read-only by default, writable only where declared.
     let writable = resolve_writable(workspace, request)?;
@@ -482,12 +575,18 @@ fn sandboxed_command(
     // Environment: a clean slate plus explicit entries. Provider keys and
     // the rest of the parent environment never reach repository code.
     command.env_clear();
-    command.env("PATH", "/usr/local/bin:/usr/bin:/bin");
+    command.env("PATH", sandbox_path(request));
     command.env("HOME", "/tmp");
     command.env("TMPDIR", "/tmp");
     command.env("TERM", "dumb");
     command.env("NO_COLOR", "1");
     for (key, value) in &request.env {
+        command.env(key, value);
+    }
+
+    // Toolchain discovery needs its own roots to be named explicitly: a
+    // sandboxed rustup finds no toolchain otherwise.
+    for (key, value) in toolchain_env(request) {
         command.env(key, value);
     }
 
@@ -566,8 +665,11 @@ fn run_blocking(
             command.args(&request.args);
             command.current_dir(working_dir.absolute());
             command.env_clear();
-            command.env("PATH", "/usr/local/bin:/usr/bin:/bin");
+            command.env("PATH", sandbox_path(request));
             for (key, value) in &request.env {
+                command.env(key, value);
+            }
+            for (key, value) in toolchain_env(request) {
                 command.env(key, value);
             }
             command.stdin(Stdio::null());

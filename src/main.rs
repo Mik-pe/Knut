@@ -113,6 +113,7 @@ async fn run(args: Vec<String>) -> Result<(), KnutError> {
         "demo-tree" => demo_tree(verbose).await,
         "eval" => eval().await,
         "doctor" => doctor(live_from_flags(&positionals)).await,
+        "verify" => verify_workspace(verbose, as_json).await,
         "--help" | "-h" | "help" => {
             println!("{}", usage());
             Ok(())
@@ -133,6 +134,7 @@ USAGE:
   knut demo-tree [--verbose]
   knut eval
   knut doctor [--live]
+  knut verify [--json]     run the workspace's real checks for the current revision
 
 System One backends (--backend):
   static (default)   deterministic mock, fully offline
@@ -489,6 +491,66 @@ async fn demo_tree(verbose: bool) -> Result<(), KnutError> {
     }
 
     Ok(())
+}
+
+/// `verify`: run the workspace's real checks and report revision-bound
+/// evidence. This is the same path completion uses, not a demo.
+async fn verify_workspace(verbose: bool, as_json: bool) -> Result<(), KnutError> {
+    let workspace = knut::Workspace::open(".")?;
+    let profiles = knut::discover_profiles(&workspace);
+    if profiles.is_empty() {
+        return Err(KnutError::Tool(
+            "no check profile fits this workspace (looked for Cargo.toml / package.json)"
+                .to_owned(),
+        ));
+    }
+
+    let supervisor = Arc::new(knut::Supervisor::new(workspace.clone()));
+    let mut all_green = true;
+
+    for profile in profiles {
+        if !profile.tool_available() {
+            println!(
+                "profile {}: toolchain not installed; checks reported unavailable",
+                profile.name
+            );
+        }
+        let runner = knut::CheckRunner::new(workspace.clone(), Arc::clone(&supervisor), profile);
+        let revision = runner.current_revision("workspace")?;
+        let checks = runner.run_all(&revision).await;
+        let report =
+            knut::EvidenceReport::build(&runner.requirements(), revision, checks, Vec::new(), None);
+
+        if as_json {
+            let serialized = serde_json::to_string_pretty(&report)
+                .map_err(|err| KnutError::Tool(format!("serialize report: {err}")))?;
+            println!("{serialized}");
+        } else {
+            print!("{}", report.summary());
+            if verbose {
+                for check in &report.checks {
+                    println!("  $ {}", check.command.join(" "));
+                    if !check.output.is_empty() {
+                        for line in check.output.lines().take(12) {
+                            println!("      {line}");
+                        }
+                    }
+                }
+            }
+        }
+
+        // A weakened test set is never green, even with passing checks.
+        all_green &= report.is_green();
+    }
+
+    if all_green {
+        println!("verified: all blocking checks passed for this revision");
+        Ok(())
+    } else {
+        Err(KnutError::Tool(
+            "verification did not pass; see the evidence above".to_owned(),
+        ))
+    }
 }
 
 /// `doctor`: report what is configured, and optionally prove it works.

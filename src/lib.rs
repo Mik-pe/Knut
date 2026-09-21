@@ -18,6 +18,7 @@ mod system_zero;
 mod tool;
 mod tree;
 mod typesafe;
+mod verify;
 mod workspace;
 
 pub use completion::{
@@ -89,6 +90,11 @@ pub use tree::{
 pub use typesafe::{
     Answer, DEFAULT_BASE_URL, DEFAULT_MODEL, DEFAULT_TIMEOUT, JevSystemOne, Question,
     SystemOneRequest, SystemOneResponse, TypeSafeConfig,
+};
+pub use verify::{
+    AcceptAllVerifier, CheckEvidence, CheckOutcome, CheckProfile, CheckRunner, CheckSpec,
+    EvidenceReport, ReviewOutcome, ReviewVerdict, TestCounts, TestSetChange, detect_weakened_tests,
+    discover_profiles, parse_review, review_change,
 };
 pub use workspace::{
     ContentRef, INSTRUCTION_FILES, InstructionFile, ListTool, MAX_INSTRUCTION_BYTES, ReadTool,
