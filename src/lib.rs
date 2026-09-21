@@ -6,6 +6,7 @@ mod evals;
 mod frame;
 mod judgment;
 mod model;
+mod patch;
 mod planner;
 mod policy;
 mod provider;
@@ -45,10 +46,16 @@ pub use model::{
     Model, ModelAttempt, ModelCapabilities, ModelIdentity, ModelRequest, ModelResponse,
     ModelStreamEvent, ModelStreamSink, ToolCall, Usage, VerificationVerdict, Verifier,
 };
+pub use patch::{
+    AppliedOp, ApplyFailure, ApplyOutcome, ApplyPatchTool, MAX_PATCH_OPS, Patch, PatchApplier,
+    PatchOp, PatchRejection, RevertOutcome, SkippedRevert, ValidatedOp, ValidatedPatch,
+    validate_patch,
+};
 pub use planner::{MAX_DEPTH, MAX_NODES, PlanRejection, Planner, PlanningContext, ValidatedPlan};
 pub use policy::{
-    ApprovalLedger, Authorization, ExecOutcome, ExecutionGate, InMemoryJournal, JournalEntry,
-    JournalStore, OutcomeState, Policy, PolicyVerdict, ProposedExecution, SideEffectPolicy,
+    ApprovalLedger, Authorization, ContentPreconditions, ExecOutcome, ExecutionGate,
+    InMemoryJournal, JournalEntry, JournalStore, OutcomeState, Policy, PolicyVerdict,
+    ProposedExecution, SideEffectPolicy,
 };
 pub use provider::{
     BillingPath, DEFAULT_CHAT_PATH, OpenAiCompatibleModel, ProviderConfig, ProviderSummary,
