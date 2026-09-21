@@ -32,6 +32,7 @@ mod tui_render;
 mod tui_state;
 mod typesafe;
 mod verify;
+mod workers;
 mod workspace;
 
 pub use attach::{
@@ -158,6 +159,12 @@ pub use verify::{
     AcceptAllVerifier, CheckEvidence, CheckOutcome, CheckProfile, CheckRunner, CheckSpec,
     EvidenceReport, ReviewOutcome, ReviewVerdict, TestCounts, TestSetChange, detect_weakened_tests,
     discover_profiles, parse_review, review_change,
+};
+pub use workers::{
+    CleanupOutcome, ContractRejection, ContractTemplate, DelegationComparison, DelegationContract,
+    DelegationRefused, IntegrationPlan, MAX_CONCURRENT_WORKERS, MAX_WORKERS_PER_SESSION,
+    PatchConflict, Worker, WorkerKind, WorkerPool, WorkerResult, WorkerState, contract_templates,
+    delegation_candidates, reconcile,
 };
 pub use workspace::{
     ContentRef, INSTRUCTION_FILES, InstructionFile, ListTool, MAX_INSTRUCTION_BYTES, ReadTool,
