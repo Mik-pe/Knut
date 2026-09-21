@@ -83,11 +83,14 @@ pub struct WorkbenchState {
     pub model: Option<String>,
     pub task_state: Option<TaskState>,
     pub focus: Focus,
-    /// The composer's text, as a sequence of lines.
-    pub composer: Vec<String>,
-    /// Cursor position within the composer.
-    pub cursor_row: usize,
-    pub cursor_col: usize,
+    /// The multiline composer (issue #28): grapheme-aware editing,
+    /// undo/redo, history and bracketed paste.
+    pub composer: crate::composer::Composer,
+    /// Action cards for the current session (issue #28).
+    pub cards: crate::cards::CardList,
+    /// Requests queued while a task is running (issue #28): these start a
+    /// *new* task when the current one ends and never modify it.
+    pub queued: Vec<String>,
     pub timeline: Vec<TimelineEntry>,
     /// Number of entries dropped from the front (virtualization).
     pub timeline_offset: usize,
@@ -98,6 +101,12 @@ pub struct WorkbenchState {
     pub pending: Option<PendingPrompt>,
     /// Whether a help overlay is open.
     pub help: bool,
+    /// Command palette state: the query when open.
+    pub palette: Option<String>,
+    /// Attachments resolved for the current composer text.
+    pub attachments: Vec<crate::attach::Attachment>,
+    /// Attachment errors to surface to the user.
+    pub attachment_errors: Vec<crate::attach::AttachError>,
     /// Transient status message.
     pub status: Option<String>,
     /// Counters for the inspector.
@@ -130,15 +139,18 @@ impl WorkbenchState {
             model: None,
             task_state: None,
             focus: Focus::Composer,
-            composer: vec![String::new()],
-            cursor_row: 0,
-            cursor_col: 0,
+            composer: crate::composer::Composer::new(),
+            cards: crate::cards::CardList::new(),
+            queued: Vec::new(),
             timeline: Vec::new(),
             timeline_offset: 0,
             selection: 0,
             follow: true,
             pending: None,
             help: false,
+            palette: None,
+            attachments: Vec::new(),
+            attachment_errors: Vec::new(),
             status: None,
             stats: WorkbenchStats::default(),
         }
@@ -146,18 +158,30 @@ impl WorkbenchState {
 
     /// Composer contents as one string.
     pub fn composer_text(&self) -> String {
-        self.composer.join("\n")
+        self.composer.text()
     }
 
     pub fn is_composer_empty(&self) -> bool {
-        self.composer.iter().all(|line| line.trim().is_empty())
+        self.composer.is_empty()
     }
 
     /// Clear the composer after a submit.
     pub fn clear_composer(&mut self) {
-        self.composer = vec![String::new()];
-        self.cursor_row = 0;
-        self.cursor_col = 0;
+        self.composer = crate::composer::Composer::new();
+    }
+
+    /// Queue a request for after the current task (never a steering edit).
+    pub fn queue_request(&mut self, text: impl Into<String>) {
+        self.queued.push(text.into());
+    }
+
+    /// Take the next queued request, if any.
+    pub fn take_queued(&mut self) -> Option<String> {
+        if self.queued.is_empty() {
+            None
+        } else {
+            Some(self.queued.remove(0))
+        }
     }
 
     /// The entries currently visible, newest last.
@@ -252,13 +276,54 @@ impl WorkbenchState {
                     false,
                 );
             }
+            SessionEvent::RequestQueued { text } => {
+                // Queued work is shown as queued, never as a change to the
+                // running task.
+                self.queue_request(text.clone());
+                self.push(
+                    TimelineKind::Action,
+                    format!("queued for next task: {text}"),
+                    false,
+                );
+            }
+            SessionEvent::CardStarted { card_id, title, .. } => {
+                self.cards.start(card_id.clone(), title.clone());
+            }
+            SessionEvent::CardFinished {
+                card_id,
+                state,
+                summary,
+                detail,
+                elapsed_ms,
+                ..
+            } => {
+                self.cards.finish(
+                    card_id,
+                    *state,
+                    summary.clone(),
+                    detail.clone(),
+                    *elapsed_ms,
+                );
+            }
             SessionEvent::NodeResult {
                 node_label,
                 status,
                 output,
+                node,
                 ..
             } => {
                 self.stats.node_results += 1;
+                // The card mirrors the engine's reported status, sanitized
+                // for display.
+                let card_id = format!("node:{}", node.0);
+                self.cards.start(card_id.clone(), node_label.clone());
+                self.cards.finish(
+                    &card_id,
+                    crate::cards::CardState::from_node_status(*status),
+                    crate::cards::summarize_value(output),
+                    crate::cards::sanitize_for_display(&output.to_string()),
+                    0,
+                );
                 let marker = match status {
                     NodeStatus::Succeeded => "ok",
                     NodeStatus::Failed => "failed",
@@ -348,7 +413,12 @@ impl WorkbenchState {
             }
             SessionEvent::TextDelta { text, .. } => {
                 self.stats.text_deltas += 1;
-                self.push(TimelineKind::Assistant, text.clone(), true);
+                // Untrusted model output is sanitized before display.
+                self.push(
+                    TimelineKind::Assistant,
+                    crate::cards::sanitize_for_display(text),
+                    true,
+                );
             }
             SessionEvent::ToolCallProposed {
                 name, arguments, ..
@@ -363,6 +433,52 @@ impl WorkbenchState {
                 self.push(TimelineKind::Error, message.clone(), false);
             }
         }
+    }
+
+    /// Open the palette.
+    pub fn open_palette(&mut self) {
+        self.palette = Some(String::new());
+    }
+
+    /// Close the palette.
+    pub fn close_palette(&mut self) {
+        self.palette = None;
+    }
+
+    /// Whether the palette is open.
+    pub fn palette_open(&self) -> bool {
+        self.palette.is_some()
+    }
+
+    /// Commands matching the current palette query.
+    pub fn palette_results(&self) -> Vec<crate::attach::PaletteCommand> {
+        match &self.palette {
+            Some(query) => crate::attach::filter_catalog(query),
+            None => Vec::new(),
+        }
+    }
+
+    /// Resolve `@mentions` in the composer against the workspace.
+    ///
+    /// Resolving is a *local* read through the workspace tools: it grants
+    /// no egress permission, and the summary exists so the user sees what
+    /// would be attached before submitting.
+    pub fn refresh_attachments(&mut self, workspace: &crate::Workspace) {
+        let mentions = crate::attach::extract_mentions(&self.composer.text());
+        let (attachments, errors) = crate::attach::resolve_mentions(workspace, &mentions);
+        self.attachments = attachments;
+        self.attachment_errors = errors;
+    }
+
+    /// A summary of what the next submission would carry.
+    pub fn attachment_summary(&self) -> String {
+        crate::attach::attachment_summary(&self.attachments, &self.attachment_errors)
+    }
+
+    /// Resume following the newest output (an explicit user action).
+    pub fn resume_follow(&mut self) {
+        self.follow = true;
+        self.selection = self.timeline.len().saturating_sub(1);
     }
 
     /// Record that the runtime dropped cosmetic events.
@@ -512,15 +628,15 @@ mod tests {
         let mut state = WorkbenchState::new("/tmp/ws");
         assert!(state.is_composer_empty());
 
-        state.composer = vec!["first line".to_owned(), "second".to_owned()];
-        state.cursor_row = 1;
-        state.cursor_col = 6;
+        state.composer.paste("first line\nsecond");
         assert_eq!(state.composer_text(), "first line\nsecond");
         assert!(!state.is_composer_empty());
+        // The cursor sits at the end of the pasted text, not mid-buffer.
+        assert_eq!(state.composer.cursor(), (1, 6));
 
         state.clear_composer();
         assert!(state.is_composer_empty());
-        assert_eq!(state.cursor_row, 0);
+        assert_eq!(state.composer.cursor(), (0, 0));
     }
 
     #[test]

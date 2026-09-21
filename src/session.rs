@@ -73,6 +73,10 @@ pub enum SessionCommand {
     Deny { approval_key: String },
     /// Cancel the active task; in-flight work is cancelled.
     Cancel,
+    /// Mid-task input: steer the active task when it is a directive, or
+    /// queue the request for the next task. The runtime owns the choice so
+    /// a queued request never silently modifies the active task.
+    SteerOrQueue { text: String },
 }
 
 /// Stable identifier for one task within a session.
@@ -192,6 +196,34 @@ pub enum SessionEvent {
         output: Value,
     },
 
+    /// A request was queued for the next task rather than applied to the
+    /// running one.
+    RequestQueued {
+        text: String,
+    },
+
+    /// An action card began: the UI's view of one unit of work, with a
+    /// stable id and an explicit lifecycle state.
+    CardStarted {
+        task: TaskId,
+        turn: TurnId,
+        card_id: String,
+        title: String,
+    },
+
+    /// An action card finished, with its terminal state, a one-line
+    /// summary, bounded detail and elapsed time. Cancellation and timeout
+    /// are distinct from failure.
+    CardFinished {
+        task: TaskId,
+        turn: TurnId,
+        card_id: String,
+        state: crate::cards::CardState,
+        summary: String,
+        detail: String,
+        elapsed_ms: u64,
+    },
+
     /// Incremental assistant text within one turn.
     ///
     /// Droppable: losing a delta must never lose the final artifact. What
@@ -290,7 +322,9 @@ impl SessionEvent {
     fn droppable(&self) -> bool {
         matches!(
             self,
-            SessionEvent::RuntimeError { .. } | SessionEvent::TextDelta { .. }
+            SessionEvent::RuntimeError { .. }
+                | SessionEvent::TextDelta { .. }
+                | SessionEvent::CardFinished { .. }
         )
     }
 
@@ -315,7 +349,10 @@ impl SessionEvent {
             SessionEvent::NodeResult { task, .. }
             | SessionEvent::TextDelta { task, .. }
             | SessionEvent::ToolCallProposed { task, .. }
-            | SessionEvent::FrameDecided { task, .. } => Some(*task),
+            | SessionEvent::FrameDecided { task, .. }
+            | SessionEvent::CardStarted { task, .. }
+            | SessionEvent::CardFinished { task, .. } => Some(*task),
+            SessionEvent::RequestQueued { .. } => None,
         }
     }
 }
@@ -831,6 +868,71 @@ where
                     task,
                     reason: "user denied the required approval".to_owned(),
                 });
+                Ok(())
+            }
+            SessionCommand::SteerOrQueue { text } => {
+                // Mid-task input: a short directive steers the active
+                // task; anything else is a *new* request, which must not
+                // silently modify the running one.
+                let (active, short) = {
+                    let Some(task) = self.task.as_ref() else {
+                        return Err(KnutError::InvalidArguments {
+                            path: "task".to_owned(),
+                            reason: "no active task to steer or queue for".to_owned(),
+                        });
+                    };
+                    if task.state.is_terminal() {
+                        return Err(KnutError::InvalidArguments {
+                            path: "task".to_owned(),
+                            reason: "task is already terminal".to_owned(),
+                        });
+                    }
+                    (true, is_steering_directive(&text))
+                };
+
+                if active && short {
+                    // Steering bumps the revision, which invalidates any
+                    // plan or approval bound to the older one. This is the
+                    // same body as `Steer`, inlined to keep `command` free
+                    // of async recursion.
+                    let task_id = self.task.as_ref().map(|task| task.id);
+                    let last_turn = self
+                        .task
+                        .as_ref()
+                        .and_then(|task| task.routed)
+                        .map(|(_, turn)| turn)
+                        .unwrap_or(TurnId(0));
+                    let was_waiting = self.pending_wait.is_some();
+                    self.pending_wait = None;
+                    if let Some(task_id) = task_id
+                        && was_waiting
+                    {
+                        self.emit(SessionEvent::WaitResolved {
+                            task: task_id,
+                            turn: last_turn,
+                        });
+                    }
+                    let revision = {
+                        let Some(task) = self.task.as_mut() else {
+                            return Ok(());
+                        };
+                        task.revision = TaskRevision(task.revision.0 + 1);
+                        task.prompt = text.clone();
+                        task.pending_plan = None;
+                        task.revision
+                    };
+                    if let Some(task_id) = task_id {
+                        self.emit(SessionEvent::TaskSteered {
+                            task: task_id,
+                            revision,
+                            prompt: text,
+                        });
+                    }
+                    return Ok(());
+                }
+
+                // Otherwise it is the next request, held for later.
+                self.emit(SessionEvent::RequestQueued { text });
                 Ok(())
             }
             SessionCommand::Cancel => {
@@ -1683,6 +1785,17 @@ where
             }
         }
     }
+}
+
+/// Whether mid-task input is a steering directive rather than new work.
+///
+/// Deliberately simple and documented: a single short line is a
+/// directive; anything longer or multi-line is new work that gets queued.
+/// The session owns the decision, so the UI cannot silently reinterpret a
+/// queued request as an edit to the running task.
+fn is_steering_directive(text: &str) -> bool {
+    let trimmed = text.trim();
+    !trimmed.is_empty() && !trimmed.contains('\n') && trimmed.chars().count() <= 160
 }
 
 /// Whether a failed node is a *check* failure (schema/artifact
@@ -2888,6 +3001,177 @@ mod tests {
             .unwrap();
         let state = drive_until_stable(&mut runtime, 4).await.unwrap();
         assert_ne!(state, TaskState::Completed);
+    }
+
+    #[tokio::test]
+    async fn steering_while_an_approval_is_pending_invalidates_the_stale_action() {
+        // The user steers mid-task while an approval is pending: the
+        // approval was minted for the old revision, so it must not be
+        // resumable afterwards.
+        let (mut runtime, _reasoner) = runtime_with_reasoner(
+            Arc::new(ActFiles),
+            vec![plan_json("write")],
+            crate::SideEffectPolicy::new()
+                .allow(SideEffect::ReadOnly)
+                .require_approval(SideEffect::IdempotentWrite),
+        );
+
+        runtime
+            .command(SessionCommand::Submit {
+                prompt: "files".to_owned(),
+            })
+            .await
+            .unwrap();
+        let state = drive_until_stable(&mut runtime, 10).await.unwrap();
+        assert_eq!(state, TaskState::Waiting);
+
+        let wait = runtime.pending_wait().unwrap();
+        let WaitKind::Approval { approval_key } = &wait.kind else {
+            panic!("expected approval wait");
+        };
+        let stale_key = approval_key.clone();
+
+        // Mid-task input: a short directive steers the task.
+        runtime
+            .command(SessionCommand::SteerOrQueue {
+                text: "use a different file instead".to_owned(),
+            })
+            .await
+            .unwrap();
+
+        // The stale approval is gone: the wait was resolved by the
+        // steering, and the old key no longer refers to anything.
+        assert!(runtime.pending_wait().is_none());
+        let err = runtime
+            .command(SessionCommand::Approve {
+                approval_key: stale_key,
+            })
+            .await
+            .unwrap_err();
+        assert!(
+            format!("{err}").contains("no pending approval"),
+            "got {err}"
+        );
+
+        // The revision advanced, and the steering is in the transcript.
+        let events: Vec<&SessionEvent> = runtime.events().events().collect();
+        assert!(events.iter().any(|e| matches!(
+            e,
+            SessionEvent::TaskSteered { revision, .. } if revision.0 >= 2
+        )));
+    }
+
+    #[tokio::test]
+    async fn queuing_does_not_modify_the_active_task() {
+        // Mid-task input that is new work is queued: the running task's
+        // prompt and revision are untouched.
+        let mut runtime = runtime_with(
+            Arc::new(AlwaysGenerate),
+            vec!["first".to_owned(), "second".to_owned()],
+            crate::SideEffectPolicy::new().allow(SideEffect::ReadOnly),
+        )
+        .with_requirements(CompletionRequirements::none().require("tests", "tests pass", true))
+        .with_artifact_revision(crate::ArtifactRevision::new("patch", "r1"));
+
+        runtime
+            .command(SessionCommand::Submit {
+                prompt: "the original task".to_owned(),
+            })
+            .await
+            .unwrap();
+        runtime.drive().await.unwrap();
+
+        let revision_before = runtime
+            .events()
+            .events()
+            .filter_map(|e| match e {
+                SessionEvent::TaskStarted { .. } => Some(TaskRevision(1)),
+                SessionEvent::TaskSteered { revision, .. } => Some(*revision),
+                _ => None,
+            })
+            .last()
+            .unwrap_or(TaskRevision(1));
+
+        // A multi-line request is new work, not a directive.
+        runtime
+            .command(SessionCommand::SteerOrQueue {
+                text: "a much longer request\nwith several lines\nof new work".to_owned(),
+            })
+            .await
+            .unwrap();
+
+        // No steering happened, the request is queued, and the active task
+        // still holds its own prompt.
+        let events: Vec<&SessionEvent> = runtime.events().events().collect();
+        assert!(
+            !events
+                .iter()
+                .any(|e| matches!(e, SessionEvent::TaskSteered { .. })),
+            "queued work was applied as a steering edit"
+        );
+        assert!(events.iter().any(|e| matches!(
+            e,
+            SessionEvent::RequestQueued { text } if text.contains("several lines")
+        )));
+
+        // The running task's revision is unchanged.
+        let revision_after = events
+            .iter()
+            .rev()
+            .find_map(|e| match e {
+                SessionEvent::TaskSteered { revision, .. } => Some(*revision),
+                _ => None,
+            })
+            .unwrap_or(revision_before);
+        assert_eq!(revision_before, revision_after);
+    }
+
+    #[tokio::test]
+    async fn a_directive_steers_and_new_work_queues_in_one_stream() {
+        let mut runtime = runtime_with(
+            Arc::new(AlwaysGenerate),
+            vec!["one".to_owned(), "two".to_owned(), "three".to_owned()],
+            crate::SideEffectPolicy::new().allow(SideEffect::ReadOnly),
+        )
+        .with_requirements(CompletionRequirements::none().require("tests", "tests pass", true))
+        .with_artifact_revision(crate::ArtifactRevision::new("patch", "r1"));
+
+        runtime
+            .command(SessionCommand::Submit {
+                prompt: "do the thing".to_owned(),
+            })
+            .await
+            .unwrap();
+        runtime.drive().await.unwrap();
+
+        runtime
+            .command(SessionCommand::SteerOrQueue {
+                text: "be more careful".to_owned(),
+            })
+            .await
+            .unwrap();
+        runtime
+            .command(SessionCommand::SteerOrQueue {
+                text: "then also rewrite the parser\nand update the docs".to_owned(),
+            })
+            .await
+            .unwrap();
+
+        let events: Vec<&SessionEvent> = runtime.events().events().collect();
+        assert_eq!(
+            events
+                .iter()
+                .filter(|e| matches!(e, SessionEvent::TaskSteered { .. }))
+                .count(),
+            1
+        );
+        assert_eq!(
+            events
+                .iter()
+                .filter(|e| matches!(e, SessionEvent::RequestQueued { .. }))
+                .count(),
+            1
+        );
     }
 
     #[tokio::test]

@@ -35,6 +35,8 @@ pub enum ShellAction {
     Quit,
     /// Send a command to the session runtime.
     Command(SessionCommand),
+    /// Run an implemented palette command by id.
+    PaletteCommand(&'static str),
 }
 
 /// Apply one keystroke to the state, returning the next action.
@@ -56,9 +58,16 @@ pub fn handle_key(state: &mut WorkbenchState, key: KeyEvent, tab: &mut Tab) -> S
             KeyCode::Char('c') | KeyCode::Char('C') => ShellAction::Quit,
             KeyCode::Char('j') => {
                 // Newline in the composer without submitting.
-                state.composer.push(String::new());
-                state.cursor_row = state.composer.len() - 1;
-                state.cursor_col = 0;
+                state.composer.insert_newline();
+                ShellAction::Continue
+            }
+            // Undo/redo: Ctrl+Z / Ctrl+Y.
+            KeyCode::Char('z') => {
+                state.composer.undo();
+                ShellAction::Continue
+            }
+            KeyCode::Char('y') => {
+                state.composer.redo();
                 ShellAction::Continue
             }
             KeyCode::Char('p') => ShellAction::Command(SessionCommand::Pause),
@@ -75,9 +84,51 @@ pub fn handle_key(state: &mut WorkbenchState, key: KeyEvent, tab: &mut Tab) -> S
         return ShellAction::Continue;
     }
 
+    // The palette owns the keyboard while it is open: a submit cannot
+    // fire from inside a command dialog.
+    if state.palette_open() {
+        return match key.code {
+            KeyCode::Esc => {
+                state.close_palette();
+                ShellAction::Continue
+            }
+            KeyCode::Backspace => {
+                if let Some(query) = state.palette.as_mut() {
+                    query.pop();
+                }
+                ShellAction::Continue
+            }
+            KeyCode::Char(c) => {
+                if let Some(query) = state.palette.as_mut() {
+                    query.push(c);
+                }
+                ShellAction::Continue
+            }
+            KeyCode::Enter => {
+                // Only an implemented command can be selected; the palette
+                // never pretends an unavailable entry worked.
+                let selected = state
+                    .palette_results()
+                    .into_iter()
+                    .find(|command| command.is_available());
+                state.close_palette();
+                match selected {
+                    Some(command) => ShellAction::PaletteCommand(command.id),
+                    None => ShellAction::Continue,
+                }
+            }
+            _ => ShellAction::Continue,
+        };
+    }
+
     match key.code {
         KeyCode::F(1) | KeyCode::Char('?') if state.focus != Focus::Composer => {
             state.help = true;
+            ShellAction::Continue
+        }
+        // The palette: every listed command states whether it exists.
+        KeyCode::Char(':') if state.focus != Focus::Composer => {
+            state.open_palette();
             ShellAction::Continue
         }
         KeyCode::Esc => {
@@ -131,11 +182,8 @@ pub fn handle_key(state: &mut WorkbenchState, key: KeyEvent, tab: &mut Tab) -> S
             None => ShellAction::Continue,
         },
         KeyCode::Up => {
-            if state.focus == Focus::Composer && state.cursor_row > 0 {
-                state.cursor_row -= 1;
-                state.cursor_col = state
-                    .cursor_col
-                    .min(state.composer[state.cursor_row].chars().count());
+            if state.focus == Focus::Composer {
+                state.composer.up();
             } else {
                 state.follow = false;
                 state.selection = state.selection.saturating_sub(1);
@@ -143,11 +191,8 @@ pub fn handle_key(state: &mut WorkbenchState, key: KeyEvent, tab: &mut Tab) -> S
             ShellAction::Continue
         }
         KeyCode::Down => {
-            if state.focus == Focus::Composer && state.cursor_row + 1 < state.composer.len() {
-                state.cursor_row += 1;
-                state.cursor_col = state
-                    .cursor_col
-                    .min(state.composer[state.cursor_row].chars().count());
+            if state.focus == Focus::Composer {
+                state.composer.down();
             } else {
                 state.selection = (state.selection + 1).min(state.timeline.len().saturating_sub(1));
                 if state.selection + 1 >= state.timeline.len() {
@@ -157,35 +202,38 @@ pub fn handle_key(state: &mut WorkbenchState, key: KeyEvent, tab: &mut Tab) -> S
             ShellAction::Continue
         }
         KeyCode::Left => {
-            if state.focus == Focus::Composer && state.cursor_col > 0 {
-                state.cursor_col -= 1;
+            if state.focus == Focus::Composer {
+                state.composer.left();
             }
             ShellAction::Continue
         }
         KeyCode::Right => {
             if state.focus == Focus::Composer {
-                let len = state.composer[state.cursor_row].chars().count();
-                state.cursor_col = (state.cursor_col + 1).min(len);
+                state.composer.right();
+            }
+            ShellAction::Continue
+        }
+        KeyCode::Home => {
+            if state.focus == Focus::Composer {
+                state.composer.home();
+            }
+            ShellAction::Continue
+        }
+        KeyCode::End => {
+            if state.focus == Focus::Composer {
+                state.composer.end();
+            }
+            ShellAction::Continue
+        }
+        KeyCode::Delete => {
+            if state.focus == Focus::Composer {
+                state.composer.delete();
             }
             ShellAction::Continue
         }
         KeyCode::Backspace => {
             if state.focus == Focus::Composer {
-                let row = state.cursor_row;
-                let line: Vec<char> = state.composer[row].chars().collect();
-                if state.cursor_col > 0 {
-                    let mut next: Vec<char> = line.clone();
-                    next.remove(state.cursor_col - 1);
-                    state.composer[row] = next.into_iter().collect();
-                    state.cursor_col -= 1;
-                } else if row > 0 {
-                    let previous = state.composer[row - 1].clone();
-                    let joined = format!("{previous}{}", state.composer[row]);
-                    state.composer[row - 1] = joined;
-                    state.composer.remove(row);
-                    state.cursor_row = row - 1;
-                    state.cursor_col = previous.chars().count();
-                }
+                state.composer.backspace();
             }
             ShellAction::Continue
         }
@@ -193,28 +241,29 @@ pub fn handle_key(state: &mut WorkbenchState, key: KeyEvent, tab: &mut Tab) -> S
             if state.focus != Focus::Composer {
                 return ShellAction::Continue;
             }
-            let text = state.composer_text();
-            if text.trim().is_empty() {
+            let Some(text) = state.composer.take_submission() else {
                 return ShellAction::Continue;
-            }
-            state.clear_composer();
-            // A pending question is answered; otherwise this is a new task
-            // or a steering prompt.
+            };
+            // A pending question is answered. Otherwise: while a task is
+            // active, a short directive steers it and anything else is
+            // queued for the next task — the user chose which, and the
+            // session revision mechanism is what validates the steering.
             match &state.pending {
                 Some(pending) if pending.kind == crate::session::WaitKind::Question => {
                     ShellAction::Command(SessionCommand::Answer { value: text })
                 }
                 Some(_) => ShellAction::Continue,
-                None => ShellAction::Command(SessionCommand::Submit { prompt: text }),
+                None => {
+                    if state.task_state.is_some_and(|s| !s.is_terminal()) {
+                        ShellAction::Command(SessionCommand::SteerOrQueue { text })
+                    } else {
+                        ShellAction::Command(SessionCommand::Submit { prompt: text })
+                    }
+                }
             }
         }
         KeyCode::Char(c) if state.focus == Focus::Composer => {
-            let row = state.cursor_row;
-            let mut chars: Vec<char> = state.composer[row].chars().collect();
-            let index = state.cursor_col.min(chars.len());
-            chars.insert(index, c);
-            state.composer[row] = chars.into_iter().collect();
-            state.cursor_col += 1;
+            state.composer.insert(&c.to_string());
             ShellAction::Continue
         }
         // On narrow layouts, digits select panes directly.
@@ -405,7 +454,33 @@ pub async fn run_shell(
                         ShellAction::Command(command) => {
                             let _ = commands.send(command);
                         }
-                        ShellAction::Continue => {}
+                        ShellAction::PaletteCommand("submit") => {
+                            if let Some(text) = state.composer.take_submission() {
+                                let _ = commands.send(SessionCommand::Submit { prompt: text });
+                            }
+                        }
+                        ShellAction::PaletteCommand("pause") => {
+                            let _ = commands.send(SessionCommand::Pause);
+                        }
+                        ShellAction::PaletteCommand("resume") => {
+                            let _ = commands.send(SessionCommand::Resume);
+                        }
+                        ShellAction::PaletteCommand("cancel") => {
+                            let _ = commands.send(SessionCommand::Cancel);
+                        }
+                        ShellAction::PaletteCommand("steer") => {
+                            if let Some(text) = state.composer.take_submission() {
+                                let _ = commands.send(SessionCommand::SteerOrQueue { text });
+                            }
+                        }
+                        ShellAction::PaletteCommand("help") => {
+                            state.help = true;
+                        }
+                        // The remaining palette entries are honest no-ops
+                        // in this increment: they either map to a command
+                        // the binary has (handled above) or are reported
+                        // as unavailable by the palette itself.
+                        ShellAction::PaletteCommand(_) | ShellAction::Continue => {}
                     }
                 }
                 Event::Resize(_, _) => {
@@ -474,7 +549,9 @@ mod tests {
         handle_key(&mut state, key(KeyCode::Char('b')), &mut tab);
 
         assert_eq!(state.composer_text(), "a\nb");
-        assert_eq!(state.cursor_row, 1);
+        // Ctrl+J moved to a new line, and the following 'b' landed there.
+        assert_eq!(state.composer.cursor(), (1, 1));
+        assert_eq!(state.composer.lines(), &["a".to_owned(), "b".to_owned()]);
     }
 
     #[test]
@@ -664,5 +741,65 @@ mod tests {
         assert_eq!(tab, Tab::Tasks);
         handle_key(&mut state, key(KeyCode::Char('2')), &mut tab);
         assert_eq!(tab, Tab::Inspector);
+    }
+
+    #[test]
+    fn the_palette_owns_the_keyboard_and_never_fake_succeeds() {
+        let mut state = WorkbenchState::new("/tmp/ws");
+        state.focus = Focus::Timeline;
+        let mut tab = Tab::Timeline;
+
+        // Open with ':'; typing filters the catalog.
+        assert_eq!(
+            handle_key(&mut state, key(KeyCode::Char(':')), &mut tab),
+            ShellAction::Continue
+        );
+        assert!(state.palette_open());
+        for c in "canc".chars() {
+            handle_key(&mut state, key(KeyCode::Char(c)), &mut tab);
+        }
+        assert_eq!(state.palette.as_deref(), Some("canc"));
+
+        // Enter selects the matching implemented command.
+        assert_eq!(
+            handle_key(&mut state, key(KeyCode::Enter), &mut tab),
+            ShellAction::PaletteCommand("cancel")
+        );
+        assert!(!state.palette_open());
+    }
+
+    #[test]
+    fn a_submit_inside_the_palette_does_not_fire() {
+        let mut state = WorkbenchState::new("/tmp/ws");
+        state.focus = Focus::Composer;
+        let mut tab = Tab::Timeline;
+        state.composer.insert("a queued prompt");
+
+        // Open the palette, then press Enter: nothing is submitted and the
+        // composer keeps its text.
+        state.open_palette();
+        handle_key(&mut state, key(KeyCode::Enter), &mut tab);
+        assert_eq!(state.composer_text(), "a queued prompt");
+
+        // Escape closes it and the composer still has the text.
+        handle_key(&mut state, key(KeyCode::Esc), &mut tab);
+        assert!(!state.palette_open());
+        assert_eq!(state.composer_text(), "a queued prompt");
+    }
+
+    #[test]
+    fn an_unavailable_palette_entry_cannot_be_selected() {
+        let mut state = WorkbenchState::new("/tmp/ws");
+        state.focus = Focus::Timeline;
+        let mut tab = Tab::Timeline;
+
+        // Search for a command that is explicitly unavailable.
+        state.open_palette();
+        for c in "review".chars() {
+            handle_key(&mut state, key(KeyCode::Char(c)), &mut tab);
+        }
+        let action = handle_key(&mut state, key(KeyCode::Enter), &mut tab);
+        // No palette command fires: the entry is honestly unavailable.
+        assert_ne!(action, ShellAction::PaletteCommand("review"));
     }
 }

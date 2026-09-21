@@ -5,6 +5,7 @@
 //! the frame it is handed — so every layout can be snapshot-tested with
 //! `TestBackend` at any size.
 
+use crate::attach::CommandAvailability;
 use ratatui::Frame;
 use ratatui::layout::{Constraint, Direction, Layout, Rect};
 use ratatui::style::{Color, Modifier, Style};
@@ -114,12 +115,17 @@ pub fn render(frame: &mut Frame, state: &WorkbenchState, tab: Tab) {
         render_help(frame, frame.area());
     }
 
+    if state.palette_open() {
+        render_palette(frame, state, frame.area());
+    }
+
     // The cursor belongs to the composer, and only when the composer is
     // focused: a text cursor floating over a read-only pane is a lie.
     if state.focus == Focus::Composer {
         let area = plan.composer;
-        let row = (area.y + 1 + state.cursor_row as u16).min(area.bottom().saturating_sub(1));
-        let col = (area.x + 2 + state.cursor_col as u16).min(area.right().saturating_sub(1));
+        let (cursor_row, cursor_col) = state.composer.cursor();
+        let row = (area.y + 1 + cursor_row as u16).min(area.bottom().saturating_sub(1));
+        let col = (area.x + 2 + cursor_col as u16).min(area.right().saturating_sub(1));
         frame.set_cursor_position((col, row));
     }
 }
@@ -273,12 +279,57 @@ fn render_inspector(frame: &mut Frame, state: &WorkbenchState, area: Rect) {
         lines.push(Line::from(format!("  dropped  {}", state.stats.dropped)));
     }
 
+    // Queued requests are work for the *next* task, shown separately so
+    // they are never mistaken for edits to the running one.
+    if !state.queued.is_empty() {
+        lines.push(Line::from(""));
+        lines.push(Line::from(Span::styled(
+            "queued",
+            Style::default().add_modifier(Modifier::BOLD),
+        )));
+        for request in state.queued.iter().take(4) {
+            let short: String = request.chars().take(40).collect();
+            lines.push(Line::from(format!("  · {short}")));
+        }
+    }
+
+    // Recent action cards with their explicit states: a running card is
+    // visible while it runs, and cancelled never reads as succeeded.
+    if !state.cards.is_empty() {
+        lines.push(Line::from(""));
+        lines.push(Line::from(Span::styled(
+            "actions",
+            Style::default().add_modifier(Modifier::BOLD),
+        )));
+        for card in state.cards.cards().iter().rev().take(6) {
+            let text = card.headline();
+            let bounded: String = text.chars().take(44).collect();
+            lines.push(Line::from(Span::styled(
+                format!("  {bounded}"),
+                card_style(card.state),
+            )));
+        }
+    }
+
     frame.render_widget(
         Paragraph::new(lines)
             .block(Block::default().borders(Borders::ALL).title(" inspector "))
             .wrap(Wrap { trim: false }),
         area,
     );
+}
+
+/// Style for a card state, so failure never looks like success.
+fn card_style(state: crate::cards::CardState) -> Style {
+    match state {
+        crate::cards::CardState::Succeeded => Style::default().fg(Color::Green),
+        crate::cards::CardState::Failed => Style::default().fg(Color::Red),
+        crate::cards::CardState::Cancelled | crate::cards::CardState::TimedOut => {
+            Style::default().fg(Color::Yellow)
+        }
+        crate::cards::CardState::Waiting => Style::default().add_modifier(Modifier::BOLD),
+        _ => Style::default(),
+    }
 }
 
 fn render_tasks(frame: &mut Frame, state: &WorkbenchState, area: Rect) {
@@ -327,19 +378,14 @@ fn render_composer(frame: &mut Frame, state: &WorkbenchState, area: Rect) {
     } else {
         Style::default().fg(Color::DarkGray)
     };
-    let lines: Vec<Line> = if focused {
-        state
-            .composer
-            .iter()
-            .map(|line| Line::from(line.clone()))
-            .collect()
-    } else {
-        state
-            .composer
-            .iter()
-            .map(|line| Line::from(line.clone()))
-            .collect()
-    };
+    // Composer lines are rendered as-is; the cursor is placed separately
+    // so a grapheme-wide character does not shift it.
+    let lines: Vec<Line> = state
+        .composer
+        .lines()
+        .iter()
+        .map(|line| Line::from(line.clone()))
+        .collect();
 
     let hint = if state.pending.is_some() {
         " answer, or [a]pprove / [d]eny "
@@ -394,6 +440,51 @@ fn render_footer(frame: &mut Frame, state: &WorkbenchState, area: Rect, tabbed: 
         ));
     }
     frame.render_widget(Paragraph::new(Line::from(spans)), area);
+}
+
+/// The command palette: every entry states whether it exists, and
+/// unavailable commands show the reason instead of pretending.
+fn render_palette(frame: &mut Frame, state: &WorkbenchState, area: Rect) {
+    let width = area.width.saturating_sub(8).min(70);
+    let results = state.palette_results();
+    let height = (results.len() as u16 + 5).min(area.height.saturating_sub(4));
+    let popup = Rect {
+        x: area.x + (area.width.saturating_sub(width)) / 2,
+        y: area.y + 2,
+        width,
+        height,
+    };
+
+    let mut lines = vec![Line::from(vec![
+        Span::styled("> ", Style::default().fg(Color::DarkGray)),
+        Span::raw(state.palette.clone().unwrap_or_default()),
+    ])];
+    if results.is_empty() {
+        lines.push(Line::from(Span::styled(
+            "  no matching command",
+            Style::default().fg(Color::DarkGray),
+        )));
+    }
+    for command in results.iter().take(height.saturating_sub(3) as usize) {
+        match command.availability {
+            CommandAvailability::Available => lines.push(Line::from(format!(
+                "  {:<10} {}",
+                command.id, command.title
+            ))),
+            CommandAvailability::Unavailable(reason) => lines.push(Line::from(Span::styled(
+                format!("  {:<10} {} — {reason}", command.id, command.title),
+                Style::default().fg(Color::DarkGray),
+            ))),
+        }
+    }
+
+    frame.render_widget(Clear, popup);
+    frame.render_widget(
+        Paragraph::new(lines)
+            .block(Block::default().borders(Borders::ALL).title(" commands "))
+            .wrap(Wrap { trim: false }),
+        popup,
+    );
 }
 
 fn render_help(frame: &mut Frame, area: Rect) {
@@ -717,7 +808,7 @@ mod tests {
             // One keystroke, then a paint.
             let started = std::time::Instant::now();
             let mut local = state.clone();
-            local.composer[0].push('x');
+            local.composer.insert("x");
             let _ = snapshot(&local, 120, 40, Tab::Timeline);
             timings.push(started.elapsed());
         }
@@ -744,5 +835,91 @@ mod tests {
         });
         let text = snapshot(&state, 100, 30, Tab::Timeline);
         assert!(text.contains("x"));
+    }
+
+    #[test]
+    fn cards_and_queued_work_are_visible_and_distinguishable() {
+        let mut state = populated_state();
+        // A running card, a cancelled one and a failed one: all three
+        // must be legible, and none may read as success.
+        state.apply(&SessionEvent::CardStarted {
+            task: TaskId(1),
+            turn: TurnId(1),
+            card_id: "tool-1".to_owned(),
+            title: "run cargo test".to_owned(),
+        });
+        state.apply(&SessionEvent::CardFinished {
+            task: TaskId(1),
+            turn: TurnId(1),
+            card_id: "tool-2".to_owned(),
+            state: crate::cards::CardState::Cancelled,
+            summary: "stopped by the user".to_owned(),
+            detail: String::new(),
+            elapsed_ms: 40,
+        });
+        state.apply(&SessionEvent::CardFinished {
+            task: TaskId(1),
+            turn: TurnId(1),
+            card_id: "tool-3".to_owned(),
+            state: crate::cards::CardState::Failed,
+            summary: "exit 101".to_owned(),
+            detail: "assertion failed".to_owned(),
+            elapsed_ms: 900,
+        });
+        state.apply(&SessionEvent::RequestQueued {
+            text: "then update the docs".to_owned(),
+        });
+
+        let text = snapshot(&state, 140, 40, Tab::Timeline);
+        assert!(text.contains("actions"));
+        assert!(text.contains("running"));
+        assert!(text.contains("cancelled"));
+        assert!(text.contains("failed"));
+        assert!(text.contains("queued"));
+        assert!(text.contains("then update the docs"));
+    }
+
+    #[test]
+    fn a_scrolled_transcript_does_not_jump_when_new_output_arrives() {
+        let mut state = populated_state();
+        for i in 0..60 {
+            state.apply(&SessionEvent::NodeResult {
+                task: TaskId(1),
+                turn: TurnId(1),
+                node: crate::session::NodeId(i),
+                node_label: format!("node-{i}"),
+                status: NodeStatus::Succeeded,
+                output: serde_json::Value::Null,
+            });
+        }
+        // The user scrolls back: follow is off and the selection holds.
+        state.follow = false;
+        state.selection = 5;
+
+        let before = state.selection;
+        state.apply(&SessionEvent::TextDelta {
+            task: TaskId(1),
+            turn: TurnId(1),
+            node: crate::session::NodeId(999),
+            text: "new output arrives".to_owned(),
+        });
+        // The view did not jump to the newest entry.
+        assert_eq!(state.selection, before);
+        assert!(!state.follow);
+
+        // The scroll position survives further output too.
+        state.apply(&SessionEvent::TextDelta {
+            task: TaskId(1),
+            turn: TurnId(1),
+            node: crate::session::NodeId(1001),
+            text: "and more".to_owned(),
+        });
+        assert_eq!(state.selection, before);
+
+        // Re-arming follow (the explicit "resume following" action) puts
+        // the view back on the newest entry.
+        state.resume_follow();
+        let newest = state.timeline.len().saturating_sub(1);
+        assert_eq!(state.selection, newest);
     }
 }

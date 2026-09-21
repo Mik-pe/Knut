@@ -1,4 +1,7 @@
+mod attach;
+mod cards;
 mod completion;
+mod composer;
 mod decision;
 mod edge;
 mod error;
@@ -24,10 +27,20 @@ mod typesafe;
 mod verify;
 mod workspace;
 
+pub use attach::{
+    AttachError, Attachment, CommandAvailability, MAX_ATTACHMENTS, PaletteCommand,
+    attachment_payload, attachment_summary, command_catalog, extract_mentions, filter_catalog,
+    resolve_mention, resolve_mentions,
+};
+pub use cards::{
+    ActionCard, CardList, CardState, MAX_CARD_DETAIL, MAX_CARDS, sanitize_for_display,
+    summarize_value,
+};
 pub use completion::{
     ArtifactRevision, ArtifactVerifier, CompletionRequirements, Evidence, Requirement,
     gather_evidence,
 };
+pub use composer::{Composer, MAX_COMPOSER_CHARS, MAX_HISTORY, MAX_PASTE_CHARS};
 pub use decision::{Action, Decision, DecisionInput, ModelTier, RetrievalSource, Risk, Route};
 pub use edge::{
     EdgeChoice, EdgeJudgment, EdgeRouter, EdgeSelector, EdgeState, MAX_STEP_ATTEMPTS, NodeOutcome,
