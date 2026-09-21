@@ -11,6 +11,7 @@ mod planner;
 mod policy;
 mod provider;
 mod runtime;
+mod sandbox;
 mod session;
 mod system_one;
 mod system_zero;
@@ -62,6 +63,11 @@ pub use provider::{
     ReasoningEffort,
 };
 pub use runtime::{DecisionSource, Knut, Routed};
+pub use sandbox::{
+    BoundedOutput, CAPABILITY as SHELL_CAPABILITY, CommandOutcome, CommandRequest, CommandStatus,
+    RunCommandTool, SandboxBackend, SandboxSpec, SandboxUnavailable, Supervisor,
+    register_command_tools, sanitize_terminal,
+};
 pub use session::{
     EVENT_LOG_CAPACITY, MAX_REPLANS_PER_TASK, MAX_TURNS_PER_TASK, SESSION_PROTOCOL_VERSION,
     SessionCommand, SessionEvent, SessionRuntime, TaskId, TaskRevision, TaskState, TurnId,

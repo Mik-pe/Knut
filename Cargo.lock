@@ -504,6 +504,7 @@ dependencies = [
  "futures-util",
  "globset",
  "ignore",
+ "libc",
  "reqwest",
  "serde",
  "serde_json",
