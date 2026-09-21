@@ -432,6 +432,9 @@ async fn demo_tree(verbose: bool) -> Result<(), KnutError> {
                 id: "summarize".to_owned(),
                 instruction: "summarize the note as JSON".to_owned(),
                 tier: ModelTier::Reasoner,
+                // The read result actually reaches the model instead of
+                // being described to it (#19).
+                input: json!({ "note": { "$ref": "note", "kind": "json" } }),
             },
             PlanNode::Verify {
                 id: "check".to_owned(),
@@ -447,13 +450,21 @@ async fn demo_tree(verbose: bool) -> Result<(), KnutError> {
         }
     })?;
 
+    let validated =
+        knut::ValidatedPlan::from_validated(plan, 1).map_err(|e| KnutError::PlanRejected {
+            errors: vec![e.to_string()],
+        })?;
+
     let gate = Arc::new(knut::ExecutionGate::new(
         knut::SideEffectPolicy::new().allow(SideEffect::ReadOnly),
     ));
     let executor = TreeExecutor::new(Arc::clone(&registry), gate, cascade, Arc::new(AcceptAll));
     let started = Instant::now();
     let result: TreeRunResult = executor
-        .run(&plan, Arc::new(std::sync::atomic::AtomicBool::new(false)))
+        .run(
+            &validated,
+            Arc::new(std::sync::atomic::AtomicBool::new(false)),
+        )
         .await?;
     let latency = started.elapsed();
 

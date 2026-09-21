@@ -54,8 +54,8 @@ pub use system_zero::{
 };
 pub use tool::{SchemaError, SideEffect, Tool, ToolMetadata, ToolRegistry, validate_arguments};
 pub use tree::{
-    AskUserHandler, CancelFlag, NodeStatus, PlanError, PlanNode, TreeExecutor, TreeRunResult,
-    validate_plan,
+    ArtifactKind, ArtifactRef, ArtifactStore, AskUserHandler, CancelFlag, NodeStatus, PlanError,
+    PlanNode, TreeExecutor, TreeRunResult, collect_refs, resolve_input, validate_plan,
 };
 pub use typesafe::{
     Answer, DEFAULT_BASE_URL, DEFAULT_MODEL, DEFAULT_TIMEOUT, JevSystemOne, Question,

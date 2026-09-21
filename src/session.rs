@@ -1050,8 +1050,10 @@ where
             Arc::clone(&self.verifier),
         );
 
-        let plan: &PlanNode = &validated.plan;
-        let run = match executor.run(plan, Arc::clone(&self.cancel_flag)).await {
+        let run = match executor
+            .run(&validated, Arc::clone(&self.cancel_flag))
+            .await
+        {
             Ok(run) => run,
             Err(err) => {
                 let reason = err.to_string();
@@ -1097,7 +1099,7 @@ where
             // The approval binds to the exact action fingerprint in the
             // gate, and the validated plan is retained so approval resumes
             // this plan instead of generating a different one.
-            let approval_key = self.extract_approval_key(plan).await;
+            let approval_key = self.extract_approval_key(&validated.plan).await;
 
             match approval_key {
                 Some(key) => {

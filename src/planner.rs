@@ -53,6 +53,15 @@ impl PlanningContext {
 }
 
 /// A validated plan plus the attempts it took to get there.
+///
+/// This is the execution-safe handle: [`TreeExecutor::run`] accepts only
+/// a `ValidatedPlan`, so an arbitrary `PlanNode` from model output or
+/// hand-written code cannot reach execution without passing limits and
+/// semantic validation first.
+///
+/// The `token` field is private and unconstructable outside this module,
+/// so downstream code cannot fabricate a "validated" plan by struct
+/// literal either.
 #[derive(Debug, Clone, PartialEq)]
 pub struct ValidatedPlan {
     pub plan: PlanNode,
@@ -61,6 +70,43 @@ pub struct ValidatedPlan {
     /// Structural stats for traces.
     pub node_count: usize,
     pub depth: usize,
+    /// Evidence that validation ran; private on purpose.
+    validated: ValidationToken,
+}
+
+/// Proof that limits and semantic validation passed.
+#[derive(Debug, Clone, PartialEq)]
+struct ValidationToken(());
+
+impl ValidatedPlan {
+    /// Wrap a plan that has *already* passed [`validate_plan`] and the
+    /// structural limits.
+    ///
+    /// This is the only constructor, and it re-checks nothing: callers
+    /// (the planner, or a caller integrating an externally validated
+    /// plan) are responsible for running validation with the same
+    /// registry and tiers the executor will use. Prefer
+    /// [`Planner::plan`], which always validates.
+    pub fn from_validated(plan: PlanNode, rounds: usize) -> Result<Self, KnutError> {
+        let (node_count, depth) = measure(&plan);
+        if node_count > MAX_NODES {
+            return Err(KnutError::PlanRejected {
+                errors: vec![format!("plan has {node_count} nodes; limit is {MAX_NODES}")],
+            });
+        }
+        if depth > MAX_DEPTH {
+            return Err(KnutError::PlanRejected {
+                errors: vec![format!("plan depth {depth}; limit is {MAX_DEPTH}")],
+            });
+        }
+        Ok(Self {
+            plan,
+            rounds,
+            node_count,
+            depth,
+            validated: ValidationToken(()),
+        })
+    }
 }
 
 /// The reason an invalid plan was rejected.
@@ -119,7 +165,18 @@ impl Planner {
             "expected_format": {
                 "type": "sequence|selector|parallel|tool|generate|verify|ask_user",
                 "note": "single root node; tool nodes need capability + tool_id; \
-                         verify nodes reference an existing node id"
+                         verify nodes reference an existing node id; a node may \
+                         consume an earlier node's output by putting \
+                         {\"$ref\": \"<node-id>\", \"kind\": \"json\"|\"text\"} anywhere \
+                         in its input, and the referenced node must run before it",
+                "example_sequence": [
+                    {"type": "tool", "id": "note", "capability": "<from tools>",
+                     "tool_id": "<from tools>", "input": {}},
+                    {"type": "generate", "id": "summarize",
+                     "instruction": "summarize the note",
+                     "tier": "reasoner",
+                     "input": {"note": {"$ref": "note", "kind": "json"}}}
+                ]
             },
         });
 
@@ -275,13 +332,7 @@ impl Planner {
             }
         })?;
 
-        let (node_count, depth) = measure(&plan);
-        Ok(ValidatedPlan {
-            plan,
-            rounds: 1,
-            node_count,
-            depth,
-        })
+        ValidatedPlan::from_validated(plan, 1)
     }
 }
 

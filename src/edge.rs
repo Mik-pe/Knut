@@ -341,6 +341,16 @@ impl<R: EdgeRouter> EdgeSelector<R> {
 mod tests {
     use super::*;
 
+    /// Validate one node the way production does before execution.
+    fn validated_step(
+        registry: &std::sync::Arc<crate::ToolRegistry>,
+        node: crate::tree::PlanNode,
+    ) -> crate::ValidatedPlan {
+        crate::tree::validate_plan(&node, registry, &[crate::ModelTier::Reasoner])
+            .unwrap_or_else(|err| panic!("test step failed validation: {err}"));
+        crate::ValidatedPlan::from_validated(node, 1).unwrap()
+    }
+
     /// Router with scripted answers; counts how often it was consulted.
     struct ScriptedRouter {
         answers: std::sync::Mutex<Vec<Result<EdgeJudgment, KnutError>>>,
@@ -833,8 +843,9 @@ mod tests {
         let gate = Arc::new(crate::ExecutionGate::new(
             crate::SideEffectPolicy::new().allow(SideEffect::ReadOnly),
         ));
+        let registry = Arc::new(registry);
         let executor = TreeExecutor::new(
-            Arc::new(registry),
+            Arc::clone(&registry),
             gate,
             Arc::new(crate::ComputeCascade::empty().with_reasoner(NoModel)),
             Arc::new(Accept),
@@ -852,6 +863,10 @@ mod tests {
             tool_id: "work".into(),
             input: serde_json::json!({}),
         };
+        // Each step runs through the same validated-plan path the
+        // production session uses.
+        let step_a = validated_step(&registry, step_a);
+        let step_b = validated_step(&registry, step_b);
         let steps = [(&step_a, "probe"), (&step_b, "work")];
 
         // Script: retry step_a once, then abandon the branch; continue
@@ -872,7 +887,7 @@ mod tests {
             loop {
                 attempts += 1;
                 let run = executor.run(node, Arc::clone(&cancel)).await.unwrap();
-                let status = run.statuses.get(node.id()).copied();
+                let status = run.statuses.get(node.plan.id()).copied();
 
                 let outcome = match status {
                     Some(crate::NodeStatus::Succeeded) => NodeOutcome::Succeeded,
@@ -883,7 +898,7 @@ mod tests {
                 // even a successful read cannot end the task.
                 let edge_state = EdgeState::for_step(
                     "finish the fake workflow",
-                    node.id().to_owned(),
+                    node.plan.id().to_owned(),
                     format!("{tool_name} attempt {attempts}"),
                     outcome,
                     SideEffect::ReadOnly,
@@ -892,7 +907,7 @@ mod tests {
                 );
 
                 let decision = selector.select(&edge_state).await.unwrap();
-                transcript.push(format!("{}: {:?}", node.id(), decision.effective));
+                transcript.push(format!("{}: {:?}", node.plan.id(), decision.effective));
 
                 match decision.effective {
                     EdgeChoice::Continue | EdgeChoice::AlternateBranch => break,
