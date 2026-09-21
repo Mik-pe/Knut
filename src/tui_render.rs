@@ -405,6 +405,20 @@ fn render_header(frame: &mut Frame, state: &WorkbenchState, area: Rect, theme: &
                 theme.faint(),
             ));
         }
+        // Whether routing is live matters: with a real router a prompt can
+        // reach the workspace tools, and without one it cannot.
+        row_two.push(Span::styled(
+            format!(
+                "  {} routing {}",
+                theme.glyphs.separator(),
+                if state.live_routing {
+                    "live"
+                } else {
+                    "deterministic"
+                }
+            ),
+            theme.faint(),
+        ));
     }
 
     frame.render_widget(Paragraph::new(row_one), Rect { height: 1, ..area });

@@ -88,6 +88,10 @@ pub struct WorkbenchState {
     pub unavailable: Option<String>,
     /// How many completion checks gate this session.
     pub checks: usize,
+    /// Whether routing decisions come from a live System One rather than
+    /// the deterministic fallback. It matters to the user: live routing is
+    /// what lets a prompt reach the workspace tools.
+    pub live_routing: bool,
     /// Model calls observed by the runtime.
     pub model_calls: u64,
     /// Wall-clock start of the current task, for the header ticker.
@@ -165,6 +169,7 @@ impl WorkbenchState {
             endpoint: None,
             unavailable: None,
             checks: 0,
+            live_routing: false,
             model_calls: 0,
             task_started: None,
             last_duration_secs: 0,

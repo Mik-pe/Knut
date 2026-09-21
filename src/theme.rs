@@ -70,7 +70,7 @@ impl ColorLevel {
                 ColorLevel::TrueColor
             }
             Some(term) if term.contains("256color") => ColorLevel::Ansi256,
-            Some(term) if term == "dumb" => ColorLevel::Mono,
+            Some("dumb") => ColorLevel::Mono,
             Some(_) => ColorLevel::Ansi16,
             None => ColorLevel::Ansi16,
         }
@@ -209,9 +209,10 @@ impl Glyphs {
         "?"
     }
 
-    /// A paused marker.
+    /// A paused marker. `=` reads as "held" in either glyph set, so it is
+    /// deliberately not part of the Unicode/ASCII split.
     pub fn paused(&self) -> &'static str {
-        if self.unicode { "=" } else { "=" }
+        "="
     }
 }
 
@@ -627,10 +628,7 @@ mod tests {
 
         let ascii = Theme::plain_ascii();
         assert!(
-            ascii
-                .spinner(0)
-                .chars()
-                .all(|character| character.is_ascii()),
+            ascii.spinner(0).is_ascii(),
             "ascii fallback must not emit braille"
         );
         assert!(ascii.glyphs.knot().is_ascii());

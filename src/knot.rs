@@ -419,7 +419,7 @@ mod tests {
             .collect();
         // No art fits, but the app still names itself.
         assert!(text.contains("K"));
-        assert!(lines.len() >= 1);
+        assert!(!lines.is_empty());
     }
 
     #[test]

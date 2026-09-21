@@ -209,19 +209,17 @@ pub fn build(workspace: Workspace) -> (Engine, EngineReport) {
             .require_approval(crate::SideEffect::IdempotentWrite),
     ));
 
-    // Routing stays deterministic and offline: the shell is not the place
-    // to invent capability candidates. A prompt is generated, then the
-    // planner turns it into gated tool work.
-    let router = Arc::new(deterministic_router());
-
-    let frames: Option<Arc<dyn crate::FrameRouter>> = match std::env::var("TYPESAFE_API_KEY") {
+    // Routing: a live System One when a key is configured, otherwise the
+    // deterministic router. A prompt that asks about the workspace must be
+    // able to reach the workspace tools, and only a real router knows how.
+    let jev = match std::env::var("TYPESAFE_API_KEY") {
         Ok(_) => match TypeSafeConfig::from_env()
             .ok()
             .and_then(|config| JevSystemOne::new(config).ok())
         {
             Some(jev) => {
                 report.frames = true;
-                Some(Arc::new(jev))
+                Some(jev)
             }
             // A key that is present but unusable is reported rather than
             // quietly ignored: the deterministic path still runs.
@@ -234,6 +232,7 @@ pub fn build(workspace: Workspace) -> (Engine, EngineReport) {
         },
         Err(_) => None,
     };
+    let router = Arc::new(Knut::new(LiveRouter::new(jev)).with_system_zero(SystemZero::empty()));
 
     // The real check contract: build/test gate completion, lint advisory.
     let supervisor = Arc::new(Supervisor::new(workspace.clone()));
@@ -244,7 +243,7 @@ pub fn build(workspace: Workspace) -> (Engine, EngineReport) {
     )
     .requirements();
 
-    let mut runtime = SessionRuntime::new(
+    let runtime = SessionRuntime::new(
         router,
         Planner::new(Arc::new(planning_cascade)),
         Arc::new(registry),
@@ -256,10 +255,6 @@ pub fn build(workspace: Workspace) -> (Engine, EngineReport) {
     .with_discovery(crate::session::DiscoveryCandidates {
         candidates: Vec::new(),
     });
-    if let Some(frames) = frames {
-        runtime = runtime.with_frames(frames);
-    }
-
     (
         Engine {
             runtime,
@@ -270,25 +265,58 @@ pub fn build(workspace: Workspace) -> (Engine, EngineReport) {
     )
 }
 
-/// The deterministic router the shell runs on: no System 0 shortcuts, one
-/// confident generation decision, so the planner always owns the work.
-fn deterministic_router() -> Knut<StaticSystemOne> {
-    Knut::new(StaticSystemOne::new(Decision {
-        route: Route::Generate,
-        confidence: 0.9,
-        retrieval: None,
-        capability: None,
-        model_tier: ModelTier::Reasoner,
-        risk: Risk::Low,
-        parallelizable: false,
-    }))
-    .with_system_zero(SystemZero::empty())
+/// The router the shell runs on.
+///
+/// A live System One (Jev) is used when it is configured, because routing
+/// is the one decision the harness must not invent: a prompt asking about
+/// the workspace should reach the workspace tools, not a text-only
+/// generation. Without a key the deterministic router below is used, and
+/// its limits are reported rather than papered over.
+pub struct LiveRouter {
+    live: Option<JevSystemOne>,
+    fallback: StaticSystemOne,
+}
+
+impl LiveRouter {
+    fn new(live: Option<JevSystemOne>) -> Self {
+        Self {
+            live,
+            fallback: StaticSystemOne::new(Decision {
+                route: Route::Generate,
+                confidence: 0.9,
+                retrieval: None,
+                capability: None,
+                model_tier: ModelTier::Reasoner,
+                risk: Risk::Low,
+                parallelizable: false,
+            }),
+        }
+    }
+}
+
+#[async_trait::async_trait]
+impl crate::SystemOne for LiveRouter {
+    async fn decide(&self, input: &crate::DecisionInput) -> Result<Decision, KnutError> {
+        match &self.live {
+            // A live router that fails must not silently become a
+            // different decision: the failure is surfaced so the task
+            // reports it.
+            Some(live) => live.decide(input).await,
+            None => self.fallback.decide(input).await,
+        }
+    }
+}
+
+/// The deterministic router for an offline shell: no System 0 shortcuts,
+/// one confident generation decision.
+fn deterministic_router() -> Knut<LiveRouter> {
+    Knut::new(LiveRouter::new(None)).with_system_zero(SystemZero::empty())
 }
 
 /// The driver's handle on the runtime, plus the bookkeeping needed to
 /// stream new events exactly once.
 pub struct Engine {
-    runtime: SessionRuntime<StaticSystemOne>,
+    runtime: SessionRuntime<LiveRouter>,
     /// How many events of the runtime log have already been forwarded.
     cursor: usize,
     /// The workspace, retained so on-demand checks run against the real
@@ -319,30 +347,37 @@ impl Engine {
             .collect())
     }
 
-    /// Forward any new runtime events to the shell, returning how many
-    /// were sent.
+    /// Forward any new runtime events to the shell.
+    ///
+    /// Returns `false` when the shell's receiver is gone, which is the
+    /// signal to stop driving: nobody is watching.
     ///
     /// Events are read from the runtime's own bounded log, which is the
     /// ordered transcript; the cursor makes this idempotent, so polling
     /// twice without new work forwards nothing.
-    pub fn pump(&mut self, tx: &UnboundedSender<SessionEvent>) -> usize {
+    pub fn pump(&mut self, tx: &UnboundedSender<SessionEvent>) -> bool {
         let events = self.runtime.events();
         let total = events.len();
         if total <= self.cursor {
             // The log evicts from the front; a cursor past the end would
             // otherwise stall forever. Resynchronise instead.
             self.cursor = total;
-            return 0;
+            return !tx.is_closed();
         }
-        let mut sent = 0;
+        let mut alive = true;
         for event in events.events().skip(self.cursor) {
             if tx.send(event.clone()).is_err() {
+                alive = false;
                 break;
             }
-            sent += 1;
         }
         self.cursor = total;
-        sent
+        alive
+    }
+
+    /// How many events have been forwarded so far (test seam).
+    pub fn cursor(&self) -> usize {
+        self.cursor
     }
 
     /// Whether the runtime currently has an active task.
@@ -368,24 +403,38 @@ impl Engine {
     /// work per tick and stops when the task needs the user or reaches a
     /// terminal state.
     ///
-    /// A rejected command is reported to the shell as a runtime error
-    /// rather than swallowed: pressing `a` with no pending approval should
-    /// say why it did nothing, not look like a dropped keystroke.
-    pub async fn handle(&mut self, command: SessionCommand) {
+    /// Events are published *after every tick*, not once at the end: a
+    /// shell that only saw the finished task would show a blank transcript
+    /// for the whole run, which is exactly the opposite of a live view. The
+    /// optional sink is called between ticks so the caller can forward what
+    /// just happened while the task keeps working.
+    pub async fn handle_with(
+        &mut self,
+        command: SessionCommand,
+        mut on_tick: impl FnMut(&mut Self),
+    ) {
         let described = describe(&command);
         if let Err(err) = self.runtime.command(command).await {
             let message = format!("{described} refused: {err}");
             self.runtime.emit_runtime_error(message);
+            on_tick(self);
             return;
         }
         for _ in 0..crate::MAX_TURNS_PER_TASK.max(1) {
             let Some(state) = self.runtime.drive().await else {
                 break;
             };
+            on_tick(self);
             if state.is_terminal() || state == TaskState::Waiting {
                 break;
             }
         }
+    }
+
+    /// Apply one command and drive it to a stop, with no intermediate
+    /// publication. Used by tests and non-streaming callers.
+    pub async fn handle(&mut self, command: SessionCommand) {
+        self.handle_with(command, |_| {}).await;
     }
 }
 
@@ -403,9 +452,18 @@ pub async fn run_engine(
         let Some(command) = commands.recv().await else {
             break;
         };
-        engine.handle(command).await;
-        engine.pump(&events);
-        if events.is_closed() {
+        // Publish after every tick: the shell must see a routing decision,
+        // a streaming fragment or a finished node as it happens, not after
+        // the whole task is over.
+        let mut alive = true;
+        engine
+            .handle_with(command, |engine| {
+                if alive {
+                    alive = engine.pump(&events);
+                }
+            })
+            .await;
+        if !alive {
             break;
         }
     }
@@ -568,24 +626,80 @@ mod tests {
         let (mut engine, _) = build(workspace);
         let (tx, mut rx) = tokio::sync::mpsc::unbounded_channel();
 
-        // No work yet: the pump is idempotent.
-        assert_eq!(engine.pump(&tx), 0);
-        assert_eq!(engine.pump(&tx), 0);
+        // No work yet: the pump publishes nothing and the shell is alive.
+        assert!(engine.pump(&tx));
+        assert_eq!(engine.cursor(), 0);
 
         block_on(engine.handle(SessionCommand::Submit {
             prompt: "hello".to_owned(),
         }));
 
-        let forwarded = engine.pump(&tx);
-        assert!(forwarded >= 1, "the task start must reach the shell");
+        assert!(engine.pump(&tx), "the shell is still connected");
+        let cursor = engine.cursor();
+        assert!(cursor >= 1, "the task start must reach the shell");
         // A second pump forwards nothing new: no duplicated transcript.
-        assert_eq!(engine.pump(&tx), 0);
+        assert!(engine.pump(&tx));
+        assert_eq!(engine.cursor(), cursor);
 
         let mut seen = 0;
         while rx.try_recv().is_ok() {
             seen += 1;
         }
-        assert_eq!(seen, forwarded);
+        assert_eq!(seen, cursor);
+        let _ = std::fs::remove_dir_all(root);
+    }
+
+    #[test]
+    fn events_are_published_between_ticks_not_only_at_the_end() {
+        // The bug this guards: the driver pumped once after the whole task,
+        // so a long task showed an empty transcript while it ran. A shell
+        // watching a task must see progress as it happens.
+        let (workspace, root) = fixture_workspace();
+        let (mut engine, _) = build(workspace);
+        let (tx, mut rx) = tokio::sync::mpsc::unbounded_channel();
+
+        let mut publications = 0usize;
+        let mut seen_at_first_publication = 0usize;
+        block_on(engine.handle_with(
+            SessionCommand::Submit {
+                prompt: "do something".to_owned(),
+            },
+            |engine| {
+                engine.pump(&tx);
+                publications += 1;
+                if publications == 1 {
+                    let mut count = 0;
+                    // The receiver is drained inside the closure only
+                    // to observe ordering; the real shell drains it on
+                    // its own thread.
+                    while rx.try_recv().is_ok() {
+                        count += 1;
+                    }
+                    seen_at_first_publication = count;
+                }
+            },
+        ));
+
+        assert!(
+            publications >= 1,
+            "the driver must publish at least once per command"
+        );
+        assert!(
+            seen_at_first_publication >= 1,
+            "the first publication must already carry the task start, not wait for the end"
+        );
+        let _ = std::fs::remove_dir_all(root);
+    }
+
+    #[test]
+    fn a_closed_shell_stops_the_driver() {
+        let (workspace, root) = fixture_workspace();
+        let (mut engine, _) = build(workspace);
+        let (tx, rx) = tokio::sync::mpsc::unbounded_channel();
+        drop(rx);
+        // Nobody is watching: the pump reports it so the loop can stop
+        // rather than drive work into the void.
+        assert!(!engine.pump(&tx));
         let _ = std::fs::remove_dir_all(root);
     }
 

@@ -582,6 +582,7 @@ async fn tui() -> Result<(), KnutError> {
     state.endpoint = report.endpoint_label();
     state.unavailable = report.unavailable.clone();
     state.checks = report.checks.len();
+    state.live_routing = report.frames;
 
     // Session work runs behind the display so a slow provider can never
     // block a keystroke.
