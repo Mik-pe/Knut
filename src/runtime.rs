@@ -13,6 +13,9 @@ const DEFAULT_CONFIDENCE_FLOOR: f32 = 0.75;
 pub enum DecisionSource {
     /// Deterministic fast path.
     SystemZero,
+    /// A bounded, versioned cache hit: the decision was made earlier for
+    /// exactly this frame, revision and version set.
+    Cache,
     /// Bounded-model judgment.
     SystemOne,
 }

@@ -12,6 +12,7 @@ mod error;
 mod evals;
 mod frame;
 mod headless;
+mod inspector;
 mod judgment;
 mod lsp;
 mod mcp;
@@ -90,6 +91,10 @@ pub use headless::{
     HeadlessCommand, HeadlessEvent, HeadlessOutcome, HeadlessSession, JSONL_PROTOCOL_VERSION,
     MAX_LINE_BYTES, PendingPermissions, ProtocolError, ProtocolFailures, acp_dispatch, acp_update,
     classify_engine_error, diagnostic, is_protocol_line, normalize_protocol_path, to_jsonl,
+};
+pub use inspector::{
+    ContextInspection, DecisionInspector, DecisionProvenance, DecisionRecord, LatencyBreakdown,
+    LatencyPhase, OutstandingWork, RequirementStatus, SelectedContext, TaskNode, UsageView,
 };
 pub use judgment::{
     Complexity, Handler, IngressJudgments, Judgment, JudgmentRouter, JudgmentSystemOne,

@@ -126,6 +126,11 @@ pub fn handle_key(state: &mut WorkbenchState, key: KeyEvent, tab: &mut Tab) -> S
             state.help = true;
             ShellAction::Continue
         }
+        // The inspector: optional, and off the ordinary transcript.
+        KeyCode::Char('i') if state.focus == Focus::Inspector => {
+            state.show_inspector = !state.show_inspector;
+            ShellAction::Continue
+        }
         // The palette: every listed command states whether it exists.
         KeyCode::Char(':') if state.focus != Focus::Composer => {
             state.open_palette();

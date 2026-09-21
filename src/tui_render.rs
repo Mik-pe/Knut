@@ -130,6 +130,12 @@ pub fn render(frame: &mut Frame, state: &WorkbenchState, tab: Tab) {
         render_palette(frame, state, frame.area());
     }
 
+    // The decision inspector is opt-in: the ordinary transcript explains
+    // useful work, and this pane explains the decisions when asked.
+    if state.show_inspector {
+        render_inspector_overlay(frame, state, frame.area());
+    }
+
     // The cursor belongs to the composer, and only when the composer is
     // focused: a text cursor floating over a read-only pane is a lie.
     if state.focus == Focus::Composer {
@@ -672,6 +678,91 @@ fn render_review_checks(frame: &mut Frame, view: &crate::review::ReviewView, are
     frame.render_widget(
         Paragraph::new(lines).block(Block::default().borders(Borders::ALL).title(" checks ")),
         area,
+    );
+}
+
+/// The decision inspector overlay.
+///
+/// Rendered from the inspector's own honest view: provenances are
+/// distinguished, usage is labelled, and nothing is invented.
+fn render_inspector_overlay(frame: &mut Frame, state: &WorkbenchState, area: Rect) {
+    let width = area.width.saturating_sub(4).min(96);
+    let height = area.height.saturating_sub(2).min(40);
+    let popup = Rect {
+        x: area.x + (area.width.saturating_sub(width)) / 2,
+        y: area.y + 1,
+        width,
+        height,
+    };
+
+    let inspector = &state.inspector;
+    let mut lines: Vec<Line> = Vec::new();
+    lines.push(Line::from(Span::styled(
+        format!("task state: {:?}", inspector.task_state()),
+        Style::default().add_modifier(Modifier::BOLD),
+    )));
+    lines.push(Line::from(inspector.graph_summary()));
+
+    // Outstanding work first: it is what the user can act on.
+    for line in inspector.outstanding().render().lines() {
+        lines.push(Line::from(line.to_owned()));
+    }
+    lines.push(Line::from(""));
+    lines.push(Line::from(Span::styled(
+        "latency",
+        Style::default().add_modifier(Modifier::BOLD),
+    )));
+    lines.push(Line::from(format!("  {}", inspector.latency().render())));
+    lines.push(Line::from(Span::styled(
+        "usage",
+        Style::default().add_modifier(Modifier::BOLD),
+    )));
+    lines.push(Line::from(format!("  {}", inspector.usage().render())));
+
+    lines.push(Line::from(""));
+    lines.push(Line::from(Span::styled(
+        "decisions (provenance preserved)",
+        Style::default().add_modifier(Modifier::BOLD),
+    )));
+    for record in inspector.decisions().iter().rev().take(12).rev() {
+        let style = match record.provenance {
+            crate::inspector::DecisionProvenance::Model { .. } => Style::default(),
+            crate::inspector::DecisionProvenance::Deterministic { .. } => {
+                Style::default().fg(Color::DarkGray)
+            }
+            crate::inspector::DecisionProvenance::Cached { .. } => Style::default().fg(Color::Blue),
+            crate::inspector::DecisionProvenance::Operator { .. } => {
+                Style::default().fg(Color::Cyan)
+            }
+            crate::inspector::DecisionProvenance::Fallback { .. } => {
+                Style::default().fg(Color::Yellow)
+            }
+        };
+        let bounded: String = record.row().chars().take(90).collect();
+        lines.push(Line::from(Span::styled(format!("  {bounded}"), style)));
+    }
+
+    if !inspector.context().selected.is_empty() {
+        lines.push(Line::from(""));
+        lines.push(Line::from(Span::styled(
+            "context",
+            Style::default().add_modifier(Modifier::BOLD),
+        )));
+        for line in inspector.context().render().lines().take(6) {
+            lines.push(Line::from(format!("  {line}")));
+        }
+    }
+
+    frame.render_widget(Clear, popup);
+    frame.render_widget(
+        Paragraph::new(lines)
+            .block(
+                Block::default()
+                    .borders(Borders::ALL)
+                    .title(" decisions (i to close) "),
+            )
+            .wrap(Wrap { trim: false }),
+        popup,
     );
 }
 

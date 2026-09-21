@@ -101,6 +101,8 @@ pub struct WorkbenchState {
     pub pending: Option<PendingPrompt>,
     /// Whether a help overlay is open.
     pub help: bool,
+    /// Whether the optional decision inspector is shown.
+    pub show_inspector: bool,
     /// Command palette state: the query when open.
     pub palette: Option<String>,
     /// Attachments resolved for the current composer text.
@@ -109,6 +111,10 @@ pub struct WorkbenchState {
     pub attachment_errors: Vec<crate::attach::AttachError>,
     /// The review workspace, when the user has opened one (issue #29).
     pub review: Option<crate::review::ReviewView>,
+    /// The optional decision inspector (issue #30). Built from the same
+    /// events the timeline uses, so it never narrates anything the
+    /// runtime did not report.
+    pub inspector: crate::inspector::DecisionInspector,
     /// Transient status message.
     pub status: Option<String>,
     /// Counters for the inspector.
@@ -150,10 +156,12 @@ impl WorkbenchState {
             follow: true,
             pending: None,
             help: false,
+            show_inspector: false,
             palette: None,
             attachments: Vec::new(),
             attachment_errors: Vec::new(),
             review: None,
+            inspector: crate::inspector::DecisionInspector::new(),
             status: None,
             stats: WorkbenchStats::default(),
         }
@@ -238,6 +246,9 @@ impl WorkbenchState {
     /// This is the whole reducer: pure, synchronous and independent of
     /// I/O, so it can be replayed in a test at full speed.
     pub fn apply(&mut self, event: &SessionEvent) {
+        // The inspector consumes the same stream; it performs no I/O and
+        // adds nothing the runtime did not report.
+        self.inspector.apply(event);
         match event {
             SessionEvent::SessionStarted { protocol_version } => {
                 self.status = Some(format!("session protocol v{protocol_version}"));

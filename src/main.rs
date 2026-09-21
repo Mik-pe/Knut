@@ -347,6 +347,7 @@ async fn route_once<S: SystemOne>(
 
     let source = match routed.source {
         DecisionSource::SystemZero => "system-0",
+        DecisionSource::Cache => "cache",
         DecisionSource::SystemOne => "system-1",
     };
     println!(
