@@ -123,6 +123,7 @@ async fn run(args: Vec<String>) -> Result<(), KnutError> {
         "sessions" => sessions(&positionals, as_json).await,
         "bench" => bench().await,
         "lsp" => lsp_status().await,
+        "jsonl" => headless_jsonl(&positionals).await,
         "--help" | "-h" | "help" => {
             println!("{}", usage());
             Ok(())
@@ -147,6 +148,7 @@ USAGE:
   knut tui                 open the workbench shell (Ratatui)
   knut bench               run the pilot benchmark and write an inspectable report
   knut lsp                 report language-server availability and negotiated features
+  knut jsonl [prompt]      headless JSONL: commands on stdin, events on stdout
   knut sessions list       list stored sessions
   knut sessions show <id>  replay a stored transcript (state only)
   knut sessions export <id> [--raw]  export without executing anything
@@ -664,6 +666,66 @@ async fn bench() -> Result<(), KnutError> {
     println!("report written to {}", path.display());
     let _ = std::fs::remove_dir_all(&root);
     Ok(())
+}
+
+/// `jsonl`: the headless adapter over the same session runtime.
+///
+/// Contract: stdout carries protocol messages only; diagnostics go to
+/// stderr. A single prompt argument runs one scripted session, otherwise
+/// commands are read line by line from stdin.
+async fn headless_jsonl(positionals: &[String]) -> Result<(), KnutError> {
+    let mut adapter = knut::HeadlessAdapter::new(format!("headless-{}", std::process::id()));
+    emit(&knut::HeadlessEvent::Ready {
+        protocol_version: knut::JSONL_PROTOCOL_VERSION,
+        session: adapter.session.id.clone(),
+    });
+
+    // A one-shot prompt from the command line, for scripting.
+    if !positionals.is_empty() {
+        let prompt = positionals.join(" ");
+        let event = knut::SessionEvent::TaskStarted {
+            task: knut::TaskId(1),
+            prompt: prompt.clone(),
+        };
+        emit(&adapter.translate(&event));
+        let routed = adapter.outcome(&knut::SessionEvent::TaskFailed {
+            task: knut::TaskId(1),
+            reason: "no reasoner configured: set KNUT_PROVIDER_API_KEY to run tasks headlessly"
+                .to_owned(),
+        });
+        if let Some(routed) = routed {
+            emit(&routed);
+        }
+        return Ok(());
+    }
+
+    // Otherwise read commands from stdin, one JSON object per line.
+    use std::io::BufRead;
+    let stdin = std::io::stdin();
+    for line in stdin.lock().lines() {
+        let line = line.map_err(|err| KnutError::Tool(format!("reading stdin: {err}")))?;
+        if line.trim().is_empty() {
+            continue;
+        }
+        for event in adapter.handle_line(&line) {
+            emit(&event);
+        }
+    }
+
+    // stdin closed: the session stops.
+    for event in adapter.handle_line(r#"{"type":"close"}"#) {
+        emit(&event);
+    }
+    Ok(())
+}
+
+/// Write one protocol message to stdout, reporting write failures on
+/// stderr rather than corrupting the stream.
+fn emit(event: &knut::HeadlessEvent) {
+    match knut::to_jsonl(event) {
+        Ok(line) => println!("{line}"),
+        Err(err) => eprintln!("{}", knut::diagnostic(&format!("{err:?}"))),
+    }
 }
 
 /// `lsp`: report language-server availability without starting anything
