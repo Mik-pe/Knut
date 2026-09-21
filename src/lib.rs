@@ -10,6 +10,7 @@ mod frame;
 mod judgment;
 mod model;
 mod patch;
+mod persist;
 mod planner;
 mod policy;
 mod provider;
@@ -69,6 +70,10 @@ pub use patch::{
     AppliedOp, ApplyFailure, ApplyOutcome, ApplyPatchTool, MAX_PATCH_OPS, Patch, PatchApplier,
     PatchOp, PatchRejection, RevertOutcome, SkippedRevert, ValidatedOp, ValidatedPatch,
     validate_patch,
+};
+pub use persist::{
+    OperationRecord, PersistedOutcome, ResumeBlocker, ResumePlan, SCHEMA_VERSION, SessionExport,
+    SessionStore, SessionSummary, redact_path, replay_state,
 };
 pub use planner::{MAX_DEPTH, MAX_NODES, PlanRejection, Planner, PlanningContext, ValidatedPlan};
 pub use policy::{

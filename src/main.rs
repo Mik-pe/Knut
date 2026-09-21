@@ -120,6 +120,7 @@ async fn run(args: Vec<String>) -> Result<(), KnutError> {
         "doctor" => doctor(live_from_flags(&positionals)).await,
         "verify" => verify_workspace(verbose, as_json).await,
         "tui" | "workbench" => tui().await,
+        "sessions" => sessions(&positionals, as_json).await,
         "--help" | "-h" | "help" => {
             println!("{}", usage());
             Ok(())
@@ -142,6 +143,10 @@ USAGE:
   knut doctor [--live]
   knut verify [--json]     run the workspace's real checks for the current revision
   knut tui                 open the workbench shell (Ratatui)
+  knut sessions list       list stored sessions
+  knut sessions show <id>  replay a stored transcript (state only)
+  knut sessions export <id> [--raw]  export without executing anything
+  knut sessions plan <id>  report whether a session can be resumed
 
 System One backends (--backend):
   static (default)   deterministic mock, fully offline
@@ -565,6 +570,127 @@ async fn tui() -> Result<(), KnutError> {
     knut::run_shell(state, event_rx, command_tx)
         .await
         .map_err(|err| KnutError::Tool(format!("terminal: {err}")))
+}
+
+/// `sessions`: local session management over the SQLite store.
+///
+/// Every subcommand here is read-only unless it explicitly writes a new
+/// session: none of them dispatches a tool or a provider call.
+async fn sessions(args: &[String], as_json: bool) -> Result<(), KnutError> {
+    let store_path = session_store_path();
+    let mut store = knut::SessionStore::open(&store_path)?;
+    let subcommand = args.first().map(String::as_str).unwrap_or("list");
+
+    match subcommand {
+        "list" | "" => {
+            let sessions = store.sessions()?;
+            if as_json {
+                println!(
+                    "{}",
+                    serde_json::to_string_pretty(&sessions)
+                        .map_err(|err| KnutError::Tool(format!("serialize: {err}")))?
+                );
+            } else if sessions.is_empty() {
+                println!("no stored sessions ({})", store_path.display());
+            } else {
+                println!("stored sessions ({})", store_path.display());
+                for session in sessions {
+                    println!(
+                        "  {}  {}  {} events  {}",
+                        session.id, session.task_state, session.event_count, session.workspace
+                    );
+                }
+            }
+            Ok(())
+        }
+        "show" | "replay" => {
+            let Some(id) = args.get(1) else {
+                return Err(KnutError::Tool(
+                    "sessions show needs a session id".to_owned(),
+                ));
+            };
+            // Replaying rebuilds state only: it never dispatches.
+            let state = knut::replay_state(&store, id, "stored")?;
+            println!("session {id} replayed (state only; nothing was executed)");
+            println!("  task state: {:?}", state.task_state);
+            println!("  timeline entries: {}", state.timeline.len());
+            for entry in state.timeline.iter().rev().take(10).rev() {
+                println!("  [{}] {}", entry.kind.label(), entry.text);
+            }
+            Ok(())
+        }
+        "export" => {
+            let Some(id) = args.get(1) else {
+                return Err(KnutError::Tool(
+                    "sessions export needs a session id".to_owned(),
+                ));
+            };
+            let include_raw = args.iter().any(|arg| arg == "--raw");
+            let export = store.export(id, include_raw)?;
+            println!(
+                "{}",
+                serde_json::to_string_pretty(&export)
+                    .map_err(|err| KnutError::Tool(format!("serialize: {err}")))?
+            );
+            if !include_raw {
+                eprintln!("note: paths are redacted; pass --raw to include them explicitly");
+            }
+            Ok(())
+        }
+        "plan" | "resume" => {
+            let Some(id) = args.get(1) else {
+                return Err(KnutError::Tool(
+                    "sessions plan needs a session id".to_owned(),
+                ));
+            };
+            let workspace = knut::Workspace::open(".")?;
+            let supervisor = std::sync::Arc::new(knut::Supervisor::new(workspace.clone()));
+            let revision =
+                knut::CheckRunner::new(workspace.clone(), supervisor, knut::CheckProfile::rust())
+                    .current_revision("workspace")
+                    .map(|revision| revision.revision)
+                    .unwrap_or_else(|_| "unknown".to_owned());
+
+            let plan = store.plan_resume(id, &revision, "side-effect-default")?;
+            match plan {
+                knut::ResumePlan::Continue => {
+                    println!("session {id} can continue");
+                }
+                knut::ResumePlan::Reconcile(blockers) => {
+                    println!("session {id} needs reconciliation before continuing:");
+                    for blocker in blockers {
+                        println!("  - {blocker}");
+                    }
+                }
+                knut::ResumePlan::Refuse(blockers) => {
+                    println!("session {id} cannot be resumed as-is:");
+                    for blocker in blockers {
+                        println!("  - {blocker}");
+                    }
+                }
+            }
+            let _ = &mut store;
+            Ok(())
+        }
+        other => Err(KnutError::Tool(format!(
+            "unknown sessions subcommand {other:?}; expected list, show, export or plan"
+        ))),
+    }
+}
+
+/// Where stored sessions live: alongside the user's local state, never in
+/// the repository.
+fn session_store_path() -> std::path::PathBuf {
+    if let Ok(path) = std::env::var("KNUT_SESSION_STORE") {
+        return std::path::PathBuf::from(path);
+    }
+    let base = std::env::var("XDG_DATA_HOME")
+        .map(std::path::PathBuf::from)
+        .or_else(|_| {
+            std::env::var("HOME").map(|home| std::path::PathBuf::from(home).join(".local/share"))
+        })
+        .unwrap_or_else(|_| std::path::PathBuf::from("."));
+    base.join("knut").join("sessions.db")
 }
 
 /// `verify`: run the workspace's real checks and report revision-bound
