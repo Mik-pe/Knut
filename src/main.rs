@@ -122,6 +122,7 @@ async fn run(args: Vec<String>) -> Result<(), KnutError> {
         "tui" | "workbench" => tui().await,
         "sessions" => sessions(&positionals, as_json).await,
         "bench" => bench().await,
+        "lsp" => lsp_status().await,
         "--help" | "-h" | "help" => {
             println!("{}", usage());
             Ok(())
@@ -145,6 +146,7 @@ USAGE:
   knut verify [--json]     run the workspace's real checks for the current revision
   knut tui                 open the workbench shell (Ratatui)
   knut bench               run the pilot benchmark and write an inspectable report
+  knut lsp                 report language-server availability and negotiated features
   knut sessions list       list stored sessions
   knut sessions show <id>  replay a stored transcript (state only)
   knut sessions export <id> [--raw]  export without executing anything
@@ -661,6 +663,43 @@ async fn bench() -> Result<(), KnutError> {
     println!("{}", report.human_summary());
     println!("report written to {}", path.display());
     let _ = std::fs::remove_dir_all(&root);
+    Ok(())
+}
+
+/// `lsp`: report language-server availability without starting anything
+/// implicitly.
+///
+/// Honest by design: an untrusted or missing server is reported, not
+/// silently installed, and the session degrades to the workspace search
+/// tools.
+async fn lsp_status() -> Result<(), KnutError> {
+    println!("language intelligence (LSP {})", knut::LSP_PROTOCOL_VERSION);
+    println!(
+        "  supported features: {}",
+        knut::SUPPORTED_FEATURES
+            .iter()
+            .map(|feature| feature.label())
+            .collect::<Vec<_>>()
+            .join(", ")
+    );
+
+    for config in [knut::ServerConfig::rust(), knut::ServerConfig::typescript()] {
+        let availability = {
+            let manager = knut::LanguageServerManager::new(config.clone());
+            manager.availability()
+        };
+        match availability {
+            Ok(()) => println!("  {}: ready ({})", config.language, config.program),
+            Err(unavailable) => {
+                println!("  {}: unavailable — {unavailable}", config.language);
+            }
+        }
+    }
+
+    println!(
+        "  note: servers are not started implicitly; trust one with ServerConfig::trust(true) \
+         and a verified executable"
+    );
     Ok(())
 }
 

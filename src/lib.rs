@@ -12,6 +12,7 @@ mod error;
 mod evals;
 mod frame;
 mod judgment;
+mod lsp;
 mod model;
 mod patch;
 mod persist;
@@ -83,6 +84,12 @@ pub use frame::{
 pub use judgment::{
     Complexity, Handler, IngressJudgments, Judgment, JudgmentRouter, JudgmentSystemOne,
     RetrievalJudgment, StaticJudgments, TierJudgment, YesNo,
+};
+pub use lsp::{
+    Degradation, Diagnostic, DiagnosticSeverity, DiagnosticsState, DocumentVersions,
+    LSP_PROTOCOL_VERSION, LanguageServerManager, Location, LspFeature, MAX_NAVIGATION_RESULTS,
+    Navigation, Position, PositionEncoding, SUPPORTED_FEATURES, ServerCapabilities, ServerConfig,
+    ServerEdit, ServerEditRejected, ServerUnavailable, initialize_request, navigation_candidates,
 };
 pub use model::{
     BufferedSink, CascadeOutcome, ComputeCascade, Continuation, ContinuationPart, ExpectedArtifact,
