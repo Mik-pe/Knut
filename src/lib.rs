@@ -1,4 +1,5 @@
 mod attach;
+mod bench;
 mod cards;
 mod completion;
 mod composer;
@@ -35,6 +36,10 @@ pub use attach::{
     AttachError, Attachment, CommandAvailability, MAX_ATTACHMENTS, PaletteCommand,
     attachment_payload, attachment_summary, command_catalog, extract_mentions, filter_catalog,
     resolve_mention, resolve_mentions,
+};
+pub use bench::{
+    Arm, ArmSummary, BenchReport, BenchTask, PairedComparison, REPORT_VERSION, RunMode,
+    RunVersions, TaskKind, TaskRun, TaskWorkspace, pilot_suite, run_task_check,
 };
 pub use cards::{
     ActionCard, CardList, CardState, MAX_CARD_DETAIL, MAX_CARDS, sanitize_for_display,

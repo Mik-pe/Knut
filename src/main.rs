@@ -121,6 +121,7 @@ async fn run(args: Vec<String>) -> Result<(), KnutError> {
         "verify" => verify_workspace(verbose, as_json).await,
         "tui" | "workbench" => tui().await,
         "sessions" => sessions(&positionals, as_json).await,
+        "bench" => bench().await,
         "--help" | "-h" | "help" => {
             println!("{}", usage());
             Ok(())
@@ -143,6 +144,7 @@ USAGE:
   knut doctor [--live]
   knut verify [--json]     run the workspace's real checks for the current revision
   knut tui                 open the workbench shell (Ratatui)
+  knut bench               run the pilot benchmark and write an inspectable report
   knut sessions list       list stored sessions
   knut sessions show <id>  replay a stored transcript (state only)
   knut sessions export <id> [--raw]  export without executing anything
@@ -570,6 +572,96 @@ async fn tui() -> Result<(), KnutError> {
     knut::run_shell(state, event_rx, command_tx)
         .await
         .map_err(|err| KnutError::Tool(format!("terminal: {err}")))
+}
+
+/// `bench`: run the pilot task suite with real checks and write a report.
+///
+/// Offline by construction: the checks are real, the "model" side is the
+/// local harness. The report says so, and the numbers are harness
+/// measurements rather than live provider results.
+async fn bench() -> Result<(), KnutError> {
+    let root = std::env::temp_dir().join(format!(
+        "knut-bench-{}-{:?}",
+        std::process::id(),
+        std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)
+            .map(|d| d.as_nanos())
+            .unwrap_or(0)
+    ));
+    std::fs::create_dir_all(&root)
+        .map_err(|err| KnutError::Tool(format!("creating bench root: {err}")))?;
+
+    let versions = knut::RunVersions {
+        harness: format!("knut {}", env!("CARGO_PKG_VERSION")),
+        report: knut::REPORT_VERSION,
+        model: std::env::var("KNUT_PROVIDER_MODEL")
+            .unwrap_or_else(|_| "not configured (offline harness)".to_owned()),
+        reasoning_effort: "not applicable offline".to_owned(),
+        question_pack: "frame-v1".to_owned(),
+        pricing_source: "illustrative example, not a provider price list".to_owned(),
+        pricing_as_of: "2026-09-21".to_owned(),
+        mode: knut::RunMode::Offline,
+        provider_region: None,
+    };
+
+    let mut runs = Vec::new();
+    for task in knut::pilot_suite() {
+        for arm in [knut::Arm::Baseline, knut::Arm::Hybrid] {
+            let started = std::time::Instant::now();
+            let workspace = knut::TaskWorkspace::create(&task, &root)?;
+            let revision_before = workspace.revision()?;
+            let supervisor = Arc::new(knut::Supervisor::new(workspace.workspace()?));
+            let revision = knut::ArtifactRevision::new(&task.id, revision_before.clone());
+
+            // The harness's "work" for this pilot: for a task whose check
+            // already passes, the correct action is to change nothing; for
+            // a failing one, run the check so the failure is recorded
+            // verbatim. The report makes clear that no model produced the
+            // patch in offline mode.
+            let check = knut::run_task_check(&supervisor, &task, &revision).await?;
+            let verified = check.outcome == knut::CheckOutcome::Passed;
+            let revision_after = workspace.revision()?;
+
+            runs.push(knut::TaskRun {
+                task: task.id.clone(),
+                kind: task.kind,
+                arm,
+                verified,
+                checks: vec![check],
+                failure: if verified {
+                    None
+                } else {
+                    Some("the task check did not pass in the offline harness".to_owned())
+                },
+                time_to_first_action_ms: Some(started.elapsed().as_millis() as u64),
+                time_to_verified_ms: if verified {
+                    Some(started.elapsed().as_millis() as u64)
+                } else {
+                    None
+                },
+                total_ms: started.elapsed().as_millis() as u64,
+                control_decisions: if arm == knut::Arm::Hybrid { 1 } else { 0 },
+                control_overhead_ms: 0,
+                interventions: 0,
+                input_tokens: None,
+                output_tokens: None,
+                cost: None,
+                repairs: 0,
+                revision_before,
+                revision_after,
+            });
+        }
+    }
+
+    let report = knut::BenchReport::build(versions, runs);
+    let directory = std::path::PathBuf::from(
+        std::env::var("KNUT_BENCH_OUT").unwrap_or_else(|_| "bench-out".to_owned()),
+    );
+    let path = report.write(&directory)?;
+    println!("{}", report.human_summary());
+    println!("report written to {}", path.display());
+    let _ = std::fs::remove_dir_all(&root);
+    Ok(())
 }
 
 /// `sessions`: local session management over the SQLite store.
