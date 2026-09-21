@@ -435,19 +435,23 @@ impl WorkbenchState {
                 proposed,
                 effective,
                 overridden,
+                reason,
                 ..
             } => {
-                self.push(
-                    TimelineKind::Decision,
-                    match (proposed, effective) {
-                        (EdgeChoice::Done, EdgeChoice::Done) => "edge: done".to_owned(),
-                        _ if *overridden => {
-                            format!("edge: {proposed:?} overridden to {effective:?}")
-                        }
-                        _ => format!("edge: {effective:?}"),
-                    },
-                    false,
-                );
+                let mut text = match (proposed, effective) {
+                    (EdgeChoice::Done, EdgeChoice::Done) => "edge: done".to_owned(),
+                    _ if *overridden => {
+                        format!("edge: {proposed:?} overridden to {effective:?}")
+                    }
+                    _ => format!("edge: {effective:?}"),
+                };
+                // Carry the runtime's own reason: "continue" alone cannot
+                // be told apart from a task that is stuck.
+                if !reason.is_empty() {
+                    text.push_str(" — ");
+                    text.push_str(reason);
+                }
+                self.push(TimelineKind::Decision, text, false);
             }
             SessionEvent::FrameDecided {
                 question_kind,
@@ -724,6 +728,43 @@ mod tests {
             node: crate::session::NodeId(1),
             text: text.to_owned(),
         }
+    }
+
+    #[test]
+    fn an_edge_decision_carries_its_reason_into_the_transcript() {
+        let mut state = WorkbenchState::new("/tmp/ws");
+        state.apply(&SessionEvent::EdgeDecided {
+            task: TaskId(1),
+            turn: TurnId(1),
+            revision: TaskRevision(1),
+            proposed: EdgeChoice::Continue,
+            effective: EdgeChoice::Continue,
+            overridden: false,
+            reason: "outstanding: test: the test suite passes".to_owned(),
+        });
+        let entry = state.timeline.last().expect("a decision was recorded");
+        // The bug this guards: a bare "edge: Continue" is
+        // indistinguishable from a task that is stuck, so the runtime's
+        // own explanation must reach the transcript.
+        assert!(entry.text.contains("Continue"));
+        assert!(
+            entry.text.contains("test: the test suite passes"),
+            "the reason must be shown: {}",
+            entry.text
+        );
+
+        // A decision that speaks for itself stays clean.
+        state.apply(&SessionEvent::EdgeDecided {
+            task: TaskId(1),
+            turn: TurnId(1),
+            revision: TaskRevision(1),
+            proposed: EdgeChoice::Done,
+            effective: EdgeChoice::Done,
+            overridden: false,
+            reason: String::new(),
+        });
+        let entry = state.timeline.last().unwrap();
+        assert_eq!(entry.text, "edge: done");
     }
 
     #[test]

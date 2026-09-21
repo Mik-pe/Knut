@@ -255,6 +255,13 @@ pub enum SessionEvent {
         proposed: crate::EdgeChoice,
         effective: crate::EdgeChoice,
         overridden: bool,
+        /// Why the edge was chosen, when the reason is not self-evident.
+        ///
+        /// An unadorned "continue" tells the user nothing: without the
+        /// outstanding requirement, a task that keeps going because a
+        /// check cannot run looks exactly like a task that is stuck. Empty
+        /// when the choice speaks for itself.
+        reason: String,
     },
 
     /// The task needs the user before it can proceed.
@@ -1441,6 +1448,10 @@ where
             // to an earlier revision can never leak into this decision.
             let subject = self.completion_subject(task_id, turn, revision, "plan");
             let done_permitted = self.requirements.satisfied(&self.evidence, &subject);
+            // A plan that ran clean but is not *done* must say what is
+            // still missing, or the user cannot tell a task that needs a
+            // check to run from one that is simply spinning.
+            let outstanding = self.requirements.missing(&self.evidence, &subject);
 
             self.emit(SessionEvent::EdgeDecided {
                 task: task_id,
@@ -1457,6 +1468,11 @@ where
                     crate::EdgeChoice::Continue
                 },
                 overridden: false,
+                reason: if done_permitted {
+                    String::new()
+                } else {
+                    format!("outstanding: {}", outstanding.join("; "))
+                },
             });
 
             if done_permitted {

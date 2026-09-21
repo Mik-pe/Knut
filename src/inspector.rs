@@ -830,6 +830,7 @@ mod tests {
             proposed: EdgeChoice::Retry,
             effective: EdgeChoice::Continue,
             overridden: true,
+            reason: String::new(),
         });
 
         let labels: Vec<&str> = inspector
