@@ -1,5 +1,6 @@
 mod attach;
 mod bench;
+mod calibration;
 mod cards;
 mod completion;
 mod composer;
@@ -40,6 +41,12 @@ pub use attach::{
 pub use bench::{
     Arm, ArmSummary, BenchReport, BenchTask, PairedComparison, REPORT_VERSION, RunMode,
     RunVersions, TaskKind, TaskRun, TaskWorkspace, pilot_suite, run_task_check,
+};
+pub use calibration::{
+    BoundedRoutingCache, BreakerState, CacheKey, CacheStats, CachedDecision, CalibrationEvidence,
+    CalibrationMismatch, CalibrationReport, CircuitBreaker, DEFAULT_CACHE_CAPACITY,
+    DecisionObservation, DecisionType, InFlightCoalescer, PolicyCalibration, PolicyStatus,
+    ScoreDecision, Scores, Thresholds, classify,
 };
 pub use cards::{
     ActionCard, CardList, CardState, MAX_CARD_DETAIL, MAX_CARDS, sanitize_for_display,
