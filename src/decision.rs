@@ -73,6 +73,12 @@ impl DecisionInput {
 pub enum Action {
     AskUser,
     Retrieve(RetrievalSource),
-    Tool { capability: String },
+    /// Act without a resolved capability: an explicit intermediate action.
+    /// The runtime resolves it through bounded candidate discovery before
+    /// anything executes; it is never a direct execution instruction.
+    Discover,
+    Tool {
+        capability: String,
+    },
     Generate(ModelTier),
 }

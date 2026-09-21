@@ -18,6 +18,15 @@ impl StaticSystemOne {
     }
 }
 
+/// Sharing a router across a session must not require owning it: the
+/// blanket impl keeps `Arc<dyn SystemOne>` a `SystemOne`.
+#[async_trait]
+impl<T: SystemOne + ?Sized> SystemOne for std::sync::Arc<T> {
+    async fn decide(&self, input: &DecisionInput) -> Result<Decision, KnutError> {
+        (**self).decide(input).await
+    }
+}
+
 #[async_trait]
 impl SystemOne for StaticSystemOne {
     async fn decide(&self, _input: &DecisionInput) -> Result<Decision, KnutError> {

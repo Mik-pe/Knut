@@ -23,8 +23,9 @@ pub struct ModelIdentity {
     pub tier: ModelTier,
 }
 
-/// Token accounting for one call.
-#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+/// Token accounting for one call. `Default` is all-zero, which callers
+/// must treat as "unknown", never as "free".
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq, Serialize, Deserialize)]
 pub struct Usage {
     pub input_tokens: u64,
     pub output_tokens: u64,
@@ -72,6 +73,19 @@ pub trait Model: Send + Sync {
     fn identity(&self) -> ModelIdentity;
 
     async fn complete(&self, request: &ModelRequest) -> Result<ModelResponse, KnutError>;
+}
+
+/// Sharing a model (for tests, counters, or one adapter behind several
+/// tiers) must not require owning it.
+#[async_trait]
+impl<T: Model + ?Sized> Model for std::sync::Arc<T> {
+    fn identity(&self) -> ModelIdentity {
+        (**self).identity()
+    }
+
+    async fn complete(&self, request: &ModelRequest) -> Result<ModelResponse, KnutError> {
+        (**self).complete(request).await
+    }
 }
 
 /// The verdict of a verification pass over a model response.

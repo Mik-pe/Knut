@@ -8,6 +8,7 @@ mod model;
 mod planner;
 mod policy;
 mod runtime;
+mod session;
 mod system_one;
 mod system_zero;
 mod tool;
@@ -41,6 +42,11 @@ pub use policy::{
     JournalStore, OutcomeState, Policy, PolicyVerdict, ProposedExecution, SideEffectPolicy,
 };
 pub use runtime::{DecisionSource, Knut, Routed};
+pub use session::{
+    EVENT_LOG_CAPACITY, MAX_REPLANS_PER_TASK, MAX_TURNS_PER_TASK, SESSION_PROTOCOL_VERSION,
+    SessionCommand, SessionEvent, SessionRuntime, TaskId, TaskRevision, TaskState, TurnId,
+    WaitKind, drive_until_stable,
+};
 pub use system_one::{StaticSystemOne, SystemOne};
 pub use system_zero::{
     ExplicitCapabilityRule, InvalidInputRule, RoutingCache, RuleVerdict, SystemZero,

@@ -566,6 +566,7 @@ fn action_decision(action: &Action) -> Decision {
     let (route, tier, capability) = match action {
         Action::AskUser => (Route::Clarify, ModelTier::Fast, None),
         Action::Retrieve(_) => (Route::Retrieve, ModelTier::Fast, None),
+        Action::Discover => (Route::Act, ModelTier::Fast, None),
         Action::Tool { capability } => (Route::Act, ModelTier::Fast, Some(capability.clone())),
         Action::Generate(tier) => (Route::Generate, *tier, None),
     };

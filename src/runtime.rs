@@ -103,7 +103,10 @@ where
             Route::Act => decision
                 .capability
                 .map(|capability| Action::Tool { capability })
-                .unwrap_or(Action::Generate(ModelTier::Reasoner)),
+                // Act without a capability stays an explicit discovery
+                // step; it is never silently upgraded to generation and
+                // never executed as-is.
+                .unwrap_or(Action::Discover),
             Route::Generate => Action::Generate(decision.model_tier),
         }
     }
@@ -150,11 +153,13 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn act_without_capability_escalates() {
+    async fn act_without_capability_is_explicit_discovery() {
         let knut = Knut::new(StaticSystemOne::new(decision(Route::Act, 0.95)));
         let action = knut.next("do it", vec!["files".into()]).await.unwrap();
 
-        assert_eq!(action, Action::Generate(ModelTier::Reasoner));
+        // Not a silent escalation to generation: the runtime must resolve
+        // discovery before anything executes.
+        assert_eq!(action, Action::Discover);
     }
 
     /// Counts how often System One is actually consulted.

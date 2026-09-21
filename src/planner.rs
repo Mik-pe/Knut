@@ -95,12 +95,15 @@ fn measure(plan: &PlanNode) -> (usize, usize) {
 /// answer with plan JSON using only known IDs. Invalid output gets one
 /// repair round with the concrete errors attached, then a hard
 /// `PlanRejected` failure — the runtime never "just tries" a bad tree.
+///
+/// The cascade is shared (`Arc`) so one session can own a single set of
+/// model adapters across planning, generation and repair.
 pub struct Planner {
-    cascade: ComputeCascade,
+    cascade: std::sync::Arc<ComputeCascade>,
 }
 
 impl Planner {
-    pub fn new(cascade: ComputeCascade) -> Self {
+    pub fn new(cascade: std::sync::Arc<ComputeCascade>) -> Self {
         Self { cascade }
     }
 
@@ -381,7 +384,9 @@ mod tests {
     }
 
     fn planner_with(responses: Vec<String>) -> Planner {
-        Planner::new(ComputeCascade::empty().with_reasoner(ScriptedReasoner::with(responses)))
+        Planner::new(std::sync::Arc::new(
+            ComputeCascade::empty().with_reasoner(ScriptedReasoner::with(responses)),
+        ))
     }
 
     fn good_plan_json() -> String {
