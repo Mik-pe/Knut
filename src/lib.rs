@@ -3,6 +3,7 @@ mod decision;
 mod edge;
 mod error;
 mod evals;
+mod frame;
 mod judgment;
 mod model;
 mod planner;
@@ -28,6 +29,11 @@ pub use error::{KnutError, SystemOneFailure, redacted};
 pub use evals::{
     Benchmark, BenchmarkComparison, BenchmarkTask, CostModel, Expectation, Metrics,
     ShadowSystemOne, TraceLog, TurnOutcome, TurnTrace,
+};
+pub use frame::{
+    Candidate, CandidateChoice, DecisionFrame, ESCALATE_ID, FRAME_VERSION, FrameKind, FrameRouter,
+    MAX_CANDIDATES, StaticFrameRouter, decide_candidate, decide_continuation,
+    validate_candidate_answer,
 };
 pub use judgment::{
     Complexity, Handler, IngressJudgments, Judgment, JudgmentRouter, JudgmentSystemOne,

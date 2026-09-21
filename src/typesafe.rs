@@ -434,6 +434,31 @@ impl<'de> Deserialize<'de> for Answer {
     }
 }
 
+/// Read one validated choice answer, with its raw distribution and
+/// confidence preserved.
+///
+/// Returns an error when the response lacks the answer or the answer is
+/// not a choice: callers then fall back to a deterministic decision
+/// rather than guessing.
+pub fn answer_choice(
+    response: &SystemOneResponse,
+    question_id: &str,
+) -> Result<(String, std::collections::BTreeMap<String, f64>, f64), KnutError> {
+    let answer = response.answers.get(question_id).ok_or_else(|| {
+        KnutError::SystemOne(format!("response has no answer for {question_id:?}"))
+    })?;
+    match answer {
+        Answer::Choice {
+            choice,
+            probabilities,
+            confidence,
+        } => Ok((choice.clone(), probabilities.clone(), *confidence)),
+        other => Err(KnutError::SystemOne(format!(
+            "expected a choice answer for {question_id:?}, got {other:?}"
+        ))),
+    }
+}
+
 /// Token usage reported by the API.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
 pub struct Usage {
@@ -955,6 +980,24 @@ impl JudgmentRouter for JevSystemOne {
     }
 }
 
+/// Live coding-frame routing: posts a frame's question pack to Jev and
+/// returns the validated answers.
+///
+/// The frame is the *state*; the runtime owns which actions are legal, so
+/// an answer can only select among candidates the runtime already
+/// authorized.
+#[async_trait]
+impl crate::FrameRouter for JevSystemOne {
+    async fn ask(&self, frame: &crate::DecisionFrame) -> Result<SystemOneResponse, KnutError> {
+        let request = SystemOneRequest {
+            model: self.config.model.clone(),
+            state: frame.to_state(),
+            questions: frame.questions(),
+        };
+        self.post(&request).await
+    }
+}
+
 #[async_trait]
 impl crate::SystemOne for JevSystemOne {
     async fn decide(&self, input: &DecisionInput) -> Result<Decision, KnutError> {
@@ -1264,6 +1307,46 @@ mod tests {
         )]);
 
         assert!(response.validate_against(&questions).is_err());
+    }
+
+    /// A recovery frame through the real API: proves a coding-loop
+    /// decision (not just ingress) round-trips on the wire.
+    #[tokio::test]
+    async fn frame_question_pack_round_trips_on_the_wire() {
+        if std::env::var("TYPESAFE_API_KEY").is_err() {
+            eprintln!("skipping: TYPESAFE_API_KEY not set");
+            return;
+        }
+
+        let system_one = JevSystemOne::new(TypeSafeConfig::from_env().unwrap()).unwrap();
+        let frame = crate::DecisionFrame::new(
+            crate::FrameKind::Recovery,
+            1,
+            1,
+            "fix the failing test in src/lib.rs",
+        )
+        .with_unit("check")
+        .with_capabilities(["files", "shell"])
+        .with_candidates([
+            crate::Candidate::new("read", "Read the file under test"),
+            crate::Candidate::new("run_tests", "Run the test suite"),
+        ])
+        .with_observation(serde_json::json!({ "check": "cargo test", "exit_code": 101 }));
+
+        let response = crate::FrameRouter::ask(&system_one, &frame)
+            .await
+            .expect("live recovery frame");
+        // The answer set validates against the frame's own questions.
+        response
+            .validate_against(&frame.questions())
+            .expect("answers validate against the submitted pack");
+        let (choice, distribution, confidence) =
+            answer_choice(&response, "failure_class").expect("choice answer");
+        eprintln!(
+            "live recovery frame ok: model={} choice={choice} confidence={confidence} options={}",
+            response.resolved_model,
+            distribution.len()
+        );
     }
 
     #[test]

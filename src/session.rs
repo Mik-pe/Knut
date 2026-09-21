@@ -259,6 +259,23 @@ pub enum SessionEvent {
         task: TaskId,
     },
 
+    /// A bounded System One decision was requested at a coding-loop
+    /// boundary, with everything needed to audit it: which frame version
+    /// and question pack, what was chosen, the raw answer distribution
+    /// and whether the runtime had to override it.
+    FrameDecided {
+        task: TaskId,
+        turn: TurnId,
+        revision: TaskRevision,
+        question_kind: crate::FrameKind,
+        frame_version: u32,
+        question_pack: Vec<String>,
+        choice: String,
+        confidence: f64,
+        distribution: Value,
+        overridden: bool,
+    },
+
     /// An unexpected runtime error that did not terminate the task.
     RuntimeError {
         task: Option<TaskId>,
@@ -297,7 +314,8 @@ impl SessionEvent {
             | SessionEvent::TaskCancelled { task } => Some(*task),
             SessionEvent::NodeResult { task, .. }
             | SessionEvent::TextDelta { task, .. }
-            | SessionEvent::ToolCallProposed { task, .. } => Some(*task),
+            | SessionEvent::ToolCallProposed { task, .. }
+            | SessionEvent::FrameDecided { task, .. } => Some(*task),
         }
     }
 }
@@ -394,6 +412,10 @@ pub struct SessionRuntime<S> {
     artifact: Option<crate::ArtifactRevision>,
     /// How Discover resolves to capabilities.
     discovery: DiscoveryCandidates,
+    /// Bounded System One decisions at coding-loop boundaries. `None`
+    /// means no router is configured: discovery then asks the user
+    /// rather than guessing.
+    frames: Option<Arc<dyn crate::FrameRouter>>,
 
     // Session state.
     events: EventLog,
@@ -477,6 +499,7 @@ where
             discovery: DiscoveryCandidates {
                 candidates: Vec::new(),
             },
+            frames: None,
             events: EventLog::new(),
             task: None,
             pending_wait: None,
@@ -499,6 +522,14 @@ where
     /// Configure discovery candidates for `Action::Discover`.
     pub fn with_discovery(mut self, discovery: DiscoveryCandidates) -> Self {
         self.discovery = discovery;
+        self
+    }
+
+    /// Configure the bounded System One router used at coding-loop
+    /// decision points (candidate selection, failure classification,
+    /// plan continuation).
+    pub fn with_frames(mut self, router: Arc<dyn crate::FrameRouter>) -> Self {
+        self.frames = Some(router);
         self
     }
 
@@ -912,6 +943,41 @@ where
         self.task.as_ref().map(|t| t.state)
     }
 
+    /// Ask the user to choose among real candidates, naming why we are
+    /// asking. This is the safe transition when a bounded decision is
+    /// unavailable, declined or unusable — never a guessed capability.
+    fn escalate_to_user(
+        &mut self,
+        task_id: TaskId,
+        turn: TurnId,
+        candidates: &[(String, String)],
+        reason: &str,
+    ) -> Tick {
+        if candidates.is_empty() {
+            self.emit(SessionEvent::WaitingForUser {
+                task: task_id,
+                turn,
+                wait: WaitKind::Question,
+                message: format!("{reason}; no capability candidates are available."),
+            });
+        } else {
+            self.emit(SessionEvent::WaitingForUser {
+                task: task_id,
+                turn,
+                wait: WaitKind::Question,
+                message: format!(
+                    "{reason}. Which capability should act? {}",
+                    candidates
+                        .iter()
+                        .map(|(id, _)| id.as_str())
+                        .collect::<Vec<_>>()
+                        .join(", ")
+                ),
+            });
+        }
+        Tick::Waiting(WaitKind::Question)
+    }
+
     /// One unit of work: route, then execute the routed action.
     async fn tick(
         &mut self,
@@ -976,7 +1042,8 @@ where
                 // No candidates means ask the user; a single candidate is
                 // mechanical; multiple candidates select deterministically
                 // by exact prompt match, else ask.
-                let candidates = &self.discovery.candidates;
+                let candidates: Vec<(String, String)> = self.discovery.candidates.clone();
+                let candidates = &candidates;
                 match candidates.len() {
                     0 => {
                         self.emit(SessionEvent::WaitingForUser {
@@ -1005,20 +1072,100 @@ where
                                     .await
                             }
                             None => {
-                                self.emit(SessionEvent::WaitingForUser {
+                                // More than one legal choice: exactly the
+                                // case System One exists for. Ask the
+                                // frame router over a bounded, versioned
+                                // frame, and fall back to asking the user
+                                // when the answer is unusable.
+                                let frame = crate::DecisionFrame::new(
+                                    crate::FrameKind::CandidateSelection,
+                                    task_id.0,
+                                    revision.0,
+                                    prompt.to_owned(),
+                                )
+                                .with_capabilities(self.registry.capabilities())
+                                .with_candidates(
+                                    candidates.iter().map(|(id, description)| {
+                                        crate::Candidate::new(id.clone(), description.clone())
+                                    }),
+                                );
+
+                                let decision = match &self.frames {
+                                    Some(router) => {
+                                        crate::decide_candidate(router.as_ref(), &frame).await
+                                    }
+                                    None => Ok(crate::CandidateChoice {
+                                        id: crate::ESCALATE_ID.to_owned(),
+                                        escalate: true,
+                                        distribution: Default::default(),
+                                        confidence: 0.0,
+                                    }),
+                                };
+
+                                // Record what was asked and answered, with
+                                // the raw distribution preserved.
+                                self.emit(SessionEvent::FrameDecided {
                                     task: task_id,
                                     turn,
-                                    wait: WaitKind::Question,
-                                    message: format!(
-                                        "Multiple capabilities could apply: {}; which one?",
-                                        candidates
-                                            .iter()
-                                            .map(|(id, _)| id.as_str())
-                                            .collect::<Vec<_>>()
-                                            .join(", ")
-                                    ),
+                                    revision,
+                                    question_kind: crate::FrameKind::CandidateSelection,
+                                    frame_version: frame.version,
+                                    question_pack: frame.questions().keys().cloned().collect(),
+                                    choice: decision
+                                        .as_ref()
+                                        .map(|d| d.id.clone())
+                                        .unwrap_or_else(|_| "unavailable".to_owned()),
+                                    confidence: decision
+                                        .as_ref()
+                                        .map(|d| d.confidence)
+                                        .unwrap_or(0.0),
+                                    distribution: decision
+                                        .as_ref()
+                                        .map(|d| {
+                                            serde_json::to_value(&d.distribution)
+                                                .unwrap_or(Value::Null)
+                                        })
+                                        .unwrap_or(Value::Null),
+                                    overridden: decision.is_err(),
                                 });
-                                Tick::Waiting(WaitKind::Question)
+
+                                match decision {
+                                    // A validated, offered candidate:
+                                    // dispatch it (the gate still decides
+                                    // whether the action may run).
+                                    Ok(choice) => match choice.chosen() {
+                                        Some(capability) => {
+                                            let capability = capability.to_owned();
+                                            self.execute_capability(
+                                                task_id,
+                                                turn,
+                                                revision,
+                                                &capability,
+                                            )
+                                            .await
+                                        }
+                                        // Escalation is a safe transition,
+                                        // never a guessed capability.
+                                        None => self.escalate_to_user(
+                                            task_id,
+                                            turn,
+                                            candidates,
+                                            "the bounded router declined the candidate set",
+                                        ),
+                                    },
+                                    // Transport/protocol failure or no
+                                    // router configured: ask, with the
+                                    // real candidates listed.
+                                    Err(err) => {
+                                        eprintln!("DEBUG candidate decision error: {err}");
+                                        self.escalate_to_user(
+                                            task_id,
+                                            turn,
+                                            candidates,
+                                            "routing the candidate set failed",
+                                        )
+                                    }
+                                }
                             }
                         }
                     }
@@ -1241,6 +1388,21 @@ where
                 .as_ref()
                 .is_some_and(|task| task.replans < MAX_REPLANS_PER_TASK);
 
+            // A meaningful observation boundary: something failed and the
+            // next step is a real choice. Ask System One to classify the
+            // failure over a bounded frame; the runtime still owns the
+            // decision rules and the budgets.
+            let failure_class = self
+                .classify_failure(
+                    task_id,
+                    turn,
+                    revision,
+                    capability,
+                    &failed_leaves,
+                    repairable,
+                )
+                .await;
+
             if repairable
                 && budget_left
                 && let Some(task) = self.task.as_mut()
@@ -1250,7 +1412,7 @@ where
                 // ("carry failed artifacts and verification feedback into
                 // bounded repair"): the reasoner sees which node failed.
                 task.prompt = format!(
-                    "{}\n[failed: {}; the plan executed but these checks did not pass]",
+                    "{}\n[failed: {} ({failure_class}); the plan executed but these checks did not pass]",
                     task.prompt,
                     failed_leaves.join(", ")
                 );
@@ -1264,6 +1426,91 @@ where
             });
             Tick::Terminal(TaskState::Failed)
         }
+    }
+
+    /// Classify an observed failure through a bounded recovery frame.
+    ///
+    /// Returns a short label for the repair prompt and the audit trail.
+    /// The classification is *advisory*: it never grants permission and
+    /// never converts a failure into success. When no router is
+    /// configured, or the answer is unusable, the runtime falls back to
+    /// its own deterministic classification.
+    async fn classify_failure(
+        &mut self,
+        task_id: TaskId,
+        turn: TurnId,
+        revision: TaskRevision,
+        capability: &str,
+        failed_leaves: &[String],
+        repairable: bool,
+    ) -> String {
+        // Deterministic default: schema/artifact checks that failed can
+        // be repaired; anything else cannot.
+        let fallback = if repairable {
+            "verification"
+        } else {
+            "failed_effect"
+        }
+        .to_owned();
+
+        let Some(router) = self.frames.clone() else {
+            return fallback;
+        };
+
+        let goal = self
+            .task
+            .as_ref()
+            .map(|task| task.prompt.clone())
+            .unwrap_or_default();
+        let frame =
+            crate::DecisionFrame::new(crate::FrameKind::Recovery, task_id.0, revision.0, goal)
+                .with_unit(capability)
+                .with_capabilities(self.registry.capabilities())
+                .with_observation(serde_json::json!({
+                    "failed_nodes": failed_leaves,
+                    "repairable_as_check": repairable,
+                }))
+                .with_remaining(["the failed checks must pass for this task to complete"]);
+
+        let (choice, confidence, distribution, overridden) = match router.ask(&frame).await {
+            Ok(response) => {
+                match crate::typesafe::answer_choice(&response, "failure_class") {
+                    Ok((choice, distribution, confidence)) => {
+                        // An unoffered class is unusable: keep the
+                        // deterministic answer rather than trusting it.
+                        let offered = [
+                            "transient",
+                            "verification",
+                            "wrong_approach",
+                            "blocked_by_policy",
+                            "unknown",
+                        ];
+                        if offered.contains(&choice.as_str()) {
+                            (choice, confidence, distribution, false)
+                        } else {
+                            (fallback.clone(), 0.0, Default::default(), true)
+                        }
+                    }
+                    Err(_) => (fallback.clone(), 0.0, Default::default(), true),
+                }
+            }
+            Err(_) => (fallback.clone(), 0.0, Default::default(), true),
+        };
+
+        self.emit(SessionEvent::FrameDecided {
+            task: task_id,
+            turn,
+            revision,
+            question_kind: crate::FrameKind::Recovery,
+            frame_version: frame.version,
+            question_pack: frame.questions().keys().cloned().collect(),
+            choice: choice.clone(),
+            confidence,
+            distribution: serde_json::to_value(&distribution).unwrap_or(Value::Null),
+            overridden,
+        });
+
+        choice
     }
 
     /// Ask System Two for a validated plan for `capability`, emitting the
@@ -2221,6 +2468,293 @@ mod tests {
                 .events()
                 .any(|e| matches!(e, SessionEvent::TextDelta { text, .. } if text == "chunk 0"))
         );
+    }
+
+    // --- coding-loop frames (#22) ---------------------------------------
+
+    /// Counts frame calls so tests can prove decisions are batched and
+    /// only asked at real boundaries.
+    struct CountingFrameRouter {
+        inner: crate::StaticFrameRouter,
+        calls: Arc<Mutex<Vec<crate::FrameKind>>>,
+    }
+
+    #[async_trait]
+    impl crate::FrameRouter for CountingFrameRouter {
+        async fn ask(
+            &self,
+            frame: &crate::DecisionFrame,
+        ) -> Result<crate::SystemOneResponse, KnutError> {
+            self.calls.lock().unwrap().push(frame.kind);
+            crate::FrameRouter::ask(&self.inner, frame).await
+        }
+    }
+
+    #[tokio::test]
+    async fn one_coding_session_makes_two_meaningful_frame_decisions() {
+        // Discovery chooses a candidate, then a failing check is
+        // classified: two decisions inside one read/edit/check session,
+        // not merely at ingress.
+        // The router returns Act *without* a capability, so the runtime
+        // must resolve the capability through bounded candidate
+        // discovery, then classify the failing check.
+        let (runtime, _reasoner) = runtime_with_reasoner(
+            Arc::new(ActNoCapRouter),
+            vec![
+                plan_with_failing_check(),
+                "not json".to_owned(),
+                plan_json("read"),
+            ],
+            crate::SideEffectPolicy::new().allow(SideEffect::ReadOnly),
+        );
+
+        let calls = Arc::new(Mutex::new(Vec::new()));
+        let router = Arc::new(CountingFrameRouter {
+            inner: crate::StaticFrameRouter::choice_over(
+                "candidate",
+                "files",
+                0.9,
+                &["shell", crate::ESCALATE_ID],
+            )
+            .and(crate::StaticFrameRouter::choice_over(
+                "failure_class",
+                "verification",
+                0.8,
+                &[
+                    "transient",
+                    "wrong_approach",
+                    "blocked_by_policy",
+                    "unknown",
+                ],
+            )),
+            calls: Arc::clone(&calls),
+        });
+        let mut runtime = runtime
+            .with_frames(router)
+            .with_discovery(DiscoveryCandidates {
+                candidates: vec![
+                    (
+                        "files".to_owned(),
+                        "read or write workspace files".to_owned(),
+                    ),
+                    ("shell".to_owned(), "run a supervised command".to_owned()),
+                ],
+            });
+
+        runtime
+            .command(SessionCommand::Submit {
+                prompt: "fix it".to_owned(),
+            })
+            .await
+            .unwrap();
+        let state = drive_until_stable(&mut runtime, 12).await.unwrap();
+        assert_eq!(state, TaskState::Completed);
+
+        // Two different frame kinds were consulted: candidate selection
+        // and failure recovery.
+        let kinds = calls.lock().unwrap().clone();
+        assert!(
+            kinds.contains(&crate::FrameKind::CandidateSelection),
+            "no candidate decision: {kinds:?}"
+        );
+        assert!(
+            kinds.contains(&crate::FrameKind::Recovery),
+            "no recovery decision: {kinds:?}"
+        );
+
+        // Both are auditable in the transcript, with the frame version,
+        // the question pack and the raw distribution preserved.
+        let events: Vec<&SessionEvent> = runtime.events().events().collect();
+        let decisions: Vec<(&crate::FrameKind, &str, bool)> = events
+            .iter()
+            .filter_map(|e| match e {
+                SessionEvent::FrameDecided {
+                    question_kind,
+                    choice,
+                    overridden,
+                    ..
+                } => Some((question_kind, choice.as_str(), *overridden)),
+                _ => None,
+            })
+            .collect();
+        assert!(decisions.len() >= 2, "decisions: {decisions:?}");
+        assert!(decisions.iter().all(|(_, _, overridden)| !overridden));
+        assert!(decisions.iter().any(|(kind, choice, _)| **kind
+            == crate::FrameKind::CandidateSelection
+            && *choice == "files"));
+        assert!(
+            decisions
+                .iter()
+                .any(|(kind, choice, _)| **kind == crate::FrameKind::Recovery
+                    && *choice == "verification")
+        );
+
+        // Distributions are stored raw, not collapsed.
+        assert!(events.iter().any(|e| matches!(
+            e,
+            SessionEvent::FrameDecided { distribution, .. }
+                if distribution.get("files").is_some()
+        )));
+    }
+
+    #[tokio::test]
+    async fn unambiguous_steps_do_not_consult_system_one() {
+        // A single legal candidate is mechanical: no frame decision, no
+        // network call.
+        let (runtime, _reasoner) = runtime_with_reasoner(
+            Arc::new(ActFiles),
+            vec![plan_json("read")],
+            crate::SideEffectPolicy::new().allow(SideEffect::ReadOnly),
+        );
+        let calls = Arc::new(Mutex::new(Vec::new()));
+        let router = Arc::new(CountingFrameRouter {
+            inner: crate::StaticFrameRouter::choice("candidate", "files", 0.9),
+            calls: Arc::clone(&calls),
+        });
+        let mut runtime = runtime
+            .with_frames(router)
+            .with_discovery(DiscoveryCandidates {
+                candidates: vec![("files".to_owned(), "files".to_owned())],
+            });
+
+        runtime
+            .command(SessionCommand::Submit {
+                prompt: "fix it".to_owned(),
+            })
+            .await
+            .unwrap();
+        drive_until_stable(&mut runtime, 12).await.unwrap();
+
+        // The routed action was explicit, so nothing needed a bounded
+        // decision.
+        assert!(
+            calls.lock().unwrap().is_empty(),
+            "a mechanical step consulted System One: {:?}",
+            calls.lock().unwrap()
+        );
+    }
+
+    #[tokio::test]
+    async fn an_unoffered_candidate_answer_cannot_dispatch_anything() {
+        // The router answers with a capability the frame never offered:
+        // the runtime must treat it as unusable and escalate, not act.
+        // A well-formed answer that names an option the frame never
+        // offered: the distribution covers the real options, but the
+        // selection is unusable.
+        let mut probabilities = std::collections::BTreeMap::new();
+        probabilities.insert("files".to_owned(), 0.01);
+        probabilities.insert("shell".to_owned(), 0.01);
+        probabilities.insert(crate::ESCALATE_ID.to_owned(), 0.01);
+        probabilities.insert("totally_made_up".to_owned(), 0.97);
+        let mut answers = std::collections::BTreeMap::new();
+        answers.insert(
+            "candidate".to_owned(),
+            crate::Answer::Choice {
+                choice: "totally_made_up".to_owned(),
+                probabilities,
+                confidence: 0.97,
+            },
+        );
+        let router = Arc::new(crate::StaticFrameRouter::new(answers));
+        let mut runtime = runtime_with(
+            Arc::new(ActNoCapRouter),
+            vec![],
+            crate::SideEffectPolicy::new().allow(SideEffect::ReadOnly),
+        )
+        .with_frames(router)
+        .with_discovery(DiscoveryCandidates {
+            candidates: vec![
+                ("files".to_owned(), "files".to_owned()),
+                ("shell".to_owned(), "shell".to_owned()),
+            ],
+        });
+
+        runtime
+            .command(SessionCommand::Submit {
+                prompt: "do something".to_owned(),
+            })
+            .await
+            .unwrap();
+        let state = drive_until_stable(&mut runtime, 6).await.unwrap();
+
+        // Waiting for the user: no capability was dispatched.
+        assert_eq!(state, TaskState::Waiting);
+        let events: Vec<&SessionEvent> = runtime.events().events().collect();
+        assert!(events.iter().any(|e| matches!(
+            e,
+            SessionEvent::FrameDecided {
+                overridden: true,
+                ..
+            }
+        )));
+        assert!(!events.iter().any(|e| matches!(
+            e,
+            SessionEvent::NodeResult { .. } | SessionEvent::Generating { .. }
+        )));
+    }
+
+    /// Routes Act without a capability, so discovery is exercised.
+    struct ActNoCapRouter;
+
+    #[async_trait]
+    impl SystemOne for ActNoCapRouter {
+        async fn decide(&self, _input: &DecisionInput) -> Result<Decision, KnutError> {
+            Ok(Decision {
+                route: Route::Act,
+                confidence: 0.95,
+                retrieval: None,
+                capability: None,
+                model_tier: ModelTier::Fast,
+                risk: Risk::Low,
+                parallelizable: false,
+            })
+        }
+    }
+
+    #[tokio::test]
+    async fn escalation_answer_routes_to_reasoning_not_a_guess() {
+        // The router declines the candidate set: the runtime must not
+        // pick a capability anyway.
+        let router = Arc::new(crate::StaticFrameRouter::choice_over(
+            "candidate",
+            crate::ESCALATE_ID,
+            0.9,
+            &["files", "shell"],
+        ));
+        let mut runtime = runtime_with(
+            Arc::new(ActNoCapRouter),
+            vec![],
+            crate::SideEffectPolicy::new().allow(SideEffect::ReadOnly),
+        )
+        .with_frames(router)
+        .with_discovery(DiscoveryCandidates {
+            candidates: vec![
+                ("files".to_owned(), "files".to_owned()),
+                ("shell".to_owned(), "shell".to_owned()),
+            ],
+        });
+
+        runtime
+            .command(SessionCommand::Submit {
+                prompt: "do something".to_owned(),
+            })
+            .await
+            .unwrap();
+        let state = drive_until_stable(&mut runtime, 6).await.unwrap();
+
+        assert_eq!(state, TaskState::Waiting);
+        let events: Vec<&SessionEvent> = runtime.events().events().collect();
+        // The recorded choice names escalation and was not overridden:
+        // it is a legitimate answer, not a failure.
+        assert!(events.iter().any(|e| matches!(
+            e,
+            SessionEvent::FrameDecided { choice, overridden: false, .. }
+                if choice == crate::ESCALATE_ID
+        )));
+        assert!(!events.iter().any(|e| matches!(
+            e,
+            SessionEvent::NodeResult { .. } | SessionEvent::Generating { .. }
+        )));
     }
 
     #[tokio::test]
