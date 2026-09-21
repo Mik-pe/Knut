@@ -15,6 +15,7 @@ mod headless;
 mod inspector;
 mod judgment;
 mod lsp;
+mod matrix;
 mod mcp;
 mod model;
 mod patch;
@@ -105,6 +106,12 @@ pub use lsp::{
     LSP_PROTOCOL_VERSION, LanguageServerManager, Location, LspFeature, MAX_NAVIGATION_RESULTS,
     Navigation, Position, PositionEncoding, SUPPORTED_FEATURES, ServerCapabilities, ServerConfig,
     ServerEdit, ServerEditRejected, ServerUnavailable, initialize_request, navigation_candidates,
+};
+pub use matrix::{
+    ApprovedSwitch, CAPABILITIES, CapabilityRow, PricingRecord, PricingTable, ProfileConfig,
+    ProviderMatrix, ProviderProfile, ReasoningField, SHARED_CONFORMANCE_FIXTURES, SupportLevel,
+    SwitchRefusal, TurnState, adapter_for, all_matrices, all_profiles, can_switch, deepseek_matrix,
+    glm_matrix, render_matrix, switch_provider,
 };
 pub use mcp::{
     ACCEPTED_REVISIONS, ConfigSource, DeclaredSideEffect, DiscoveredTool, ImportRejection,
