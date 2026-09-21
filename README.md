@@ -51,23 +51,131 @@ The core contains:
 - an edge selector so System One re-routes after node results,
 - a policy layer: permission and side-effect approval are Rust, not judgment,
 - a System Two planner that produces validated plans only,
-- eval traces, shadow routing, replay, and offline benchmarks.
+- eval traces, shadow routing, replay, and offline benchmarks,
+- one event-driven session runtime shared by the TUI, headless and editor
+  clients,
+- real workspace tools, reviewable patches and sandboxed command execution,
+- revision-bound check evidence, persistent sessions and calibrated routing,
+- optional language intelligence, bounded subagents and trusted MCP tools.
 
-Open follow-ups live in the issue tracker; the Jev HTTP adapter (#2) is the next isolated piece.
+## Invariants
 
-## CLI playground
+These hold across every client (TUI, headless JSONL, ACP) and every phase:
+
+- **one engine.** TUI, JSONL and editor clients submit commands to one
+  `SessionRuntime` and consume its events. No client implements its own
+  execution loop.
+- **a mandatory gate.** Every tool invocation passes through
+  `ExecutionGate`: policy, approval and replay semantics live in Rust, and
+  nothing a model controls can bypass them.
+- **quality mode by default.** Substantive code reasoning stays on the
+  configured reasoner; cheaper-generation routing is opt-in and must earn
+  promotion through measured results.
+- **real evidence, not assertions.** Completion requires checks that
+  actually ran against the current revision. Valid JSON is not correct
+  code, and a router's confidence is not a probability that code is right.
+- **honest unknowns.** Unreported usage is unknown, not zero; a stale
+  revision says so; an unavailable capability is reported, never silently
+  substituted.
+
+## Getting started
 
 ```console
-$ cargo run -- route weather
-weather -> Tool { capability: "weather" } (confidence 1.00, via system-0)
-
-$ cargo run -- route "find my notes" --verbose
-$ cargo run -- demo-tree          # execute the canned validated tree
-$ cargo run -- eval               # hybrid routing vs always-reasoner
-$ cargo run -- repl               # route prompts interactively
+$ cargo build --release
+$ ./target/release/knut doctor          # what is configured, offline
+$ ./target/release/knut doctor --live   # one real call per configured provider
+$ ./target/release/knut tui             # the workbench shell
+$ ./target/release/knut run "fix the failing test"   # one real coding task
 ```
 
-The playground runs fully offline against a deterministic mock System One; live Jev routing is issue #2.
+Configuration is environment-based and nothing is written to the
+repository:
+
+| variable | purpose |
+| --- | --- |
+| `KNUT_PROVIDER_API_KEY` | reasoner credential (required for `run`) |
+| `KNUT_PROVIDER_BASE_URL` | endpoint; defaults to the Z.ai coding endpoint |
+| `KNUT_PROVIDER_MODEL` | model id; defaults to `glm-5.3-flash` |
+| `TYPESAFE_API_KEY` | Jev credential (optional; decisions fall back to deterministic rules) |
+| `KNUT_MODE` | `quality` (default) or `adaptive` |
+
+`knut doctor` reports what is missing with actionable guidance, and makes
+no paid request unless you pass `--live`.
+
+## Commands
+
+```console
+$ knut doctor [--live]      configuration, capabilities, and live checks
+$ knut tui                  Ratatui workbench
+$ knut run <prompt>         real provider + tools + sandboxed checks
+$ knut jsonl [prompt]       headless: commands on stdin, events on stdout
+$ knut verify [--json]      the workspace's real checks for this revision
+$ knut bench                pilot benchmark with an inspectable report
+$ knut sessions list|show|export|plan    stored sessions
+$ knut lsp                  language-server availability
+$ knut release              versioned artifact and checksum instructions
+$ knut route|repl|demo-tree|eval         offline playground (mock, demo-only)
+```
+
+The playground commands are explicitly demo-only: they use a deterministic
+mock router and canned tools, and their numbers are not measurements of
+coding quality. `run`, `verify`, `bench` and `tui` use the real engine.
+
+## Architecture
+
+```
+commands/events ──▶ SessionRuntime ──▶ events to TUI · JSONL · ACP
+                        │
+        ┌───────────────┼────────────────┬──────────────┐
+        ▼               ▼                ▼              ▼
+   System 0/1      Planner (S2)    ExecutionGate   CheckRunner
+   (bounded)       validated plans  policy/approve  revision-bound
+        │               │                │          evidence
+        └───────────────┴────────────────┴──────────────┘
+                        │
+              provider adapters (GLM, DeepSeek) · workspace tools
+              sandboxed processes · patches · SQLite session store
+```
+
+See the [provider compatibility matrix](src/matrix.rs) for what each
+endpoint actually supports, with the evidence behind every claim.
+
+## Alpha status and limitations
+
+**Verified on 2026-09-21 at commit `9b5b3f9`** (plus the release work in
+this commit), on Linux:
+
+| check | evidence |
+| --- | --- |
+| `knut doctor` (offline) | reports missing configuration with actionable guidance |
+| `knut doctor --live` | one real call each to Jev and the configured reasoner; both succeeded |
+| provider adapters | GLM (`glm-5.3-flash`, coding endpoint) and DeepSeek (`deepseek-v4.1-flash`, Ollama Cloud) streamed, returned tool calls, reported usage and preserved reasoning parts |
+| `knut verify` | ran build, 246 tests and clippy inside the OS sandbox and reported the real result |
+| `knut bench` | wrote an inspectable report showing 1/6 tasks verified offline, with limitations stated |
+| `knut tui` | launched, accepted input, streamed events, and restored the terminal on exit |
+| `knut jsonl` | stdout stayed parseable JSONL with malformed input piped in |
+| sandbox | bubblewrap denied a read outside the workspace and unreachable network |
+| session store | created owner-only (`0600`) and refused a corrupt file without resetting it |
+
+**Known limitations, stated rather than implied:**
+
+- `knut run` wires the real provider, workspace tools, gate, sandbox and
+  check runner, and executes a validated plan. On the fixture used here,
+  the model's plan asked to pass a *search result* as a `read` node's
+  `path`, which the plan language cannot express: `$ref` substitutes a
+  whole value, and a search result is not a path string. The node failed
+  and the task honestly reported "not verified" instead of claiming
+  success. Extracting a typed field out of a referenced artifact is
+  future work; until then, `run` is a real harness that may not
+  autonomously complete every task, and never pretends otherwise.
+- `bench` is a pilot: six fixture tasks, all offline. It is not the
+  30-task held-out evaluation the roadmap calls for.
+- Language servers are reported but never started implicitly; LSP
+  navigation is fixture-tested, not live-verified here.
+- macOS and Windows are not verified. Do not treat command isolation as
+  working there.
+- TUI performance was measured on a synthetic fixture (p95 under 5 ms for
+  reducer plus render), not against real provider latency.
 
 ## Example
 

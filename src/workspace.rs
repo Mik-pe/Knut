@@ -667,6 +667,103 @@ impl Tool for ReadTool {
     }
 }
 
+/// `files.write`: the plan-invocable editing tool.
+///
+/// It exists so a validated plan can actually change code, and it is the
+/// narrowest thing that can: the caller supplies a workspace-relative path
+/// and the file's full new contents, with the content hash it expects to
+/// replace. There is no append, no regex substitution and no shell: a
+/// stale or mistyped precondition fails the node rather than rewriting
+/// something the caller did not read.
+///
+/// It declares `IdempotentWrite`, so the gate decides whether approval is
+/// needed and the journal makes the write replay-safe.
+pub struct WriteTool {
+    workspace: Workspace,
+}
+
+impl WriteTool {
+    pub fn new(workspace: Workspace) -> Self {
+        Self { workspace }
+    }
+}
+
+#[async_trait::async_trait]
+impl Tool for WriteTool {
+    fn metadata(&self) -> ToolMetadata {
+        ToolMetadata {
+            id: "write".to_owned(),
+            tool_version: "1".to_owned(),
+            capability: CAPABILITY.to_owned(),
+            description: "Replace a workspace file with new contents, checking its revision first"
+                .to_owned(),
+            input_schema: json!({
+                "type": "object",
+                "properties": {
+                    "path": { "type": "string" },
+                    "content": { "type": "string" },
+                    "expect_hash": { "type": "string" }
+                },
+                "required": ["path", "content"]
+            }),
+            side_effect: SideEffect::IdempotentWrite,
+        }
+    }
+
+    async fn call(&self, input: Value) -> Result<Value, KnutError> {
+        let path = input
+            .get("path")
+            .and_then(Value::as_str)
+            .ok_or_else(|| KnutError::Tool("write requires a path".to_owned()))?
+            .to_owned();
+        let content = input
+            .get("content")
+            .and_then(Value::as_str)
+            .ok_or_else(|| KnutError::Tool("write requires content".to_owned()))?
+            .to_owned();
+        if content.len() > MAX_FILE_BYTES as usize {
+            return Err(KnutError::Tool(format!(
+                "write of {} bytes exceeds the {MAX_FILE_BYTES}-byte limit",
+                content.len()
+            )));
+        }
+
+        // A caller that read the file tells us its revision; the check is
+        // what makes a stale edit fail instead of overwriting.
+        let existing = self.workspace.read_bytes(&path).ok();
+        if let Some(expected) = input.get("expect_hash").and_then(Value::as_str) {
+            let actual = existing.as_ref().map(|bytes| content_hash(bytes));
+            if actual.as_deref() != Some(expected) {
+                return Err(KnutError::Tool(format!(
+                    "{path:?} changed since it was read (expected {expected}, found {})",
+                    actual.as_deref().unwrap_or("<missing>")
+                )));
+            }
+        }
+
+        let safe = self.workspace.resolve(&path)?;
+        if self.workspace.is_denied(safe.relative()) {
+            return Err(KnutError::Tool(format!(
+                "path {:?} is excluded from workspace writes",
+                safe.relative()
+            )));
+        }
+        if let Some(parent) = safe.absolute().parent() {
+            std::fs::create_dir_all(parent)
+                .map_err(|err| KnutError::Tool(format!("creating {parent:?}: {err}")))?;
+        }
+        std::fs::write(safe.absolute(), content.as_bytes())
+            .map_err(|err| KnutError::Tool(format!("writing {:?}: {err}", safe.relative())))?;
+
+        let bytes = content.as_bytes();
+        Ok(json!({
+            "path": safe.relative(),
+            "bytes": bytes.len(),
+            "content_hash": content_hash(bytes),
+        }))
+    }
+}
+
 /// Register the workspace tools into a registry.
 pub fn register_workspace_tools(
     registry: &mut crate::ToolRegistry,
@@ -674,7 +771,8 @@ pub fn register_workspace_tools(
 ) -> Result<(), KnutError> {
     registry.register(ListTool::new(workspace.clone()))?;
     registry.register(SearchTool::new(workspace.clone()))?;
-    registry.register(ReadTool::new(workspace))?;
+    registry.register(ReadTool::new(workspace.clone()))?;
+    registry.register(WriteTool::new(workspace))?;
     Ok(())
 }
 
@@ -1101,11 +1199,97 @@ mod tests {
 
         assert_eq!(registry.capabilities(), vec![CAPABILITY.to_owned()]);
         let candidates = registry.tools_for_capability(CAPABILITY);
-        assert_eq!(candidates.len(), 3);
-        assert!(
+        // Three read-only tools plus the one writing tool.
+        assert_eq!(candidates.len(), 4);
+        assert_eq!(
             candidates
                 .iter()
-                .all(|t| t.side_effect == SideEffect::ReadOnly)
+                .filter(|metadata| metadata.side_effect == SideEffect::ReadOnly)
+                .count(),
+            3
         );
+        // The write tool declares a write, so the gate treats it as one:
+        // nothing here is silently read-only.
+        assert_eq!(
+            candidates
+                .iter()
+                .filter(|metadata| metadata.side_effect == SideEffect::IdempotentWrite)
+                .count(),
+            1
+        );
+    }
+
+    #[tokio::test]
+    async fn the_write_tool_changes_a_file_and_honors_its_precondition() {
+        let fixture = Fixture::new("write-tool");
+        fixture.write("src/lib.rs", "pub fn sum() {}\n");
+        let workspace = fixture.workspace();
+        let tool = WriteTool::new(workspace.clone());
+
+        // Read first, so the caller has the revision it is replacing.
+        let read = crate::Tool::call(&tool, json!({ "path": "src/lib.rs" })).await;
+        let _ = read;
+        let original = workspace.read_text("src/lib.rs").unwrap();
+        let hash = content_hash(original.as_bytes());
+
+        // A matching precondition writes.
+        let written = crate::Tool::call(
+            &tool,
+            json!({
+                "path": "src/lib.rs",
+                "content": "pub fn sum(values: &[i64]) -> i64 { values.iter().sum() }\n",
+                "expect_hash": hash,
+            }),
+        )
+        .await
+        .unwrap();
+        assert_eq!(written["path"], json!("src/lib.rs"));
+        assert!(
+            workspace
+                .read_text("src/lib.rs")
+                .unwrap()
+                .contains("values.iter().sum()")
+        );
+
+        // A stale precondition is refused rather than overwriting.
+        let err = crate::Tool::call(
+            &tool,
+            json!({
+                "path": "src/lib.rs",
+                "content": "// clobbered\n",
+                "expect_hash": hash, // the *old* hash
+            }),
+        )
+        .await
+        .unwrap_err();
+        assert!(
+            format!("{err}").contains("changed since it was read"),
+            "got {err}"
+        );
+        // The new content survived.
+        assert!(
+            workspace
+                .read_text("src/lib.rs")
+                .unwrap()
+                .contains("values.iter().sum()")
+        );
+    }
+
+    #[tokio::test]
+    async fn the_write_tool_refuses_denied_paths_and_traversal() {
+        let fixture = Fixture::new("write-denied");
+        fixture.write(".env", "SECRET=1\n");
+        let workspace = fixture.workspace();
+        let tool = WriteTool::new(workspace.clone());
+
+        let err = crate::Tool::call(&tool, json!({ "path": ".env", "content": "SECRET=2\n" }))
+            .await
+            .unwrap_err();
+        assert!(format!("{err}").contains("excluded"), "got {err}");
+
+        let err = crate::Tool::call(&tool, json!({ "path": "../outside.txt", "content": "x" }))
+            .await
+            .unwrap_err();
+        assert!(format!("{err}").contains("rejected"), "got {err}");
     }
 }

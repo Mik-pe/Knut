@@ -163,20 +163,41 @@ impl Planner {
             "tools": context.tool_catalog,
             "constraints": context.constraints,
             "expected_format": {
-                "type": "sequence|selector|parallel|tool|generate|verify|ask_user",
-                "note": "single root node; tool nodes need capability + tool_id; \
-                         verify nodes reference an existing node id; a node may \
-                         consume an earlier node's output by putting \
-                         {\"$ref\": \"<node-id>\", \"kind\": \"json\"|\"text\"} anywhere \
-                         in its input, and the referenced node must run before it",
-                "example_sequence": [
-                    {"type": "tool", "id": "note", "capability": "<from tools>",
-                     "tool_id": "<from tools>", "input": {}},
-                    {"type": "generate", "id": "summarize",
-                     "instruction": "summarize the note",
-                     "tier": "reasoner",
-                     "input": {"note": {"$ref": "note", "kind": "json"}}}
-                ]
+                "node_forms": {
+                    "sequence": {"type": "sequence", "id": "<id>", "children": ["<node>", "..."]},
+                    "selector": {"type": "selector", "id": "<id>", "children": ["<node>", "..."]},
+                    "parallel": {"type": "parallel", "id": "<id>", "children": ["<node>", "..."]},
+                    "tool": {"type": "tool", "id": "<id>", "capability": "<capability>",
+                             "tool_id": "<tool id from tools>", "input": {}},
+                    "generate": {"type": "generate", "id": "<id>", "instruction": "<text>",
+                                 "tier": "fast|standard|reasoner", "input": {}},
+                    "verify": {"type": "verify", "id": "<id>", "target": "<node id>",
+                               "artifact": "text|json"},
+                    "ask_user": {"type": "ask_user", "id": "<id>", "question": "<text>"}
+                },
+                "rules": [
+                    "the response IS the root node; do not wrap it in a `tree` or `plan` key",
+                    "use `id`, never `name`, for node identity",
+                    "child nodes go in the parent's `children` array, inline",
+                    "`tier` and `artifact` are lowercase strings, not objects",
+                    "tool nodes need capability + tool_id; verify nodes reference an existing node id",
+                    "a node may consume an earlier node's output by putting \
+                     {\"$ref\": \"<node-id>\", \"kind\": \"json\"|\"text\"} anywhere in its input, \
+                     and the referenced node must run before it",
+                    "to change a file, use the files/write tool with the file's full new \
+                     contents; pass expect_hash from the files/read result so a stale edit fails \
+                     instead of overwriting what you did not read"
+                ],
+                "example": {
+                    "type": "sequence", "id": "root",
+                    "children": [
+                        {"type": "tool", "id": "note", "capability": "<from tools>",
+                         "tool_id": "<from tools>", "input": {}},
+                        {"type": "generate", "id": "summarize",
+                         "instruction": "summarize the note", "tier": "reasoner",
+                         "input": {"note": {"$ref": "note", "kind": "json"}}}
+                    ]
+                }
             },
         });
 
@@ -185,8 +206,12 @@ impl Planner {
         }
 
         ModelRequest::new(
-            "Produce a behavior-tree plan as JSON. \
-             Use only the listed tool ids under their listed capabilities.",
+            "Produce a single behavior-tree plan as ONE JSON object, and nothing else. \
+             The root object is a node. Every node MUST have exactly the keys of one of the \
+             forms in `expected_format.node_forms`: use `id` for a node's identity (never \
+             `name`), and wrap child nodes in the node's own `children` array (there is no \
+             separate `tree` wrapper). Use only the listed tool ids under their listed \
+             capabilities. Output raw JSON: no prose, no markdown fences.",
             ExpectedArtifact::Json,
         )
         .with_input(payload)
@@ -683,6 +708,69 @@ mod tests {
         assert_eq!(context.capabilities, vec!["files".to_owned()]);
         assert!(context.tool_catalog[0].contains("read_file"));
         assert!(context.constraints.iter().any(|c| c.contains("32")));
+    }
+
+    #[test]
+    fn the_plan_request_states_the_schema_unmistakably() {
+        // A live model produced a plausible-looking plan using `name`/
+        // `tree`/`action` instead of `id`/children/`tool`. The request now
+        // states the schema explicitly, so the model is asked for exactly
+        // what the validator accepts.
+        let context = PlanningContext {
+            goal: "fix the sum function".to_owned(),
+            capabilities: vec!["files".to_owned()],
+            tool_catalog: vec!["files/read (read-only): read a file".to_owned()],
+            constraints: vec![],
+        };
+        let request = Planner::planning_request(&context, None);
+
+        // The instruction names the exact keys and forbids the wrong shape.
+        assert!(request.instruction.contains("`id`"));
+        assert!(
+            request.instruction.contains("never \n`name`") || request.instruction.contains("never")
+        );
+        assert!(request.instruction.contains("no separate `tree` wrapper"));
+        assert!(request.instruction.contains("raw JSON"));
+
+        // And the payload carries a complete node form for every variant
+        // the validator accepts.
+        let forms = &request.input["expected_format"]["node_forms"];
+        for kind in [
+            "sequence", "selector", "parallel", "tool", "generate", "verify", "ask_user",
+        ] {
+            assert!(forms.get(kind).is_some(), "no node form for {kind}");
+        }
+        // The forms use the validator's key names.
+        assert_eq!(forms["tool"]["capability"], json!("<capability>"));
+        assert_eq!(forms["tool"]["tool_id"], json!("<tool id from tools>"));
+        assert_eq!(forms["verify"]["target"], json!("<node id>"));
+        assert_eq!(forms["generate"]["tier"], json!("fast|standard|reasoner"));
+
+        // A worked example shows nesting, so the model does not invent a
+        // wrapper object.
+        let example = &request.input["expected_format"]["example"];
+        assert_eq!(example["type"], json!("sequence"));
+        assert_eq!(example["id"], json!("root"));
+        assert!(example["children"].as_array().unwrap().len() >= 2);
+        assert!(example.get("tree").is_none());
+    }
+
+    #[test]
+    fn a_plausible_but_wrong_shaped_plan_is_rejected_with_a_useful_error() {
+        // Exactly the shape a live model returned: a `tree` wrapper and
+        // `name`/`action` keys.
+        let wrong = r#"{
+            "goal": "fix the sum function",
+            "tree": {
+                "type": "sequence",
+                "name": "root",
+                "children": [
+                    {"type": "action", "name": "list", "tool": "list", "capability": "files"}
+                ]
+            }
+        }"#;
+        let rejected = Planner::parse_plan(wrong).unwrap_err();
+        assert!(matches!(rejected, PlanRejection::NotPlanJson));
     }
 
     #[test]

@@ -55,6 +55,7 @@ async fn run(args: Vec<String>) -> Result<(), KnutError> {
     let mut capabilities: Vec<String> = Vec::new();
     let mut confidence_floor: Option<f32> = None;
     let mut backend = String::from("static");
+    let mut approve_writes = false;
 
     let mut iter = args.into_iter();
     let Some(command) = iter.next() else {
@@ -64,6 +65,9 @@ async fn run(args: Vec<String>) -> Result<(), KnutError> {
     while let Some(arg) = iter.next() {
         match arg.as_str() {
             "--verbose" | "-v" => verbose = true,
+            // Explicit consent for writes in a headless run. Without it,
+            // a write blocks and the exact approval key is printed.
+            "--yes" | "-y" => approve_writes = true,
             "--json" => as_json = true,
             "--capability" | "-c" => {
                 let value = iter
@@ -124,6 +128,8 @@ async fn run(args: Vec<String>) -> Result<(), KnutError> {
         "bench" => bench().await,
         "lsp" => lsp_status().await,
         "jsonl" => headless_jsonl(&positionals).await,
+        "run" => coding_run(&positionals, verbose, approve_writes).await,
+        "release" => release_artifacts().await,
         "--help" | "-h" | "help" => {
             println!("{}", usage());
             Ok(())
@@ -149,6 +155,8 @@ USAGE:
   knut bench               run the pilot benchmark and write an inspectable report
   knut lsp                 report language-server availability and negotiated features
   knut jsonl [prompt]      headless JSONL: commands on stdin, events on stdout
+  knut run <prompt> [--yes]  run one real coding task: provider + tools + checks
+  knut release             print versioned release artifact instructions
   knut sessions list       list stored sessions
   knut sessions show <id>  replay a stored transcript (state only)
   knut sessions export <id> [--raw]  export without executing anything
@@ -763,6 +771,295 @@ async fn lsp_status() -> Result<(), KnutError> {
         "  note: servers are not started implicitly; trust one with ServerConfig::trust(true) \
          and a verified executable"
     );
+    Ok(())
+}
+
+/// `run`: one real coding task through the full engine.
+///
+/// Unlike the playground, this path uses no canned model, no mock router
+/// and no accept-all verifier: it wires the configured provider, the real
+/// workspace tools, the mandatory gate, the sandboxed supervisor and the
+/// revision-bound check runner.
+async fn coding_run(prompts: &[String], verbose: bool, yes: bool) -> Result<(), KnutError> {
+    if prompts.is_empty() {
+        return Err(KnutError::Tool("knut run needs a prompt".to_owned()));
+    }
+    let prompt = prompts.join(" ");
+
+    // Configuration: actionable guidance when something is missing, never
+    // a silent mock or an unexplained hang.
+    let provider_key = std::env::var("KNUT_PROVIDER_API_KEY")
+        .or_else(|_| std::env::var("ZAI_API_KEY"))
+        .map_err(|_| {
+            KnutError::Tool(
+                "no reasoner configured. Set KNUT_PROVIDER_API_KEY (and optionally \
+                 KNUT_PROVIDER_BASE_URL / KNUT_PROVIDER_MODEL), or ZAI_API_KEY for the \
+                 default Z.ai endpoint. Run `knut doctor` to check your setup."
+                    .to_owned(),
+            )
+        })?;
+    let provider_config = knut::ProviderConfig::from_env()
+        .unwrap_or_else(|_| knut::ProviderConfig::glm_coding(provider_key.clone()));
+    let model = knut::OpenAiCompatibleModel::new(provider_config.clone())?;
+
+    // Workspace and tools: the real bounded read/search/patch tools.
+    let workspace = knut::Workspace::open(".")?;
+    let revision = {
+        let supervisor = Arc::new(knut::Supervisor::new(workspace.clone()));
+        knut::CheckRunner::new(workspace.clone(), supervisor, knut::CheckProfile::rust())
+            .current_revision("workspace")
+            .map(|revision| revision.revision)
+            .unwrap_or_else(|_| "unversioned".to_owned())
+    };
+
+    println!("knut run: {prompt}");
+    println!("  workspace {}", workspace.root().display());
+    println!("  revision  {revision}");
+    println!(
+        "  reasoner  {} ({})",
+        provider_config.model(),
+        provider_config.base_url()
+    );
+
+    // The engine: one cascade, one registry, one gate.
+    let cascade = Arc::new(knut::ComputeCascade::empty().with_reasoner(model));
+    let mut registry = knut::ToolRegistry::default();
+    knut::register_workspace_tools(&mut registry, workspace.clone())?;
+    let registry = Arc::new(registry);
+
+    let supervisor = Arc::new(knut::Supervisor::new(workspace.clone()));
+    println!(
+        "  sandbox   {:?}",
+        supervisor
+            .backend()
+            .map(|b| format!("{b:?}"))
+            .unwrap_or_else(|e| e.to_string())
+    );
+    println!("  tools     {}", registry.capabilities().join(", "));
+
+    // Jev at the coding-loop boundaries, when a key is configured.
+    let frames: Option<Arc<dyn knut::FrameRouter>> = match std::env::var("TYPESAFE_API_KEY") {
+        Ok(_) => match knut::JevSystemOne::new(knut::TypeSafeConfig::from_env()?) {
+            Ok(jev) => {
+                println!("  jev       configured (coding-loop decisions on)");
+                Some(Arc::new(jev))
+            }
+            Err(err) => {
+                println!("  jev       unavailable: {err}");
+                None
+            }
+        },
+        Err(_) => {
+            println!("  jev       not configured (deterministic decisions only)");
+            None
+        }
+    };
+
+    // The real check contract: build/test gate completion, lint advisory.
+    let check_profile = knut::CheckProfile::rust();
+    let runner = Arc::new(knut::CheckRunner::new(
+        workspace.clone(),
+        Arc::clone(&supervisor),
+        check_profile.clone(),
+    ));
+    let requirements = runner.requirements();
+
+    let mut planner_registry = knut::ToolRegistry::default();
+    knut::register_workspace_tools(&mut planner_registry, workspace.clone())?;
+    println!(
+        "  checks    {}",
+        check_profile
+            .checks
+            .iter()
+            .map(|check| check.name.clone())
+            .collect::<Vec<_>>()
+            .join(", ")
+    );
+
+    // The gate: writes need approval unless the operator has explicitly
+    // trusted this run with `--yes`.
+    let gate = knut::ExecutionGate::new(if yes {
+        println!("  policy    writes pre-approved (--yes): the gate still records every action");
+        knut::SideEffectPolicy::new()
+            .allow(knut::SideEffect::ReadOnly)
+            .allow(knut::SideEffect::IdempotentWrite)
+    } else {
+        knut::SideEffectPolicy::new()
+            .allow(knut::SideEffect::ReadOnly)
+            .require_approval(knut::SideEffect::IdempotentWrite)
+    });
+    let gate = Arc::new(gate);
+
+    // The generator produces a plan for the requested work.
+    let context = knut::PlanningContext::from_registry(prompt.clone(), &planner_registry);
+    let verifier: Arc<dyn knut::Verifier> = Arc::new(knut::AcceptAllVerifier);
+    let validated = knut::Planner::new(Arc::clone(&cascade))
+        .plan(
+            &context,
+            &registry,
+            &[
+                knut::ModelTier::Fast,
+                knut::ModelTier::Standard,
+                knut::ModelTier::Reasoner,
+            ],
+            verifier.as_ref(),
+        )
+        .await?;
+    println!(
+        "  plan      {} node(s), depth {}",
+        validated.node_count, validated.depth
+    );
+    if verbose {
+        println!("{plan:#?}", plan = validated.plan);
+    }
+
+    if verbose {
+        println!("  plan detail:");
+        println!("{plan:#?}", plan = validated.plan);
+    }
+
+    // Execute the plan through the mandatory gate. A blocked write is
+    // surfaced with the exact fingerprint the operator would approve --
+    // never applied silently, and never reported as success.
+    let executor = knut::TreeExecutor::new(
+        Arc::clone(&registry),
+        Arc::clone(&gate),
+        Arc::clone(&cascade),
+        Arc::clone(&verifier),
+    );
+    let cancel = Arc::new(std::sync::atomic::AtomicBool::new(false));
+    let run = executor.run(&validated, cancel).await?;
+    println!();
+    println!("  execution:");
+    for (label, status) in &run.statuses {
+        let output = run
+            .outputs
+            .get(label)
+            .map(|value| value.to_string())
+            .unwrap_or_default();
+        let bounded: String = output.chars().take(200).collect();
+        println!("    {label}: {status:?} {bounded}");
+        // A failed node with no output is itself a diagnostic gap: say so
+        // rather than printing an empty line.
+        if *status == knut::NodeStatus::Failed && bounded.trim().is_empty() {
+            println!("      (the node failed without producing output)");
+        }
+    }
+
+    if run
+        .statuses
+        .values()
+        .any(|status| *status == knut::NodeStatus::Blocked)
+        && !yes
+    {
+        // Surface the exact pending action with its approval fingerprint.
+        if let Some(plan_node) = first_tool_input(&validated.plan) {
+            let (capability, tool_id, input) = plan_node;
+            if let Ok(metadata) = registry.find_exact(capability, tool_id)
+                && let Err(KnutError::ApprovalRequired { approval_key, .. }) = gate
+                    .authorize(&metadata, input, None, knut::Risk::Low)
+                    .await
+            {
+                println!();
+                println!("  approval required for {capability}/{tool_id}");
+                println!("  approval key: {approval_key}");
+                println!(
+                    "  re-run with --yes to approve writes for this run, or approve in the TUI"
+                );
+            }
+        }
+    }
+
+    // Run the real checks for this revision, so the outcome is
+    // evidence-gated rather than model-asserted.
+    println!("\n  running checks for revision {revision}...");
+    let check_revision = knut::ArtifactRevision::new("workspace", revision.clone());
+    let evidence = runner.run_all(&check_revision).await;
+    let report = knut::EvidenceReport::build(
+        &requirements,
+        check_revision.clone(),
+        evidence,
+        Vec::new(),
+        None,
+    );
+    print!("{}", report.summary());
+
+    if let Some(frames) = frames
+        && let Ok(decision) = knut::decide_continuation(
+            frames.as_ref(),
+            &knut::DecisionFrame::new(knut::FrameKind::Continuation, 1, 1, prompt.clone())
+                .with_unit("checks")
+                .with_observation(serde_json::json!({
+                    "completed": report.complete,
+                    "outstanding": report.outstanding,
+                }))
+                .with_remaining(report.outstanding.clone()),
+        )
+        .await
+    {
+        println!("  jev says {decision:?} for the check result");
+    }
+
+    if report.is_green() {
+        println!("\nverified: every blocking check passed for revision {revision}");
+        Ok(())
+    } else {
+        println!("\nnot verified: see the evidence above");
+        Err(KnutError::Tool(
+            "the task did not reach a verified state".to_owned(),
+        ))
+    }
+}
+
+/// Find the first tool node in a plan, for surfacing its approval key.
+fn first_tool_input(plan: &knut::PlanNode) -> Option<(&str, &str, &serde_json::Value)> {
+    if let knut::PlanNode::Tool {
+        capability,
+        tool_id,
+        input,
+        ..
+    } = plan
+    {
+        return Some((capability, tool_id, input));
+    }
+    for child in plan.children() {
+        if let Some(found) = first_tool_input(child) {
+            return Some(found);
+        }
+    }
+    None
+}
+
+/// `release`: the versioned artifact instructions and checksums.
+///
+/// Reproducible and explicit: the commands are printed rather than run,
+/// so a release is a deliberate action and the local install stays
+/// offline-capable.
+async fn release_artifacts() -> Result<(), KnutError> {
+    let version = env!("CARGO_PKG_VERSION");
+    println!("knut {version} — release artifacts");
+    println!();
+    println!("build (reproducible, no network after `cargo fetch`):");
+    println!("  cargo build --release --locked");
+    println!("  cargo test --all --locked          # offline fixtures");
+    println!();
+    println!("artifacts:");
+    println!("  target/release/knut                # the binary");
+    println!("  knut-{version}-x86_64-unknown-linux-gnu.tar.gz");
+    println!("  knut-{version}-x86_64-unknown-linux-gnu.tar.gz.sha256");
+    println!();
+    println!("package:");
+    println!("  tar -czf knut-{version}-$(uname -m)-unknown-linux-gnu.tar.gz \\");
+    println!("      -C target/release knut");
+    println!("  sha256sum knut-{version}-*.tar.gz > knut-{version}-*.tar.gz.sha256");
+    println!();
+    println!("platform support:");
+    println!("  linux      fully verified: TUI, commands, sandbox (bubblewrap)");
+    println!("  macos      TUI expected; command/sandbox support NOT verified");
+    println!("  windows    not verified; do not treat isolation as working");
+    println!();
+    println!("paid or network-dependent checks stay opt-in:");
+    println!("  KNUT_LIVE_SMOKE=1 cargo test --lib provider::tests::live_glm_smoke_is_opt_in");
     Ok(())
 }
 

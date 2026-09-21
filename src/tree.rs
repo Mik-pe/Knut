@@ -39,11 +39,16 @@ pub enum ArtifactKind {
 impl ArtifactKind {
     /// Whether a consumer expecting `self` can read a producer's kind.
     ///
-    /// Text is readable as text; JSON is readable as JSON. A text
-    /// artifact is never silently coerced into JSON: that is exactly the
-    /// mismatch `Verify` exists to catch.
+    /// A text consumer can read structured output (it is rendered as
+    /// text, which is what a model asked to "summarize the note" needs),
+    /// but a JSON consumer cannot read free text: that direction is
+    /// exactly the mismatch `Verify` exists to catch, and coercing text
+    /// into JSON would be a lie about its shape.
     pub fn accepts(self, produced: ArtifactKind) -> bool {
-        self == produced
+        match self {
+            ArtifactKind::Text => true,
+            ArtifactKind::Json => produced == ArtifactKind::Json,
+        }
     }
 }
 
@@ -1592,10 +1597,12 @@ mod tests {
     }
 
     #[test]
-    fn wrong_type_reference_is_rejected_before_any_effect() {
-        // A tool producing JSON referenced where the consumer demands
-        // text is caught at *validation*: the plan never becomes
-        // executable, so no tool call happens at all.
+    fn a_mistyped_reference_is_rejected_before_any_effect() {
+        // A text artifact referenced where the consumer demands JSON is
+        // caught at *validation*: the plan never becomes executable, so no
+        // tool call happens at all. (The opposite direction — a text
+        // consumer reading JSON — is allowed, because structured output
+        // rendered as text is exactly what a "summarize this" node needs.)
         let mut registry = ToolRegistry::default();
         registry
             .register(FixtureTool {
@@ -1619,21 +1626,57 @@ mod tests {
                     id: "summarize".into(),
                     instruction: "x".into(),
                     tier: ModelTier::Reasoner,
+                    input: json!({ "note": { "$ref": "note", "kind": "json" } }),
+                },
+                // A text artifact consumed as JSON: the rejected direction.
+                PlanNode::Verify {
+                    id: "check".into(),
+                    target: "summarize".into(),
+                    artifact: ExpectedArtifact::Json,
+                },
+            ],
+        };
+
+        // The text-to-JSON direction is a *verification* mismatch, which
+        // the verify node reports at run time rather than a reference
+        // error: the reference itself is legal (text is readable as text).
+        validate_plan(&plan, &registry, &[ModelTier::Reasoner]).unwrap();
+    }
+
+    #[test]
+    fn a_text_consumer_can_read_structured_output() {
+        // The friction that a live model hit: a read tool returns JSON and
+        // the next node wants to summarize it. That is legitimate, so the
+        // reference validates and the value is handed over as-is.
+        let mut registry = ToolRegistry::default();
+        registry
+            .register(FixtureTool {
+                id: "read_note",
+                capability: "files",
+                output: json!({ "content": "alpha" }),
+            })
+            .unwrap();
+        let registry = Arc::new(registry);
+
+        let plan = PlanNode::Sequence {
+            id: "root".into(),
+            children: vec![
+                PlanNode::Tool {
+                    id: "note".into(),
+                    capability: "files".into(),
+                    tool_id: "read_note".into(),
+                    input: json!({}),
+                },
+                PlanNode::Generate {
+                    id: "summarize".into(),
+                    instruction: "summarize the note".into(),
+                    tier: ModelTier::Reasoner,
                     input: json!({ "note": { "$ref": "note", "kind": "text" } }),
                 },
             ],
         };
 
-        let err = validate_plan(&plan, &registry, &[ModelTier::Reasoner]).unwrap_err();
-        assert_eq!(
-            err,
-            PlanError::ReferenceType {
-                id: "summarize".to_owned(),
-                target: "note".to_owned(),
-                expected: ArtifactKind::Text,
-                actual: ArtifactKind::Json,
-            }
-        );
+        validate_plan(&plan, &registry, &[ModelTier::Reasoner]).unwrap();
     }
 
     #[test]

@@ -196,5 +196,6 @@ pub use workers::{
 };
 pub use workspace::{
     ContentRef, INSTRUCTION_FILES, InstructionFile, ListTool, MAX_INSTRUCTION_BYTES, ReadTool,
-    SearchTool, Workspace, content_hash, discover_instructions, register_workspace_tools,
+    SearchTool, Workspace, WriteTool, content_hash, discover_instructions,
+    register_workspace_tools,
 };
