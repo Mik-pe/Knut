@@ -177,6 +177,20 @@ pub enum SessionEvent {
         revision: TaskRevision,
     },
 
+    /// What a completed model round-trip actually cost.
+    ///
+    /// Reported only when the provider reported it: `tokens` is `None` for
+    /// a call whose usage never arrived, because an unknown cost is not
+    /// zero and a status line that implies otherwise is a lie. Every
+    /// client that shows spend reads this one event.
+    UsageReported {
+        task: TaskId,
+        turn: TurnId,
+        model: String,
+        round_trip_ms: u64,
+        tokens: Option<u64>,
+    },
+
     /// A validated plan is starting.
     PlanStarted {
         task: TaskId,
@@ -344,6 +358,7 @@ impl SessionEvent {
             | SessionEvent::TaskSteered { task, .. }
             | SessionEvent::Routed { task, .. }
             | SessionEvent::Generating { task, .. }
+            | SessionEvent::UsageReported { task, .. }
             | SessionEvent::PlanStarted { task, .. }
             | SessionEvent::EdgeDecided { task, .. }
             | SessionEvent::WaitingForUser { task, .. }
@@ -1770,6 +1785,24 @@ where
         match outcome {
             Ok(outcome) => {
                 self.model_calls.fetch_add(1, Ordering::SeqCst);
+                // Publish what the round-trip cost, when the provider
+                // said so. This is the session's only accounting of spend.
+                let usage = outcome.response.usage;
+                self.emit(SessionEvent::UsageReported {
+                    task: task_id,
+                    turn,
+                    model: outcome.response.identity.model.clone(),
+                    round_trip_ms: outcome
+                        .attempts
+                        .iter()
+                        .map(|a| a.latency.as_millis() as u64)
+                        .sum(),
+                    tokens: usage
+                        .input_tokens
+                        .zip(usage.output_tokens)
+                        .map(|(i, o)| i + o),
+                });
+
                 let content = outcome.response.content;
 
                 // Tool calls the model requested are surfaced as proposals

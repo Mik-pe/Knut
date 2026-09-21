@@ -1433,22 +1433,41 @@ fn render_footer(frame: &mut Frame, state: &WorkbenchState, area: Rect, theme: &
     }
     push(&mut spans, "?", "help");
 
-    // Right edge: the live status, so the shell always says what it is doing.
+    // Right edge: the live status, so the shell always says what it is
+    // doing — and, when the provider reported them, what it has spent. Both
+    // Codex and Crush put resource state in the status line; it belongs
+    // where the eye already goes, not buried in an overlay.
     let left: usize = spans.iter().map(|span| span.content.chars().count()).sum();
     let status = state.status.clone().or_else(|| {
         state
             .task_state
             .map(|_| state_marker_for(state.task_state, theme).1.to_owned())
     });
+    let mut tail: Vec<(String, Style)> = Vec::new();
     if let Some(status) = status {
-        let styled = Span::styled(format!("{status} "), theme.dim());
-        let width = status.chars().count() + 1;
+        tail.push((status, theme.dim()));
+    }
+    if let Some(tokens) = state.usage_tokens() {
+        tail.push((format!("{tokens} tok"), theme.faint()));
+    }
+    if !tail.is_empty() {
+        let width: usize = tail
+            .iter()
+            .map(|(text, _)| text.chars().count() + 3)
+            .sum::<usize>()
+            + 1;
         if left + width + 2 < area.width as usize {
             spans.push(Span::styled(
                 " ".repeat(area.width as usize - left - width),
                 theme.faint(),
             ));
-            spans.push(styled);
+            for (index, (text, style)) in tail.iter().enumerate() {
+                if index > 0 {
+                    spans.push(Span::styled(" | ", theme.faint()));
+                }
+                spans.push(Span::styled(text.clone(), *style));
+            }
+            spans.push(Span::raw(" "));
         }
     }
 

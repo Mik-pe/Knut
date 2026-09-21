@@ -218,6 +218,14 @@ impl WorkbenchState {
         }
     }
 
+    /// Tokens the provider actually reported, across the session.
+    ///
+    /// `None` when nothing has been reported: an unknown cost is not zero,
+    /// and the status line must not imply otherwise.
+    pub fn usage_tokens(&self) -> Option<u64> {
+        self.inspector.usage().tokens
+    }
+
     /// A short label for the configured reasoner.
     pub fn reasoner_label(&self) -> String {
         self.model.clone().unwrap_or_else(|| "offline".to_owned())
@@ -529,6 +537,18 @@ impl WorkbenchState {
                     false,
                 );
             }
+            SessionEvent::UsageReported {
+                model,
+                round_trip_ms,
+                tokens,
+                ..
+            } => {
+                // Real accounting, straight from the runtime: the inspector
+                // gets what the provider actually reported, and an
+                // unreported call is counted as unknown rather than zero.
+                self.inspector
+                    .annotate_last_decision(model.clone(), *round_trip_ms, *tokens, None);
+            }
             SessionEvent::RuntimeError { message, .. } => {
                 self.push(TimelineKind::Error, message.clone(), false);
             }
@@ -765,6 +785,44 @@ mod tests {
         });
         let entry = state.timeline.last().unwrap();
         assert_eq!(entry.text, "edge: done");
+    }
+
+    #[test]
+    fn reported_usage_reaches_the_status_line_and_unknown_stays_unknown() {
+        let mut state = WorkbenchState::new("/tmp/ws");
+        // Nothing reported yet: the shell must not claim a number.
+        assert_eq!(state.usage_tokens(), None);
+
+        state.apply(&SessionEvent::UsageReported {
+            task: TaskId(1),
+            turn: TurnId(1),
+            model: "glm-5.3-flash".to_owned(),
+            round_trip_ms: 240,
+            tokens: Some(1_500),
+        });
+        assert_eq!(state.usage_tokens(), Some(1_500));
+
+        // A second call adds to the total.
+        state.apply(&SessionEvent::UsageReported {
+            task: TaskId(1),
+            turn: TurnId(1),
+            model: "glm-5.3-flash".to_owned(),
+            round_trip_ms: 300,
+            tokens: Some(500),
+        });
+        assert_eq!(state.usage_tokens(), Some(2_000));
+
+        // A call whose usage never arrived is counted as unknown, and the
+        // total does not silently absorb it as zero.
+        state.apply(&SessionEvent::UsageReported {
+            task: TaskId(1),
+            turn: TurnId(1),
+            model: "glm-5.3-flash".to_owned(),
+            round_trip_ms: 100,
+            tokens: None,
+        });
+        assert_eq!(state.usage_tokens(), Some(2_000));
+        assert_eq!(state.inspector.usage().unknown_usage_calls, 1);
     }
 
     #[test]

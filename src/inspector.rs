@@ -649,21 +649,27 @@ impl DecisionInspector {
         tokens: Option<u64>,
         estimated_cost: Option<f64>,
     ) {
+        // A model call happened, whether or not a routing decision is on
+        // record for it: the spend is real either way. Accounting it only
+        // when a record exists silently loses every call the router did
+        // not announce.
+        self.usage.request_count += 1;
+        match tokens {
+            Some(tokens) => {
+                self.usage.tokens = Some(self.usage.tokens.unwrap_or(0) + tokens);
+            }
+            // Unreported usage is counted, never assumed zero.
+            None => self.usage.unknown_usage_calls += 1,
+        }
+        if let Some(cost) = estimated_cost {
+            self.usage.estimated_cost = Some(self.usage.estimated_cost.unwrap_or(0.0) + cost);
+        }
+
         if let Some(record) = self.decisions.last_mut() {
             record.resolved_model = Some(model.into());
             record.round_trip_ms = Some(round_trip_ms);
             record.tokens = tokens;
             record.estimated_cost = estimated_cost;
-            match tokens {
-                Some(tokens) => {
-                    self.usage.tokens = Some(self.usage.tokens.unwrap_or(0) + tokens);
-                }
-                // Unreported usage is counted, never assumed zero.
-                None => self.usage.unknown_usage_calls += 1,
-            }
-            if let Some(cost) = estimated_cost {
-                self.usage.estimated_cost = Some(self.usage.estimated_cost.unwrap_or(0.0) + cost);
-            }
         }
     }
 
