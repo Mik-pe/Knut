@@ -13,6 +13,7 @@ mod evals;
 mod frame;
 mod judgment;
 mod lsp;
+mod mcp;
 mod model;
 mod patch;
 mod persist;
@@ -91,6 +92,13 @@ pub use lsp::{
     LSP_PROTOCOL_VERSION, LanguageServerManager, Location, LspFeature, MAX_NAVIGATION_RESULTS,
     Navigation, Position, PositionEncoding, SUPPORTED_FEATURES, ServerCapabilities, ServerConfig,
     ServerEdit, ServerEditRejected, ServerUnavailable, initialize_request, navigation_candidates,
+};
+pub use mcp::{
+    ACCEPTED_REVISIONS, ConfigSource, DeclaredSideEffect, DiscoveredTool, ImportRejection,
+    ImportedTool, MAX_RESULT_BYTES, MAX_SKILL_CHARS, MAX_TOOLS_PER_SERVER, MCP_PROTOCOL_REVISION,
+    McpServerConfig, McpSessionView, McpTool, ServerState, ServerStatus, SkillMaterial,
+    StartupRefusal, Transport, bounded_candidates, changed_schemas, import_tools,
+    register_mcp_tools,
 };
 pub use model::{
     BufferedSink, CascadeOutcome, ComputeCascade, Continuation, ContinuationPart, ExpectedArtifact,
