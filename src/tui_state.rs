@@ -107,6 +107,8 @@ pub struct WorkbenchState {
     pub attachments: Vec<crate::attach::Attachment>,
     /// Attachment errors to surface to the user.
     pub attachment_errors: Vec<crate::attach::AttachError>,
+    /// The review workspace, when the user has opened one (issue #29).
+    pub review: Option<crate::review::ReviewView>,
     /// Transient status message.
     pub status: Option<String>,
     /// Counters for the inspector.
@@ -151,6 +153,7 @@ impl WorkbenchState {
             palette: None,
             attachments: Vec::new(),
             attachment_errors: Vec::new(),
+            review: None,
             status: None,
             stats: WorkbenchStats::default(),
         }

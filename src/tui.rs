@@ -131,6 +131,39 @@ pub fn handle_key(state: &mut WorkbenchState, key: KeyEvent, tab: &mut Tab) -> S
             state.open_palette();
             ShellAction::Continue
         }
+        // Review navigation when a review is open: the review owns the
+        // keyboard, so a hunk decision cannot be confused with composing.
+        KeyCode::Char('j')
+        | KeyCode::Char('k')
+        | KeyCode::Char('n')
+        | KeyCode::Char('p')
+        | KeyCode::Char('r')
+        | KeyCode::Char('y')
+            if state.review.is_some() && state.focus != Focus::Composer =>
+        {
+            let Some(review) = state.review.as_mut() else {
+                return ShellAction::Continue;
+            };
+            match key.code {
+                KeyCode::Char('j') => review.next_hunk(),
+                KeyCode::Char('k') => review.previous_hunk(),
+                KeyCode::Char('n') => review.next_file(),
+                KeyCode::Char('p') => review.previous_file(),
+                // `r` rejects the current hunk; `y` keeps it again.
+                KeyCode::Char('r') => {
+                    review.reject_current_hunk();
+                }
+                KeyCode::Char('y') => {
+                    review.keep_current_hunk();
+                }
+                _ => {}
+            }
+            ShellAction::Continue
+        }
+        KeyCode::Char('v') if state.focus != Focus::Composer => {
+            state.review = None;
+            ShellAction::Continue
+        }
         KeyCode::Esc => {
             state.focus = Focus::Timeline;
             ShellAction::Continue

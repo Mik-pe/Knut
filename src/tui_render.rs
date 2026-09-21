@@ -6,6 +6,7 @@
 //! `TestBackend` at any size.
 
 use crate::attach::CommandAvailability;
+use crate::review::MAX_HUNK_LINES;
 use ratatui::Frame;
 use ratatui::layout::{Constraint, Direction, Layout, Rect};
 use ratatui::style::{Color, Modifier, Style};
@@ -110,6 +111,16 @@ pub fn render(frame: &mut Frame, state: &WorkbenchState, tab: Tab) {
     }
     render_composer(frame, state, plan.composer);
     render_footer(frame, state, plan.footer, plan.tabbed, tab);
+
+    // The review workspace replaces the workbench while it is open: a
+    // diff needs the room, and review is the point of the view.
+    if let Some(review) = &state.review {
+        render_review(frame, review);
+        if state.help {
+            render_help(frame, frame.area());
+        }
+        return;
+    }
 
     if state.help {
         render_help(frame, frame.area());
@@ -440,6 +451,228 @@ fn render_footer(frame: &mut Frame, state: &WorkbenchState, area: Rect, tabbed: 
         ));
     }
     frame.render_widget(Paragraph::new(Line::from(spans)), area);
+}
+
+/// The review workspace: files, diff and checks side by side (issue #29).
+///
+/// Rendered as a full-screen view so a large diff has room. Narrow
+/// terminals stack the panes instead of truncating the diff.
+pub fn render_review(frame: &mut Frame, view: &crate::review::ReviewView) {
+    let area = frame.area();
+    let wide = area.width >= NARROW_WIDTH;
+
+    let (files_area, diff_area, checks_area) = if wide {
+        let horizontal = Layout::default()
+            .direction(Direction::Horizontal)
+            .constraints([
+                Constraint::Length(26),
+                Constraint::Min(30),
+                Constraint::Length(30),
+            ])
+            .split(area);
+        (horizontal[0], horizontal[1], horizontal[2])
+    } else {
+        // Stacked: the diff keeps the room, the lists are summarised.
+        let vertical = Layout::default()
+            .direction(Direction::Vertical)
+            .constraints([
+                Constraint::Length(6),
+                Constraint::Min(6),
+                Constraint::Length(8),
+            ])
+            .split(area);
+        (vertical[0], vertical[1], vertical[2])
+    };
+
+    render_review_files(frame, view, files_area);
+    render_review_diff(frame, view, diff_area);
+    render_review_checks(frame, view, checks_area);
+}
+
+fn render_review_files(frame: &mut Frame, view: &crate::review::ReviewView, area: Rect) {
+    let mut lines = Vec::new();
+    for (index, file) in view
+        .changes
+        .files
+        .iter()
+        .enumerate()
+        .take(area.height as usize)
+    {
+        let marker = file.kind.marker();
+        let from = file
+            .from
+            .as_ref()
+            .map(|from| format!("{from} -> "))
+            .unwrap_or_default();
+        let label = format!(
+            "{marker} {from}{} +{} -{}",
+            file.path, file.added, file.removed
+        );
+        let bounded: String = label
+            .chars()
+            .take(area.width.saturating_sub(3) as usize)
+            .collect();
+        let style = if index == view.file_index {
+            Style::default().add_modifier(Modifier::REVERSED)
+        } else {
+            Style::default()
+        };
+        lines.push(Line::from(Span::styled(bounded, style)));
+    }
+
+    frame.render_widget(
+        Paragraph::new(lines).block(
+            Block::default()
+                .borders(Borders::ALL)
+                .title(format!(" changes ({}) ", view.changes.files.len())),
+        ),
+        area,
+    );
+}
+
+fn render_review_diff(frame: &mut Frame, view: &crate::review::ReviewView, area: Rect) {
+    let mut lines: Vec<Line> = Vec::new();
+    let Some(file) = view.current_file() else {
+        frame.render_widget(
+            Paragraph::new("no changes")
+                .block(Block::default().borders(Borders::ALL).title(" diff ")),
+            area,
+        );
+        return;
+    };
+
+    lines.push(Line::from(Span::styled(
+        format!("{} ({})", file.path, file.kind.label()),
+        Style::default().add_modifier(Modifier::BOLD),
+    )));
+
+    let budget = area.height.saturating_sub(2) as usize;
+    let mut used = 1usize;
+    for (index, hunk) in file.hunks.iter().enumerate() {
+        if used >= budget {
+            lines.push(Line::from(Span::styled(
+                format!("  ({} more hunk(s) below)", file.hunks.len() - index),
+                Style::default().fg(Color::DarkGray),
+            )));
+            break;
+        }
+        let rejected = view.selection.is_rejected(&hunk.id);
+        let marker = if rejected { "[rejected] " } else { "" };
+        let style = if index == view.hunk_index {
+            Style::default().add_modifier(Modifier::REVERSED)
+        } else if rejected {
+            Style::default().fg(Color::DarkGray)
+        } else {
+            Style::default()
+        };
+        lines.push(Line::from(Span::styled(
+            format!("{marker}{}", hunk.header()),
+            style,
+        )));
+        used += 1;
+        // Bounded per hunk: a huge hunk is folded, not rendered whole.
+        for line in hunk.lines.iter().take(MAX_HUNK_LINES).take(budget - used) {
+            let color = match line.chars().next() {
+                Some('+') => Color::Green,
+                Some('-') => Color::Red,
+                _ => Color::DarkGray,
+            };
+            lines.push(Line::from(Span::styled(
+                line.chars()
+                    .take(area.width.saturating_sub(2) as usize)
+                    .collect::<String>(),
+                style.patch(Style::default().fg(color)),
+            )));
+            used += 1;
+        }
+        if hunk.lines.len() > MAX_HUNK_LINES {
+            lines.push(Line::from(Span::styled(
+                format!("  … {} more line(s)", hunk.lines.len() - MAX_HUNK_LINES),
+                Style::default().fg(Color::DarkGray),
+            )));
+            used += 1;
+        }
+    }
+
+    // The approval gate is visible without burying the composer.
+    if let Some(approval) = view.approvals.pending() {
+        lines.push(Line::from(""));
+        lines.push(Line::from(Span::styled(
+            format!("APPROVAL REQUIRED: {}", approval.reason),
+            Style::default().add_modifier(Modifier::BOLD),
+        )));
+        lines.push(Line::from(format!(
+            "  action    {}",
+            approval.action.chars().take(60).collect::<String>()
+        )));
+        lines.push(Line::from(format!("  workspace {}", approval.workspace)));
+        lines.push(Line::from(format!(
+            "  scope     {} (network: {})",
+            approval.scope.join(", "),
+            if approval.network {
+                "allowed"
+            } else {
+                "denied"
+            }
+        )));
+        lines.push(Line::from(
+            "  [a] approve once   [A] allow this session   [d] reject",
+        ));
+    }
+
+    frame.render_widget(
+        Paragraph::new(lines)
+            .block(
+                Block::default()
+                    .borders(Borders::ALL)
+                    .title(" diff (j/k hunk, n/p file, r reject) "),
+            )
+            .wrap(Wrap { trim: false }),
+        area,
+    );
+}
+
+fn render_review_checks(frame: &mut Frame, view: &crate::review::ReviewView, area: Rect) {
+    let mut lines = Vec::new();
+    if view.checks.is_empty() {
+        lines.push(Line::from(Span::styled(
+            "no checks run yet",
+            Style::default().fg(Color::DarkGray),
+        )));
+    }
+    for check in view.checks.iter().take(area.height as usize) {
+        // The label never says "passed" for a stale or failed check.
+        let label = check.label();
+        let style = if check.is_green() {
+            Style::default().fg(Color::Green)
+        } else {
+            match check.state {
+                crate::verify::CheckOutcome::Failed => Style::default().fg(Color::Red),
+                _ => Style::default().fg(Color::Yellow),
+            }
+        };
+        lines.push(Line::from(Span::styled(
+            format!("{}: {label}", check.name),
+            style,
+        )));
+        for diagnostic in check.diagnostics.iter().take(2) {
+            lines.push(Line::from(Span::styled(
+                format!("  {diagnostic}"),
+                Style::default().fg(Color::DarkGray),
+            )));
+        }
+        if check.output_truncated {
+            lines.push(Line::from(Span::styled(
+                "  (output truncated; full log retained)",
+                Style::default().fg(Color::DarkGray),
+            )));
+        }
+    }
+
+    frame.render_widget(
+        Paragraph::new(lines).block(Block::default().borders(Borders::ALL).title(" checks ")),
+        area,
+    );
 }
 
 /// The command palette: every entry states whether it exists, and

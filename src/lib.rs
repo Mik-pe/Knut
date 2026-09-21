@@ -13,6 +13,7 @@ mod patch;
 mod planner;
 mod policy;
 mod provider;
+mod review;
 mod runtime;
 mod sandbox;
 mod session;
@@ -79,6 +80,11 @@ pub use provider::{
     BillingPath, DEFAULT_CHAT_PATH, OpenAiCompatibleModel, ProviderConfig, ProviderSummary,
     ReasoningEffort,
 };
+pub use review::{
+    ApprovalChoice, ApprovalError, ApprovalState, ApprovalView, ChangeKind, ChangeSet, CheckRow,
+    FileChange, Hunk, HunkSelection, MAX_FILES, MAX_HUNK_LINES, ReviewFocus, ReviewView,
+    RevisedProposal, diff_hunks, revise_proposal,
+};
 pub use runtime::{DecisionSource, Knut, Routed};
 pub use sandbox::{
     BoundedOutput, CAPABILITY as SHELL_CAPABILITY, CommandOutcome, CommandRequest, CommandStatus,
@@ -104,7 +110,7 @@ pub use tree::{
     PlanNode, TreeExecutor, TreeRunResult, collect_refs, resolve_input, validate_plan,
 };
 pub use tui::{ShellAction, TerminalGuard, handle_key, run_shell};
-pub use tui_render::{LayoutPlan, NARROW_WIDTH, Tab, plan_layout, render};
+pub use tui_render::{LayoutPlan, NARROW_WIDTH, Tab, plan_layout, render, render_review};
 pub use tui_state::{
     Focus, MAX_ENTRY_CHARS, MAX_TIMELINE, PendingPrompt, TimelineEntry, TimelineKind,
     WorkbenchState, WorkbenchStats,
