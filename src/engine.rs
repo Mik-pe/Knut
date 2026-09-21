@@ -90,6 +90,31 @@ pub fn build_here() -> (Engine, EngineReport) {
     }
 }
 
+/// Describe the registry's capabilities for discovery.
+///
+/// One entry per capability, described by the tools that back it, so a
+/// routed `Discover` can resolve to something real. The list is bounded by
+/// the registry itself, which is small and explicit by construction.
+fn discovery_candidates(registry: &ToolRegistry) -> Vec<(String, String)> {
+    registry
+        .capabilities()
+        .into_iter()
+        .map(|capability| {
+            let tools: Vec<String> = registry
+                .tools_for_capability(&capability)
+                .into_iter()
+                .map(|tool| format!("{} ({:?})", tool.id, tool.side_effect))
+                .collect();
+            let description = if tools.is_empty() {
+                capability.clone()
+            } else {
+                format!("{capability}: {}", tools.join(", "))
+            };
+            (capability, description)
+        })
+        .collect()
+}
+
 /// A runtime with no tools and no model: enough to accept commands and
 /// report why they cannot be carried out.
 fn minimal_engine(reason: Option<String>) -> Engine {
@@ -243,6 +268,7 @@ pub fn build(workspace: Workspace) -> (Engine, EngineReport) {
     )
     .requirements();
 
+    let discovery = discovery_candidates(&registry);
     let runtime = SessionRuntime::new(
         router,
         Planner::new(Arc::new(planning_cascade)),
@@ -253,7 +279,10 @@ pub fn build(workspace: Workspace) -> (Engine, EngineReport) {
     )
     .with_requirements(requirements)
     .with_discovery(crate::session::DiscoveryCandidates {
-        candidates: Vec::new(),
+        // Real capabilities, described by the tools that actually back
+        // them. An empty set makes discovery ask the user for a capability
+        // the harness already has.
+        candidates: discovery,
     });
     (
         Engine {
