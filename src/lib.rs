@@ -16,6 +16,7 @@ mod system_zero;
 mod tool;
 mod tree;
 mod typesafe;
+mod workspace;
 
 pub use completion::{
     ArtifactRevision, ArtifactVerifier, CompletionRequirements, Evidence, Requirement,
@@ -64,7 +65,10 @@ pub use system_zero::{
     ExplicitCapabilityRule, InvalidInputRule, RoutingCache, RuleVerdict, SystemZero,
     SystemZeroOutcome, SystemZeroRule, UnavailableCapabilityRule,
 };
-pub use tool::{SchemaError, SideEffect, Tool, ToolMetadata, ToolRegistry, validate_arguments};
+pub use tool::{
+    SchemaError, SideEffect, Tool, ToolMetadata, ToolRegistry, validate_arguments,
+    validate_schema_supported,
+};
 pub use tree::{
     ArtifactKind, ArtifactRef, ArtifactStore, AskUserHandler, CancelFlag, NodeStatus, PlanError,
     PlanNode, TreeExecutor, TreeRunResult, collect_refs, resolve_input, validate_plan,
@@ -72,4 +76,8 @@ pub use tree::{
 pub use typesafe::{
     Answer, DEFAULT_BASE_URL, DEFAULT_MODEL, DEFAULT_TIMEOUT, JevSystemOne, Question,
     SystemOneRequest, SystemOneResponse, TypeSafeConfig,
+};
+pub use workspace::{
+    ContentRef, INSTRUCTION_FILES, InstructionFile, ListTool, MAX_INSTRUCTION_BYTES, ReadTool,
+    SearchTool, Workspace, content_hash, discover_instructions, register_workspace_tools,
 };

@@ -80,13 +80,14 @@ impl ToolRegistry {
             });
         }
 
-        // The empty object validates nothing but is a legal, if loose,
-        // declared schema; anything unsupported is refused now.
-        validate_arguments(&metadata.input_schema, &serde_json::json!({})).map_err(|_| {
+        // The declared schema must stay inside the supported subset;
+        // check the schema itself, not a probe input, so a schema that
+        // legitimately declares `required` fields still registers.
+        validate_schema_supported(&metadata.input_schema).map_err(|err| {
             KnutError::InvalidArguments {
                 path: "$".to_owned(),
                 reason: format!(
-                    "tool {:?} declares an input schema outside the supported subset",
+                    "tool {:?} declares an input schema outside the supported subset: {err}",
                     metadata.id
                 ),
             }
@@ -312,6 +313,59 @@ impl From<SchemaError> for KnutError {
             reason: e.reason,
         }
     }
+}
+
+/// Check that a declared schema stays inside the supported subset.
+///
+/// This inspects the *schema*, so a schema that declares `required`
+/// fields, enums or nested objects registers correctly — only the
+/// unsupported constructs are rejected.
+pub fn validate_schema_supported(schema: &Value) -> Result<(), SchemaError> {
+    fn check(schema: &Value, path: &str) -> Result<(), SchemaError> {
+        let err = |reason: &str| SchemaError {
+            path: path.to_owned(),
+            reason: reason.to_owned(),
+        };
+
+        let schema_type = schema
+            .get("type")
+            .and_then(Value::as_str)
+            .ok_or_else(|| err("schema missing supported \"type\""))?;
+
+        match schema_type {
+            "object" => {
+                if let Some(required) = schema.get("required") {
+                    let Some(list) = required.as_array() else {
+                        return Err(err("\"required\" must be an array of field names"));
+                    };
+                    if list.iter().any(|v| !v.is_string()) {
+                        return Err(err("\"required\" entries must be strings"));
+                    }
+                }
+                if let Some(properties) = schema.get("properties").and_then(Value::as_object) {
+                    for (key, field_schema) in properties {
+                        let leaf = field_schema.get("type").and_then(Value::as_str);
+                        match leaf {
+                            Some("string") | Some("number") | Some("boolean") => {}
+                            Some("object") | Some("array") => {
+                                check(field_schema, &format!("{path}.{key}"))?
+                            }
+                            other => {
+                                return Err(err(&format!(
+                                    "unsupported schema type {}",
+                                    other.unwrap_or("<missing>")
+                                )));
+                            }
+                        }
+                    }
+                }
+                Ok(())
+            }
+            other => Err(err(&format!("unsupported schema type {other:?}"))),
+        }
+    }
+
+    check(schema, "$")
 }
 
 pub fn validate_arguments(schema: &Value, input: &Value) -> Result<(), SchemaError> {
