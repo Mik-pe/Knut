@@ -123,7 +123,6 @@ writing. A run gets at most three plan/execute/check attempts; a blocked approva
 ends the scripted run, and successful existing tests cannot hide failed edits.
 
 For a live repository-edit comparison with Ante, see
-[the measured pilot](HARNESS_COMPARISON.md) and
 [the comparison runner](scripts/compare-harnesses.mjs). Prepare an empty temporary
 directory, then run each harness against its isolated snapshot:
 

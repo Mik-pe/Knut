@@ -38,28 +38,7 @@ Acceptance requires:
 
 Start with execution-path integration, then live events/cancellation and repo
 context/checks. UI polish comes after a real interactive task passes these gates.
-Existing visual/backlog work remains in [CLI_UX.md](CLI_UX.md) and [TASKS.md](TASKS.md).
-
-## Comparison baseline already available
-
-Inspected saved `result.json`, `verification.json`, verification logs, and Knut's
-census under `/var/tmp/knut-comparison.sWxwYR`. These are historical results;
-this audit did not rerun the harnesses. The detailed ledger is
-[HARNESS_COMPARISON.md](HARNESS_COMPARISON.md).
-
-| Recorded measurement | Knut | Ante |
-| --- | ---: | ---: |
-| Model / reasoning effort | GLM-5.3 Flash / low | GLM-5.3 Flash / low |
-| Independent verification | Passed, including 4 hidden tests | Passed, including 4 hidden tests |
-| Changed scope | `src/composer.rs` | `src/composer.rs` |
-| Native elapsed time | 493.117 s | 594.048 s |
-| Reported input / output tokens | 18,635 / 3,569 | 174,156 / 2,566 (pilot report) |
-
-Both produced working patches. The report records broader regression coverage
-in Ante's patch. Cache accounting, Jev usage, build-cache conditions, and native
-sampling settings differ or are incomplete; these results establish neither a
-cost advantage nor a general quality/latency advantage. They also do not validate
-the TUI or prove Jev adds value.
+Existing visual work remains in [CLI_UX.md](CLI_UX.md).
 
 ## Next comparison protocol
 
@@ -117,11 +96,9 @@ A real provider exposed a generation route that returned tool-shaped text
 instead of acting. That failure is retained in the comparison ledger; repository
 generation now executes a tool plan and has a regression test.
 The corrected shared-runtime live run succeeded, and independent verification
-passed 607 library tests, 2 CLI tests, and 4 hidden regressions. The matched Ante
-run timed out; its production fix passed the hidden cases but an added Unicode
-test failed independently. The verified Knut-generated composer patch is now
-applied to this working tree. See HARNESS_COMPARISON.md for exact versions,
-accounting, and limitations.
+passed 607 library tests, 2 CLI tests, and 4 hidden regressions.
+The verified Knut-generated composer patch is now
+applied to this working tree.
 
 The end-to-end repository milestone is complete. Queue/steer semantics, richer
 project setup, eliminating path-only model calls, complete usage accounting,
