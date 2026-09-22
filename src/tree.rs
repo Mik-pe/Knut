@@ -82,10 +82,47 @@ impl ArtifactRef {
 /// input: a model can build these, but it cannot make one refer to
 /// something that does not exist or that runs later.
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
 pub struct ArtifactRefSpec {
     #[serde(rename = "$ref")]
     pub node: String,
     pub kind: ArtifactKind,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub pointer: Option<String>,
+}
+
+fn ref_spec(input: &Value) -> Result<Option<ArtifactRefSpec>, PlanError> {
+    let Some(map) = input.as_object().filter(|map| map.contains_key("$ref")) else {
+        return Ok(None);
+    };
+    let node = map
+        .get("$ref")
+        .and_then(Value::as_str)
+        .unwrap_or("")
+        .to_owned();
+    let spec: ArtifactRefSpec =
+        serde_json::from_value(input.clone()).map_err(|_| PlanError::InvalidRef {
+            node: node.clone(),
+            reason: "expected $ref, kind and optional JSON pointer only".to_owned(),
+        })?;
+    if let Some(pointer) = &spec.pointer {
+        if !pointer.is_empty() && !pointer.starts_with('/') {
+            return Err(PlanError::InvalidRef {
+                node,
+                reason: "JSON pointer must be empty or start with /".to_owned(),
+            });
+        }
+        let mut chars = pointer.chars();
+        while let Some(c) = chars.next() {
+            if c == '~' && !matches!(chars.next(), Some('0' | '1')) {
+                return Err(PlanError::InvalidRef {
+                    node,
+                    reason: "invalid JSON pointer escape".to_owned(),
+                });
+            }
+        }
+    }
+    Ok(Some(spec))
 }
 
 /// Bounded store of node outputs, keyed by node id.
@@ -142,22 +179,25 @@ pub fn resolve_input(input: &Value, store: &ArtifactStore) -> Result<Value, Plan
             // A ref is only a ref when it is the whole object: partial
             // merges would make the resolved arguments hard to reason
             // about and easy to mis-serialize.
-            if map.len() == 2 && map.contains_key("$ref") && map.contains_key("kind") {
-                let spec: ArtifactRefSpec =
-                    serde_json::from_value(input.clone()).map_err(|_| PlanError::InvalidRef {
-                        node: map
-                            .get("$ref")
-                            .and_then(Value::as_str)
-                            .unwrap_or("")
-                            .to_owned(),
-                        reason: "malformed artifact reference".to_owned(),
-                    })?;
+            if let Some(spec) = ref_spec(input)? {
                 let value = store
                     .get(&spec.node)
                     .ok_or_else(|| PlanError::UnknownReference {
                         id: "<input>".to_owned(),
                         target: spec.node.clone(),
                     })?;
+                let value = match &spec.pointer {
+                    Some(pointer) => {
+                        value
+                            .pointer(pointer)
+                            .ok_or_else(|| PlanError::InvalidRef {
+                                node: spec.node.clone(),
+                                reason: "JSON pointer does not resolve in the produced artifact"
+                                    .to_owned(),
+                            })?
+                    }
+                    None => value,
+                };
                 let actual = match value {
                     Value::String(_) => ArtifactKind::Text,
                     _ => ArtifactKind::Json,
@@ -190,28 +230,34 @@ pub fn resolve_input(input: &Value, store: &ArtifactStore) -> Result<Value, Plan
 }
 
 /// Collect the artifact references declared inside one input value.
-pub fn collect_refs(input: &Value, refs: &mut Vec<ArtifactRef>) {
+pub fn collect_refs(input: &Value, refs: &mut Vec<ArtifactRef>) -> Result<(), PlanError> {
     match input {
         Value::Object(map) => {
-            if map.len() == 2
-                && map.contains_key("$ref")
-                && map.contains_key("kind")
-                && let Ok(spec) = serde_json::from_value::<ArtifactRefSpec>(input.clone())
-            {
-                refs.push(ArtifactRef::new(spec.node, spec.kind));
-                return;
+            if let Some(spec) = ref_spec(input)? {
+                let kind = if spec
+                    .pointer
+                    .as_ref()
+                    .is_some_and(|pointer| !pointer.is_empty())
+                {
+                    ArtifactKind::Json
+                } else {
+                    spec.kind
+                };
+                refs.push(ArtifactRef::new(spec.node, kind));
+                return Ok(());
             }
             for value in map.values() {
-                collect_refs(value, refs);
+                collect_refs(value, refs)?;
             }
         }
         Value::Array(items) => {
             for item in items {
-                collect_refs(item, refs);
+                collect_refs(item, refs)?;
             }
         }
         _ => {}
     }
+    Ok(())
 }
 
 /// The plan data Knut traverses.
@@ -528,7 +574,7 @@ fn validate_refs(
     produced: &std::collections::HashMap<String, ArtifactKind>,
 ) -> Result<(), PlanError> {
     let mut refs = Vec::new();
-    collect_refs(input, &mut refs);
+    collect_refs(input, &mut refs)?;
 
     for reference in refs {
         if reference.node == id {
@@ -576,6 +622,7 @@ pub type CancelFlag = Arc<AtomicBool>;
 pub struct TreeRunResult {
     pub statuses: BTreeMap<String, NodeStatus>,
     pub outputs: BTreeMap<String, Value>,
+    pub errors: BTreeMap<String, String>,
     pub cancelled: bool,
 }
 
@@ -586,6 +633,7 @@ pub struct TreeExecutor {
     cascade: Arc<ComputeCascade>,
     verifier: Arc<dyn Verifier>,
     ask_handler: Option<Arc<dyn AskUserHandler>>,
+    instructions: String,
 }
 
 impl TreeExecutor {
@@ -603,7 +651,13 @@ impl TreeExecutor {
             cascade,
             verifier,
             ask_handler: None,
+            instructions: String::new(),
         }
+    }
+
+    pub fn with_instructions(mut self, instructions: String) -> Self {
+        self.instructions = instructions;
+        self
     }
 
     pub fn with_ask_handler(mut self, handler: Arc<dyn AskUserHandler>) -> Self {
@@ -623,18 +677,30 @@ impl TreeExecutor {
         validated: &ValidatedPlan,
         cancel: CancelFlag,
     ) -> Result<TreeRunResult, KnutError> {
-        let plan = &validated.plan;
-        let mut result = TreeRunResult {
+        let result = TreeRunResult {
             statuses: BTreeMap::new(),
             outputs: BTreeMap::new(),
+            errors: BTreeMap::new(),
             cancelled: false,
         };
 
+        self.resume(validated, cancel, result).await
+    }
+
+    pub(crate) async fn resume(
+        &self,
+        validated: &ValidatedPlan,
+        cancel: CancelFlag,
+        mut result: TreeRunResult,
+    ) -> Result<TreeRunResult, KnutError> {
+        let plan = &validated.plan;
+        result.errors.clear();
         let status = self
             .exec(
                 plan,
                 &mut result.statuses,
                 &mut result.outputs,
+                &mut result.errors,
                 &cancel,
                 &mut result.cancelled,
             )
@@ -656,10 +722,11 @@ impl TreeExecutor {
         node: &'a PlanNode,
         statuses: &'a mut BTreeMap<String, NodeStatus>,
         outputs: &'a mut BTreeMap<String, Value>,
+        errors: &'a mut BTreeMap<String, String>,
         cancel: &'a CancelFlag,
         cancelled: &'a mut bool,
     ) -> Pin<Box<dyn Future<Output = Result<NodeStatus, KnutError>> + Send + 'a>> {
-        Box::pin(self.exec(node, statuses, outputs, cancel, cancelled))
+        Box::pin(self.exec(node, statuses, outputs, errors, cancel, cancelled))
     }
 
     /// Execute one node, recording status and output.
@@ -671,6 +738,7 @@ impl TreeExecutor {
         node: &PlanNode,
         statuses: &mut BTreeMap<String, NodeStatus>,
         outputs: &mut BTreeMap<String, Value>,
+        errors: &mut BTreeMap<String, String>,
         cancel: &CancelFlag,
         cancelled: &mut bool,
     ) -> Result<NodeStatus, KnutError> {
@@ -679,12 +747,15 @@ impl TreeExecutor {
             return Ok(NodeStatus::Pending);
         }
 
+        if node.children().is_empty() && statuses.get(node.id()) == Some(&NodeStatus::Succeeded) {
+            return Ok(NodeStatus::Succeeded);
+        }
         let status = match node {
             PlanNode::Sequence { children, .. } => {
                 let mut joined = NodeStatus::Succeeded;
                 for child in children {
                     let child_status = self
-                        .exec_boxed(child, statuses, outputs, cancel, cancelled)
+                        .exec_boxed(child, statuses, outputs, errors, cancel, cancelled)
                         .await?;
                     if *cancelled {
                         return Ok(NodeStatus::Pending);
@@ -707,7 +778,7 @@ impl TreeExecutor {
                 let mut joined = NodeStatus::Failed;
                 for child in children {
                     let child_status = self
-                        .exec_boxed(child, statuses, outputs, cancel, cancelled)
+                        .exec_boxed(child, statuses, outputs, errors, cancel, cancelled)
                         .await?;
                     if *cancelled {
                         return Ok(NodeStatus::Pending);
@@ -733,7 +804,7 @@ impl TreeExecutor {
                 let mut any_blocked = false;
                 for child in children {
                     let child_status = self
-                        .exec_boxed(child, statuses, outputs, cancel, cancelled)
+                        .exec_boxed(child, statuses, outputs, errors, cancel, cancelled)
                         .await?;
                     if *cancelled {
                         return Ok(NodeStatus::Pending);
@@ -763,7 +834,11 @@ impl TreeExecutor {
                 // failure, never a silently-empty argument.
                 let resolved = match resolve_input(input, &ArtifactStore::from(outputs)) {
                     Ok(resolved) => resolved,
-                    Err(_) => return Ok(NodeStatus::Failed),
+                    Err(error) => {
+                        errors.insert(id.clone(), error.to_string());
+                        statuses.insert(id.clone(), NodeStatus::Failed);
+                        return Ok(NodeStatus::Failed);
+                    }
                 };
                 // Single execution path: availability, argument schema,
                 // policy, approval, and journal semantics all live in the
@@ -784,7 +859,10 @@ impl TreeExecutor {
                     | Err(KnutError::ExecutionReserved { .. })
                     | Err(KnutError::UnknownEffect { .. }) => NodeStatus::Blocked,
                     // Bad arguments or tool failure: failed.
-                    Err(_) => NodeStatus::Failed,
+                    Err(error) => {
+                        errors.insert(id.clone(), error.to_string());
+                        NodeStatus::Failed
+                    }
                 }
             }
             PlanNode::Generate {
@@ -797,9 +875,17 @@ impl TreeExecutor {
                 // sees: a read result must actually reach generation.
                 let resolved = match resolve_input(input, &ArtifactStore::from(outputs)) {
                     Ok(resolved) => resolved,
-                    Err(_) => return Ok(NodeStatus::Failed),
+                    Err(error) => {
+                        errors.insert(id.clone(), error.to_string());
+                        statuses.insert(id.clone(), NodeStatus::Failed);
+                        return Ok(NodeStatus::Failed);
+                    }
                 };
-                let mut request = ModelRequest::new(instruction.clone(), ExpectedArtifact::Text);
+                let mut request = ModelRequest::new(
+                    format!("{}\n{instruction}", self.instructions),
+                    ExpectedArtifact::Text,
+                )
+                .with_purpose(crate::CallPurpose::PlanExecution);
                 if !resolved.is_null() {
                     request = request.with_input(resolved);
                 }
@@ -812,7 +898,10 @@ impl TreeExecutor {
                         outputs.insert(id.clone(), Value::String(outcome.response.content));
                         NodeStatus::Succeeded
                     }
-                    Err(_) => NodeStatus::Failed,
+                    Err(error) => {
+                        errors.insert(id.clone(), error.to_string());
+                        NodeStatus::Failed
+                    }
                 }
             }
             PlanNode::Verify {
@@ -859,6 +948,50 @@ impl TreeExecutor {
 
 #[cfg(test)]
 mod tests {
+    #[test]
+    fn projections_bind_observed_paths_and_hashes_without_inventing_values() {
+        let mut store = super::ArtifactStore::new();
+        store.insert(
+            "search",
+            serde_json::json!({"matches": [{"path": "src/lib.rs"}]}),
+        );
+        store.insert("read", serde_json::json!({"content_hash": "revision-1"}));
+        let input = serde_json::json!({
+            "path": {"$ref": "search", "kind": "text", "pointer": "/matches/0/path"},
+            "expect_hash": {"$ref": "read", "kind": "text", "pointer": "/content_hash"}
+        });
+        assert_eq!(
+            super::resolve_input(&input, &store).unwrap(),
+            serde_json::json!({"path": "src/lib.rs", "expect_hash": "revision-1"})
+        );
+        let missing =
+            serde_json::json!({"$ref": "search", "kind": "text", "pointer": "/matches/1/path"});
+        assert!(super::resolve_input(&missing, &store).is_err());
+    }
+
+    #[test]
+    fn malformed_references_are_rejected_before_execution() {
+        for reference in [
+            serde_json::json!({"$ref": "x", "kind": "text", "pointer": "path"}),
+            serde_json::json!({"$ref": "x", "kind": "text", "pointer": "/bad~2"}),
+            serde_json::json!({"$ref": "x", "kind": "text", "extra": true}),
+            serde_json::json!({"$ref": "x"}),
+        ] {
+            assert!(super::collect_refs(&reference, &mut Vec::new()).is_err());
+        }
+    }
+
+    #[test]
+    fn projection_escapes_and_selected_types_are_checked() {
+        let mut store = super::ArtifactStore::new();
+        store.insert("x", serde_json::json!({"a/b": {"~name": "value"}}));
+        let reference = serde_json::json!({"$ref": "x", "kind": "text", "pointer": "/a~1b/~0name"});
+        assert_eq!(super::resolve_input(&reference, &store).unwrap(), "value");
+        let wrong_type =
+            serde_json::json!({"$ref": "x", "kind": "json", "pointer": "/a~1b/~0name"});
+        assert!(super::resolve_input(&wrong_type, &store).is_err());
+    }
+
     use std::sync::Mutex;
 
     use async_trait::async_trait;
@@ -1063,6 +1196,29 @@ mod tests {
                 fail: true,
             },
         ])
+    }
+
+    #[tokio::test]
+    async fn failed_projection_records_the_leaf_status_and_reason() {
+        let plan = PlanNode::Sequence {
+            id: "root".into(),
+            children: vec![
+                tool_node("source", "files", "ok"),
+                PlanNode::Tool {
+                    id: "consumer".into(),
+                    capability: "files".into(),
+                    tool_id: "ok".into(),
+                    input: json!({"path": {"$ref":"source", "kind":"json", "pointer":"/status"}}),
+                },
+            ],
+        };
+        let result = executor(good_registry())
+            .run(&validated(plan, &good_registry()), no_cancel())
+            .await
+            .unwrap();
+        assert_eq!(result.statuses.get("consumer"), Some(&NodeStatus::Failed));
+        assert!(result.errors["consumer"].contains("Text"));
+        assert!(!result.outputs.contains_key("consumer"));
     }
 
     #[tokio::test]
@@ -1812,6 +1968,7 @@ mod tests {
         let run = TreeRunResult {
             statuses: BTreeMap::from([("root".to_owned(), NodeStatus::Succeeded)]),
             outputs: BTreeMap::new(),
+            errors: BTreeMap::new(),
             cancelled: false,
         };
         let run_json = serde_json::to_string(&run).unwrap();

@@ -21,7 +21,6 @@ use crate::{EdgeChoice, FrameKind};
 pub enum Focus {
     Composer,
     Timeline,
-    Inspector,
 }
 
 /// One line of the conversation/action timeline.
@@ -119,13 +118,14 @@ pub struct WorkbenchState {
     pub selection: usize,
     /// Whether the timeline is scrolled to the newest entry.
     pub follow: bool,
+    pub transcript_scroll: usize,
+    pub detail_scroll: u16,
     pub pending: Option<PendingPrompt>,
     /// Whether a help overlay is open.
     pub help: bool,
-    /// Whether the optional decision inspector is shown.
-    pub show_inspector: bool,
     /// Command palette state: the query when open.
     pub palette: Option<String>,
+    pub palette_selection: usize,
     /// Attachments resolved for the current composer text.
     pub attachments: Vec<crate::attach::Attachment>,
     /// Attachment errors to surface to the user.
@@ -160,6 +160,16 @@ pub const MAX_TIMELINE: usize = 2000;
 pub const MAX_ENTRY_CHARS: usize = 4000;
 
 impl WorkbenchState {
+    fn last_response_contains(&self, text: &str) -> bool {
+        !text.is_empty()
+            && self.timeline.last().is_some_and(|entry| {
+                entry.kind == TimelineKind::Assistant
+                    && entry
+                        .text
+                        .starts_with(&crate::cards::sanitize_for_display(text))
+            })
+    }
+
     pub fn new(workspace: impl Into<String>) -> Self {
         Self {
             workspace: workspace.into(),
@@ -184,10 +194,12 @@ impl WorkbenchState {
             timeline_offset: 0,
             selection: 0,
             follow: true,
+            transcript_scroll: 0,
+            detail_scroll: 0,
             pending: None,
             help: false,
-            show_inspector: false,
             palette: None,
+            palette_selection: 0,
             attachments: Vec::new(),
             attachment_errors: Vec::new(),
             review: None,
@@ -260,9 +272,13 @@ impl WorkbenchState {
         self.composer.is_empty()
     }
 
-    /// Clear the composer after a submit.
     pub fn clear_composer(&mut self) {
-        self.composer = crate::composer::Composer::new();
+        self.composer.clear();
+    }
+
+    pub fn show_setup(&mut self) {
+        self.push(TimelineKind::Evidence, self.setup_summary(), false);
+        self.resume_follow();
     }
 
     /// Queue a request for after the current task (never a steering edit).
@@ -334,10 +350,11 @@ impl WorkbenchState {
         // adds nothing the runtime did not report.
         self.inspector.apply(event);
         match event {
-            SessionEvent::SessionStarted { protocol_version } => {
-                self.status = Some(format!("session protocol v{protocol_version}"));
+            SessionEvent::SessionStarted { .. } => {
+                self.status = None;
             }
             SessionEvent::TaskStarted { prompt, .. } => {
+                self.status = None;
                 self.push(TimelineKind::User, prompt.clone(), false);
                 self.task_state = Some(TaskState::Running);
                 self.pending = None;
@@ -371,6 +388,7 @@ impl WorkbenchState {
                 self.status = Some("generating…".to_owned());
             }
             SessionEvent::PlanStarted { node_count, .. } => {
+                self.status = Some("executing plan…".to_owned());
                 self.push(
                     TimelineKind::Action,
                     format!("plan with {node_count} node(s)"),
@@ -425,6 +443,13 @@ impl WorkbenchState {
                     crate::cards::sanitize_for_display(&output.to_string()),
                     0,
                 );
+                if node_label == "generate"
+                    && output
+                        .as_str()
+                        .is_some_and(|text| self.last_response_contains(text))
+                {
+                    return;
+                }
                 let marker = match status {
                     NodeStatus::Succeeded => "ok",
                     NodeStatus::Failed => "failed",
@@ -486,6 +511,7 @@ impl WorkbenchState {
                 );
             }
             SessionEvent::WaitingForUser { wait, message, .. } => {
+                self.status = None;
                 self.pending = Some(PendingPrompt {
                     kind: wait.clone(),
                     message: message.clone(),
@@ -495,6 +521,8 @@ impl WorkbenchState {
             }
             SessionEvent::WaitResolved { .. } => {
                 self.pending = None;
+                self.task_state = Some(TaskState::Running);
+                self.status = Some("resuming…".to_owned());
             }
             SessionEvent::Paused { .. } => {
                 self.task_state = Some(TaskState::Paused);
@@ -505,16 +533,27 @@ impl WorkbenchState {
                 self.status = Some("resumed".to_owned());
             }
             SessionEvent::TaskCompleted { summary, .. } => {
+                self.status = None;
+                self.pending = None;
                 self.finish_timing();
                 self.task_state = Some(TaskState::Completed);
-                self.push(TimelineKind::Terminal, summary.clone(), false);
+                let text = if self.last_response_contains(summary) {
+                    "Completed".to_owned()
+                } else {
+                    summary.clone()
+                };
+                self.push(TimelineKind::Terminal, text, false);
             }
             SessionEvent::TaskFailed { reason, .. } => {
+                self.status = None;
+                self.pending = None;
                 self.finish_timing();
                 self.task_state = Some(TaskState::Failed);
                 self.push(TimelineKind::Error, reason.clone(), false);
             }
             SessionEvent::TaskCancelled { .. } => {
+                self.status = None;
+                self.pending = None;
                 self.finish_timing();
                 self.task_state = Some(TaskState::Cancelled);
                 self.push(TimelineKind::Terminal, "cancelled", false);
@@ -552,12 +591,14 @@ impl WorkbenchState {
             SessionEvent::RuntimeError { message, .. } => {
                 self.push(TimelineKind::Error, message.clone(), false);
             }
+            SessionEvent::ModelCallReported { .. } => {}
         }
     }
 
     /// Open the palette.
     pub fn open_palette(&mut self) {
         self.palette = Some(String::new());
+        self.palette_selection = 0;
     }
 
     /// Stop the header ticker and remember how long the task took.
@@ -580,7 +621,10 @@ impl WorkbenchState {
     /// Commands matching the current palette query.
     pub fn palette_results(&self) -> Vec<crate::attach::PaletteCommand> {
         match &self.palette {
-            Some(query) => crate::attach::filter_catalog(query),
+            Some(query) => crate::attach::filter_catalog(query)
+                .into_iter()
+                .filter(|command| command.is_available())
+                .collect(),
             None => Vec::new(),
         }
     }
@@ -604,6 +648,7 @@ impl WorkbenchState {
 
     /// Resume following the newest output (an explicit user action).
     pub fn resume_follow(&mut self) {
+        self.transcript_scroll = 0;
         self.follow = true;
         self.selection = self.timeline.len().saturating_sub(1);
     }
@@ -931,6 +976,27 @@ mod tests {
         assert_eq!(state.timeline.len(), 1);
         assert_eq!(state.timeline[0].text, "Hello, world");
         assert_eq!(state.stats.text_deltas, 3);
+    }
+
+    #[test]
+    fn streamed_response_is_not_repeated_by_result_or_completion() {
+        let mut state = WorkbenchState::new("/tmp/ws");
+        state.apply(&text_delta("Hello there"));
+        state.apply(&SessionEvent::NodeResult {
+            task: TaskId(1),
+            turn: TurnId(1),
+            node: crate::session::NodeId(1),
+            node_label: "generate".to_owned(),
+            status: NodeStatus::Succeeded,
+            output: serde_json::json!("Hello there"),
+        });
+        assert_eq!(state.timeline.len(), 1);
+        state.apply(&SessionEvent::TaskCompleted {
+            task: TaskId(1),
+            summary: "Hello there".to_owned(),
+        });
+        assert_eq!(state.timeline.len(), 2);
+        assert_eq!(state.timeline[1].text, "Completed");
     }
 
     #[test]

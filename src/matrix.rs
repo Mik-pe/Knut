@@ -172,15 +172,10 @@ pub fn glm_matrix() -> ProviderMatrix {
             },
             CapabilityRow {
                 capability: "reasoning controls".to_owned(),
-                // The adapter does not send `reasoning_effort` to this
-                // endpoint, and the capability report says so.
-                level: SupportLevel::Unsupported {
-                    reason: "the coding endpoint does not document `reasoning_effort`; the \
-                             adapter reports reasoning=false rather than sending a control it \
-                             cannot verify"
-                        .to_owned(),
+                level: SupportLevel::FixtureTested {
+                    fixture: "provider::tests::glm_native_reasoning_levels_are_sent_and_unsupported_levels_refused".to_owned(),
                 },
-                provider_detail: None,
+                provider_detail: Some("GLM-5.3 low/high/max; https://docs.z.ai/guides/capabilities/thinking".to_owned()),
             },
             CapabilityRow {
                 capability: "reasoning continuation".to_owned(),
@@ -712,6 +707,7 @@ impl PricingTable {
 ///
 /// Named so a matrix row can point at the exact test that backs it.
 pub const SHARED_CONFORMANCE_FIXTURES: &[&str] = &[
+    "provider::tests::glm_native_reasoning_levels_are_sent_and_unsupported_levels_refused",
     "provider::tests::live_http_fixture_completes_reasoning_tool_call_and_artifact",
     "provider::tests::fragmented_frames_across_tcp_chunks_reassemble",
     "provider::tests::fragmented_tool_arguments_are_only_published_complete",
@@ -873,9 +869,7 @@ mod tests {
             assert!(capabilities.streaming);
             assert!(capabilities.tools);
             assert!(capabilities.continuation);
-            // Reasoning controls are reported honestly for both: neither
-            // endpoint documents them here.
-            assert!(!capabilities.reasoning);
+            assert_eq!(capabilities.reasoning, profile.id == "glm");
         }
     }
 

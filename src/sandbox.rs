@@ -381,11 +381,23 @@ impl Supervisor {
         let timeout = Duration::from_secs(request.timeout_secs.max(1));
         let trust = self.trust_unsandboxed;
 
+        let abandoned = Arc::new(AtomicBool::new(false));
+        let _guard = CancelOnDrop(Arc::clone(&abandoned));
         tokio::task::spawn_blocking(move || {
-            run_blocking(&workspace, &request, backend, timeout, cancel, trust)
+            run_blocking(
+                &workspace, &request, backend, timeout, cancel, abandoned, trust,
+            )
         })
         .await
         .map_err(|err| KnutError::Tool(format!("supervisor task failed: {err}")))?
+    }
+}
+
+struct CancelOnDrop(Arc<AtomicBool>);
+
+impl Drop for CancelOnDrop {
+    fn drop(&mut self) {
+        self.0.store(true, Ordering::SeqCst);
     }
 }
 
@@ -526,7 +538,8 @@ fn sandboxed_command(
     } else {
         command.arg("--unshare-all");
     }
-    command.args(["--new-session", "--proc", "/proc", "--dev", "/dev"]);
+    // pre_exec already creates the session; a second setsid escapes its kill group.
+    command.args(["--proc", "/proc", "--dev", "/dev"]);
 
     // A minimal read-only system: the toolchain lives in these roots.
     for system_path in ["/usr", "/bin", "/lib", "/lib64", "/etc", "/nix", "/opt"] {
@@ -649,6 +662,7 @@ fn run_blocking(
     backend: SandboxBackend,
     timeout: Duration,
     cancel: Arc<AtomicBool>,
+    abandoned: Arc<AtomicBool>,
     trust: bool,
 ) -> Result<CommandOutcome, KnutError> {
     let mut command = match backend {
@@ -745,7 +759,7 @@ fn run_blocking(
     let mut timed_out = false;
     let mut cancelled = false;
     loop {
-        if cancel.load(Ordering::SeqCst) {
+        if cancel.load(Ordering::SeqCst) || abandoned.load(Ordering::SeqCst) {
             cancelled = true;
             terminate_group(pid);
             let _ = child.wait();

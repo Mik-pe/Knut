@@ -131,11 +131,7 @@ fn minimal_engine(reason: Option<String>) -> Engine {
         Arc::new(crate::AcceptAllVerifier),
     );
     let _ = reason;
-    Engine {
-        runtime,
-        cursor: 0,
-        workspace: None,
-    }
+    Engine::new(runtime, None)
 }
 
 /// Build the engine over this workspace, or explain why it cannot be
@@ -145,14 +141,16 @@ fn minimal_engine(reason: Option<String>) -> Engine {
 /// report that says so, so the shell can fail each task with an
 /// actionable message instead of answering from a canned script.
 pub fn build(workspace: Workspace) -> (Engine, EngineReport) {
-    let provider_key = std::env::var("KNUT_PROVIDER_API_KEY")
-        .or_else(|_| std::env::var("ZAI_API_KEY"))
-        .ok();
+    build_with_write_approval(workspace, false)
+}
 
-    let provider_config = provider_key.as_ref().map(|key| {
-        crate::ProviderConfig::from_env()
-            .unwrap_or_else(|_| crate::ProviderConfig::glm_coding(key.clone()))
-    });
+pub fn build_with_write_approval(
+    workspace: Workspace,
+    approve_writes: bool,
+) -> (Engine, EngineReport) {
+    let provider_result = crate::ProviderConfig::from_env();
+    let provider_error = provider_result.as_ref().err().map(ToString::to_string);
+    let provider_config = provider_result.ok();
 
     // Whether the configured provider can actually build an adapter is the
     // question that decides "configured" vs "offline": a base URL and key
@@ -176,11 +174,16 @@ pub fn build(workspace: Workspace) -> (Engine, EngineReport) {
         report.unavailable = Some(format!("workspace tools unavailable: {err}"));
     }
     report.tools = registry.capabilities();
-    report.checks = CheckProfile::rust()
-        .checks
-        .iter()
-        .map(|check| check.name.clone())
-        .collect();
+    let profile = CheckProfile::for_workspace(&workspace);
+    if let Ok(profile) = &profile {
+        report.checks = profile
+            .checks
+            .iter()
+            .map(|check| check.name.clone())
+            .collect();
+    } else if let Err(error) = &profile {
+        report.unavailable = Some(error.to_string());
+    }
 
     match (&provider_config, model_ready) {
         (Some(config), true) => {
@@ -188,11 +191,10 @@ pub fn build(workspace: Workspace) -> (Engine, EngineReport) {
             report.base_url = Some(config.base_url().to_owned());
         }
         _ => {
-            report.unavailable = Some(
-                "no reasoner configured: set KNUT_PROVIDER_API_KEY or ZAI_API_KEY \
-                 (optionally KNUT_PROVIDER_BASE_URL / KNUT_PROVIDER_MODEL), then restart"
-                    .to_owned(),
-            );
+            report.unavailable = Some(format!(
+                "reasoner unavailable: {}. Set KNUT_PROVIDER_API_KEY or ZAI_API_KEY and valid provider settings, then restart",
+                provider_error.unwrap_or_else(|| "adapter could not be built".to_owned())
+            ));
         }
     }
 
@@ -228,11 +230,12 @@ pub fn build(workspace: Workspace) -> (Engine, EngineReport) {
 
     // The gate: the shell is interactive, so a write asks rather than
     // assuming consent. Pre-approving writes belongs to scripted runs.
-    let gate = Arc::new(ExecutionGate::new(
-        SideEffectPolicy::new()
-            .allow(crate::SideEffect::ReadOnly)
-            .require_approval(crate::SideEffect::IdempotentWrite),
-    ));
+    let policy = SideEffectPolicy::new().allow(crate::SideEffect::ReadOnly);
+    let gate = Arc::new(ExecutionGate::new(if approve_writes {
+        policy.allow(crate::SideEffect::IdempotentWrite)
+    } else {
+        policy.require_approval(crate::SideEffect::IdempotentWrite)
+    }));
 
     // Routing: a live System One when a key is configured, otherwise the
     // deterministic router. A prompt that asks about the workspace must be
@@ -257,16 +260,14 @@ pub fn build(workspace: Workspace) -> (Engine, EngineReport) {
         },
         Err(_) => None,
     };
+    let jev = jev.map(Arc::new);
+    let frames = jev.clone();
     let router = Arc::new(Knut::new(LiveRouter::new(jev)).with_system_zero(SystemZero::empty()));
 
-    // The real check contract: build/test gate completion, lint advisory.
     let supervisor = Arc::new(Supervisor::new(workspace.clone()));
-    let requirements = CheckRunner::new(
-        workspace.clone(),
-        Arc::clone(&supervisor),
-        CheckProfile::rust(),
-    )
-    .requirements();
+    let checks = profile
+        .ok()
+        .map(|profile| Arc::new(CheckRunner::new(workspace.clone(), supervisor, profile)));
 
     let discovery = discovery_candidates(&registry);
     let runtime = SessionRuntime::new(
@@ -277,21 +278,25 @@ pub fn build(workspace: Workspace) -> (Engine, EngineReport) {
         Arc::new(cascade),
         Arc::new(crate::AcceptAllVerifier),
     )
-    .with_requirements(requirements)
     .with_discovery(crate::session::DiscoveryCandidates {
         // Real capabilities, described by the tools that actually back
         // them. An empty set makes discovery ask the user for a capability
         // the harness already has.
         candidates: discovery,
     });
-    (
-        Engine {
-            runtime,
-            cursor: 0,
-            workspace: Some(workspace),
-        },
-        report,
-    )
+    let runtime = match checks {
+        Some(checks) => runtime.with_checks(checks),
+        None => runtime.with_requirements(crate::CompletionRequirements::none().require(
+            "repository-checks",
+            "configure checks for this repository",
+            true,
+        )),
+    };
+    let runtime = match frames {
+        Some(frames) => runtime.with_frames(frames),
+        None => runtime,
+    };
+    (Engine::new(runtime, Some(workspace)), report)
 }
 
 /// The router the shell runs on.
@@ -302,19 +307,19 @@ pub fn build(workspace: Workspace) -> (Engine, EngineReport) {
 /// generation. Without a key the deterministic router below is used, and
 /// its limits are reported rather than papered over.
 pub struct LiveRouter {
-    live: Option<JevSystemOne>,
+    live: Option<Arc<JevSystemOne>>,
     fallback: StaticSystemOne,
 }
 
 impl LiveRouter {
-    fn new(live: Option<JevSystemOne>) -> Self {
+    fn new(live: Option<Arc<JevSystemOne>>) -> Self {
         Self {
             live,
             fallback: StaticSystemOne::new(Decision {
-                route: Route::Generate,
+                route: Route::Act,
                 confidence: 0.9,
                 retrieval: None,
-                capability: None,
+                capability: Some("files".to_owned()),
                 model_tier: ModelTier::Reasoner,
                 risk: Risk::Low,
                 parallelizable: false,
@@ -348,12 +353,23 @@ pub struct Engine {
     runtime: SessionRuntime<LiveRouter>,
     /// How many events of the runtime log have already been forwarded.
     cursor: usize,
+    live_events: UnboundedReceiver<SessionEvent>,
     /// The workspace, retained so on-demand checks run against the real
     /// tree rather than a copy.
     workspace: Option<Workspace>,
 }
 
 impl Engine {
+    fn new(runtime: SessionRuntime<LiveRouter>, workspace: Option<Workspace>) -> Self {
+        let (sender, live_events) = tokio::sync::mpsc::unbounded_channel();
+        Self {
+            runtime: runtime.with_event_sink(sender),
+            workspace,
+            cursor: 0,
+            live_events,
+        }
+    }
+
     /// Run the workspace's real checks for the current revision and return
     /// them as review rows, ready for the review pane.
     ///
@@ -366,7 +382,7 @@ impl Engine {
             ));
         };
         let supervisor = Arc::new(Supervisor::new(workspace.clone()));
-        let profile = CheckProfile::rust();
+        let profile = CheckProfile::for_workspace(&workspace)?;
         let runner = CheckRunner::new(workspace, supervisor, profile);
         let revision = runner.current_revision("workspace")?;
         let evidence = runner.run_all(&revision).await;
@@ -385,23 +401,13 @@ impl Engine {
     /// ordered transcript; the cursor makes this idempotent, so polling
     /// twice without new work forwards nothing.
     pub fn pump(&mut self, tx: &UnboundedSender<SessionEvent>) -> bool {
-        let events = self.runtime.events();
-        let total = events.len();
-        if total <= self.cursor {
-            // The log evicts from the front; a cursor past the end would
-            // otherwise stall forever. Resynchronise instead.
-            self.cursor = total;
-            return !tx.is_closed();
-        }
-        let mut alive = true;
-        for event in events.events().skip(self.cursor) {
-            if tx.send(event.clone()).is_err() {
-                alive = false;
-                break;
+        while let Ok(event) = self.live_events.try_recv() {
+            if tx.send(event).is_err() {
+                return false;
             }
+            self.cursor += 1;
         }
-        self.cursor = total;
-        alive
+        !tx.is_closed()
     }
 
     /// How many events have been forwarded so far (test seam).
@@ -449,6 +455,7 @@ impl Engine {
             on_tick(self);
             return;
         }
+        on_tick(self);
         for _ in 0..crate::MAX_TURNS_PER_TASK.max(1) {
             let Some(state) = self.runtime.drive().await else {
                 break;
@@ -477,22 +484,74 @@ pub async fn run_engine(
     let _ = events.send(SessionEvent::SessionStarted {
         protocol_version: crate::SESSION_PROTOCOL_VERSION,
     });
+    let (_, replacement) = tokio::sync::mpsc::unbounded_channel();
+    let mut live = std::mem::replace(&mut engine.live_events, replacement);
+    let mut pending = std::collections::VecDeque::new();
+    let mut drive = false;
     loop {
-        let Some(command) = commands.recv().await else {
-            break;
-        };
-        // Publish after every tick: the shell must see a routing decision,
-        // a streaming fragment or a finished node as it happens, not after
-        // the whole task is over.
-        let mut alive = true;
-        engine
-            .handle_with(command, |engine| {
-                if alive {
-                    alive = engine.pump(&events);
+        if let Some(command) = pending.pop_front() {
+            let description = describe(&command);
+            if let Err(error) = engine.runtime.command(command).await {
+                engine
+                    .runtime
+                    .emit_runtime_error(format!("{description} refused: {error}"));
+            }
+            drive = engine.runtime.is_runnable();
+        }
+        let mut disconnected = false;
+        let mut cancelled = false;
+        if drive {
+            let tick = engine.runtime.drive();
+            tokio::pin!(tick);
+            loop {
+                tokio::select! {
+                    biased;
+                    event = live.recv() => {
+                        if let Some(event) = event && events.send(event).is_err() {
+                            disconnected = true;
+                            break;
+                        }
+                    }
+                    state = &mut tick => {
+                        drive = matches!(state, Some(TaskState::Running | TaskState::Queued));
+                        break;
+                    }
+                    command = commands.recv() => {
+                        match command {
+                            Some(SessionCommand::Cancel) => { cancelled = true; break; }
+                            Some(command) => pending.push_back(command),
+                            None => { disconnected = true; break; }
+                        }
+                    }
+
                 }
-            })
-            .await;
-        if !alive {
+            }
+        } else if pending.is_empty() {
+            tokio::select! {
+                event = live.recv() => {
+                    if let Some(event) = event && events.send(event).is_err() { disconnected = true; }
+                }
+                command = commands.recv() => {
+                    match command {
+                        Some(command) => pending.push_back(command),
+                        None => disconnected = true,
+                    }
+                }
+            }
+        }
+        if cancelled || disconnected {
+            if engine
+                .task_state()
+                .is_some_and(|state| !state.is_terminal())
+            {
+                let _ = engine.runtime.command(SessionCommand::Cancel).await;
+            }
+            drive = false;
+            while let Ok(event) = live.try_recv() {
+                let _ = events.send(event);
+            }
+        }
+        if disconnected {
             break;
         }
     }
@@ -552,6 +611,11 @@ mod tests {
         ));
         std::fs::create_dir_all(root.join("src")).unwrap();
         std::fs::write(root.join("src/lib.rs"), "pub fn x() {}\n").unwrap();
+        std::fs::write(
+            root.join("Cargo.toml"),
+            "[package]\nname = \"fixture\"\nversion = \"0.1.0\"\n",
+        )
+        .unwrap();
         let workspace = Workspace::open(&root).unwrap();
         (workspace, root)
     }
@@ -697,6 +761,14 @@ mod tests {
                 engine.pump(&tx);
                 publications += 1;
                 if publications == 1 {
+                    assert_eq!(engine.model_calls(), 0);
+                    assert!(
+                        !engine
+                            .runtime
+                            .events()
+                            .events()
+                            .any(|event| matches!(event, SessionEvent::Routed { .. }))
+                    );
                     let mut count = 0;
                     // The receiver is drained inside the closure only
                     // to observe ordering; the real shell drains it on
@@ -851,5 +923,115 @@ mod tests {
                 if protocol_version == crate::SESSION_PROTOCOL_VERSION
         ));
         let _ = std::fs::remove_dir_all(root);
+    }
+    #[test]
+    fn event_delivery_survives_retained_history_rollover() {
+        let mut engine = minimal_engine(None);
+        let (tx, mut rx) = tokio::sync::mpsc::unbounded_channel();
+        for index in 0..crate::session::EVENT_LOG_CAPACITY + 20 {
+            engine.runtime.emit_runtime_error(format!("event {index}"));
+            assert!(engine.pump(&tx));
+            assert!(
+                matches!(rx.try_recv().unwrap(), SessionEvent::RuntimeError { message, .. } if message == format!("event {index}"))
+            );
+        }
+        assert!(engine.runtime.events().dropped() > 0);
+    }
+
+    struct StalledStream;
+
+    #[async_trait::async_trait]
+    impl crate::Model for StalledStream {
+        fn identity(&self) -> crate::ModelIdentity {
+            crate::ModelIdentity {
+                provider: "test".to_owned(),
+                model: "stalled".to_owned(),
+                tier: ModelTier::Reasoner,
+            }
+        }
+        fn capabilities(&self) -> crate::ModelCapabilities {
+            crate::ModelCapabilities {
+                streaming: true,
+                ..crate::ModelCapabilities::buffered_text()
+            }
+        }
+        async fn complete(
+            &self,
+            _: &crate::ModelRequest,
+        ) -> Result<crate::ModelResponse, KnutError> {
+            std::future::pending().await
+        }
+        async fn stream(
+            &self,
+            _: &crate::ModelRequest,
+            sink: &mut (dyn crate::ModelStreamSink + Send),
+        ) -> Result<crate::ModelResponse, KnutError> {
+            sink.on_event(crate::ModelStreamEvent::TextDelta {
+                text: "first fragment".to_owned(),
+            });
+            std::future::pending().await
+        }
+    }
+
+    #[tokio::test]
+    async fn live_stream_reaches_client_and_cancel_interrupts_stalled_provider() {
+        let cascade = Arc::new(ComputeCascade::empty().with_reasoner(StalledStream));
+        let router = LiveRouter {
+            live: None,
+            fallback: StaticSystemOne::new(Decision {
+                route: Route::Generate,
+                confidence: 1.0,
+                retrieval: None,
+                capability: None,
+                model_tier: ModelTier::Reasoner,
+                risk: Risk::Low,
+                parallelizable: false,
+            }),
+        };
+        let runtime = SessionRuntime::new(
+            Arc::new(Knut::new(router)),
+            Planner::new(cascade.clone()),
+            Arc::new(ToolRegistry::default()),
+            Arc::new(ExecutionGate::new(SideEffectPolicy::new())),
+            cascade,
+            Arc::new(crate::AcceptAllVerifier),
+        );
+        let engine = Engine::new(runtime, None);
+        let (commands, command_rx) = tokio::sync::mpsc::unbounded_channel();
+        let (events, mut event_rx) = tokio::sync::mpsc::unbounded_channel();
+        let driver = tokio::spawn(run_engine(engine, command_rx, events));
+        commands
+            .send(SessionCommand::Submit {
+                prompt: "hello".to_owned(),
+            })
+            .unwrap();
+        tokio::time::timeout(std::time::Duration::from_secs(5), async {
+            loop {
+                if matches!(event_rx.recv().await.unwrap(), SessionEvent::TextDelta { text, .. } if text == "first fragment") { break; }
+            }
+        }).await.expect("fragment was buffered behind stalled provider");
+        commands.send(SessionCommand::Cancel).unwrap();
+        tokio::time::timeout(std::time::Duration::from_secs(5), async {
+            loop {
+                if matches!(
+                    event_rx.recv().await.unwrap(),
+                    SessionEvent::TaskCancelled { .. }
+                ) {
+                    break;
+                }
+            }
+        })
+        .await
+        .expect("cancel waited for stalled provider");
+        drop(commands);
+        driver.await.unwrap();
+        while let Ok(event) = event_rx.try_recv() {
+            assert!(!matches!(
+                event,
+                SessionEvent::TaskCompleted { .. }
+                    | SessionEvent::TaskFailed { .. }
+                    | SessionEvent::TaskCancelled { .. }
+            ));
+        }
     }
 }

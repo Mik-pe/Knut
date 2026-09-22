@@ -18,7 +18,7 @@ pub const MAX_DEPTH: usize = 6;
 pub struct PlanningContext {
     pub goal: String,
     pub capabilities: Vec<String>,
-    /// Compact tool catalog: id + capability + description + side effect.
+    /// Tool identities, descriptions, effects and exact argument schemas.
     pub tool_catalog: Vec<String>,
     pub constraints: Vec<String>,
 }
@@ -32,8 +32,12 @@ impl PlanningContext {
         for capability in &capabilities {
             for metadata in registry.tools_for_capability(capability) {
                 tool_catalog.push(format!(
-                    "{} [{}] {} ({:?})",
-                    metadata.id, metadata.capability, metadata.description, metadata.side_effect
+                    "{} [{}] {} ({:?}); input_schema={}",
+                    metadata.id,
+                    metadata.capability,
+                    metadata.description,
+                    metadata.side_effect,
+                    metadata.input_schema
                 ));
             }
         }
@@ -181,9 +185,17 @@ impl Planner {
                     "child nodes go in the parent's `children` array, inline",
                     "`tier` and `artifact` are lowercase strings, not objects",
                     "tool nodes need capability + tool_id; verify nodes reference an existing node id",
+                    "tool input MUST follow its input_schema: use exactly the documented property names, include all required fields",
                     "a node may consume an earlier node's output by putting \
                      {\"$ref\": \"<node-id>\", \"kind\": \"json\"|\"text\"} anywhere in its input, \
                      and the referenced node must run before it",
+                    "a reference may include a JSON pointer to select one field: \
+                     {\"$ref\": \"search\", \"kind\": \"text\", \"pointer\": \"/matches/0/path\"} \
+                     selects a path; use /content_hash from a read output for expect_hash. \
+                     Missing fields fail safely; never pass a whole search or read object as a path",
+                    "kind describes the SELECTED value, not the source node: paths and hashes use kind=text, never kind=json",
+                    "when a generate node produces replacement file contents, instruct it to output only raw file contents, with no markdown fences or explanation",
+                    "for small changes prefer files/edit: a generate node returns ONLY a JSON array of exact {old,new} replacements as text, consumed by the edit tool's changes string. Bind path and expect_hash from the read output with kind=text. Combine code and tests in one edit when they share a file; never apply two writes with the same old hash",
                     "to change a file, use the files/write tool with the file's full new \
                      contents; pass expect_hash from the files/read result so a stale edit fails \
                      instead of overwriting what you did not read"
@@ -215,6 +227,11 @@ impl Planner {
             ExpectedArtifact::Json,
         )
         .with_input(payload)
+        .with_purpose(if repair_errors.is_some() {
+            crate::CallPurpose::PlanRepair
+        } else {
+            crate::CallPurpose::Planning
+        })
     }
 
     fn parse_plan(content: &str) -> Result<PlanNode, PlanRejection> {
@@ -707,6 +724,7 @@ mod tests {
 
         assert_eq!(context.capabilities, vec!["files".to_owned()]);
         assert!(context.tool_catalog[0].contains("read_file"));
+        assert!(context.tool_catalog[0].contains("input_schema={\"type\":\"object\"}"));
         assert!(context.constraints.iter().any(|c| c.contains("32")));
     }
 

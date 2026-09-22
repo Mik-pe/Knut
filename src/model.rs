@@ -52,9 +52,8 @@ impl Usage {
     pub fn merge(self, other: Self) -> Self {
         fn add(a: Option<u64>, b: Option<u64>) -> Option<u64> {
             match (a, b) {
-                (Some(a), Some(b)) => Some(a + b),
-                (Some(v), None) | (None, Some(v)) => Some(v),
-                (None, None) => None,
+                (Some(a), Some(b)) => a.checked_add(b),
+                _ => None,
             }
         }
         Self {
@@ -67,6 +66,7 @@ impl Usage {
 /// A bounded generative task.
 #[derive(Debug, Clone, PartialEq)]
 pub struct ModelRequest {
+    pub purpose: crate::CallPurpose,
     pub instruction: String,
     pub expected_artifact: ExpectedArtifact,
     /// Structured input/context for the task.
@@ -76,6 +76,7 @@ pub struct ModelRequest {
 impl ModelRequest {
     pub fn new(instruction: impl Into<String>, expected_artifact: ExpectedArtifact) -> Self {
         Self {
+            purpose: crate::CallPurpose::Response,
             instruction: instruction.into(),
             expected_artifact,
             input: Value::Null,
@@ -84,6 +85,11 @@ impl ModelRequest {
 
     pub fn with_input(mut self, input: Value) -> Self {
         self.input = input;
+        self
+    }
+
+    pub fn with_purpose(mut self, purpose: crate::CallPurpose) -> Self {
+        self.purpose = purpose;
         self
     }
 }
@@ -538,6 +544,12 @@ impl ComputeCascade {
             };
 
             let capabilities = model.capabilities();
+            let measurement = crate::census::CallMeasurement::start(
+                &request,
+                model.identity(),
+                tier,
+                capabilities.streaming,
+            );
             let started = Instant::now();
             let response = if capabilities.streaming {
                 model.stream(&request, sink).await
@@ -554,6 +566,8 @@ impl ComputeCascade {
                 })
             };
             let latency = started.elapsed();
+
+            measurement.finish(&response);
 
             let response = match response {
                 Ok(response) => response,
@@ -670,7 +684,11 @@ impl ComputeCascade {
             };
 
             let started = Instant::now();
-            let response = match model.complete(&request).await {
+            let measurement =
+                crate::census::CallMeasurement::start(&request, model.identity(), tier, false);
+            let result = model.complete(&request).await;
+            measurement.finish(&result);
+            let response = match result {
                 Ok(response) => response,
                 Err(err) => {
                     // A transport failure is an *attempt*, not a silent
@@ -1202,10 +1220,12 @@ mod tests {
         assert!(!usage.is_known());
         assert_ne!(usage.input_tokens, Some(0));
 
-        // Unknown merges with known without inventing a total for the
-        // unreported side.
         let merged = usage.merge(Usage::known(5, 5));
-        assert_eq!(merged, Usage::known(5, 5));
+        assert_eq!(merged, Usage::default());
+        assert_eq!(
+            Usage::known(2, 3).merge(Usage::known(4, 5)),
+            Usage::known(6, 8)
+        );
     }
 
     #[test]

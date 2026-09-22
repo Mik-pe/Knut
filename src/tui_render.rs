@@ -5,37 +5,21 @@
 //! the frame it is handed — so every layout can be snapshot-tested with
 //! `TestBackend` at any size.
 //!
-//! The visual language lives in [`crate::theme`] (colour and weight) and
-//! [`crate::knot`] (the mark). This module only composes: a header that
-//! reads like a status instrument, a transcript with per-kind rails, a
-//! live job strip, an inspector that explains the machine, and a composer
-//! that looks like the control surface it is.
-//!
-//! Two invariants survive every layout:
-//!
-//! - **Nothing is colour-only.** Every state carries a glyph and a word.
-//! - **Every pane truncates rather than overflows.** A narrow terminal
-//!   loses detail, never structure.
 
 use ratatui::Frame;
-use ratatui::layout::{Constraint, Direction, Layout, Rect};
-use ratatui::style::{Modifier, Style, Stylize};
+use ratatui::layout::{Constraint, Layout, Rect};
+use ratatui::style::{Modifier, Style};
 use ratatui::text::{Line, Span};
 use ratatui::widgets::{Block, BorderType, Borders, Clear, Paragraph, Wrap};
+use unicode_segmentation::UnicodeSegmentation;
+use unicode_width::UnicodeWidthStr;
 
 use crate::attach::CommandAvailability;
-use crate::knot;
 use crate::review::MAX_HUNK_LINES;
 use crate::session::TaskState;
 use crate::theme::Theme;
 use crate::tui_state::{Focus, TimelineKind, WorkbenchState};
 
-/// Width below which panes collapse into a single tabbed column.
-pub const NARROW_WIDTH: u16 = 80;
-/// Height below which the inspector is dropped entirely.
-pub const SHORT_HEIGHT: u16 = 20;
-
-/// Which pane is shown when the terminal is too narrow to split.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum Tab {
     Timeline,
@@ -46,114 +30,40 @@ pub enum Tab {
 impl Tab {
     pub fn label(self) -> &'static str {
         match self {
-            Tab::Timeline => "transcript",
-            Tab::Inspector => "state",
+            Tab::Timeline => "conversation",
+            Tab::Inspector => "decisions",
             Tab::Tasks => "jobs",
         }
     }
 }
 
-/// The layout chosen for one frame: useful panes only, and never a
-/// permanent empty dashboard.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct LayoutPlan {
     pub header: Rect,
-    /// The tab strip under the header (narrow layouts only).
-    pub tabs: Option<Rect>,
     pub timeline: Rect,
-    pub jobs: Option<Rect>,
-    pub inspector: Option<Rect>,
     pub composer: Rect,
     pub footer: Rect,
-    /// Whether the terminal is too narrow to split panes.
-    pub tabbed: bool,
 }
 
-/// Compute the layout for an area.
-pub fn plan_layout(area: Rect, show_inspector: bool) -> LayoutPlan {
-    let tabbed = area.width < NARROW_WIDTH;
-    let vertical = Layout::default()
-        .direction(Direction::Vertical)
-        .constraints([
-            Constraint::Length(2),                            // header
-            Constraint::Length(if tabbed { 1 } else { 0 }),   // tab strip
-            Constraint::Min(3),                               // body
-            Constraint::Length(composer_height(area.height)), // composer
-            Constraint::Length(1),                            // footer
-        ])
-        .split(area);
-
-    let header = vertical[0];
-    let tabs = if tabbed { Some(vertical[1]) } else { None };
-    let body = vertical[2];
-    let composer = vertical[3];
-    let footer = vertical[4];
-
-    if tabbed {
-        return LayoutPlan {
-            header,
-            tabs,
-            timeline: body,
-            jobs: None,
-            inspector: None,
-            composer,
-            footer,
-            tabbed,
-        };
-    }
-
-    // Wide: the transcript always; the inspector and the job strip only
-    // when there is something to say and room to say it.
-    let inspector_visible = show_inspector && area.height >= SHORT_HEIGHT;
-    let jobs_visible = area.height >= SHORT_HEIGHT && body.width >= 90;
-
-    let (timeline, jobs, inspector) = match (inspector_visible, jobs_visible) {
-        (true, true) => {
-            let horizontal = Layout::default()
-                .direction(Direction::Horizontal)
-                .constraints([
-                    Constraint::Min(40),
-                    Constraint::Length(30),
-                    Constraint::Length(42),
-                ])
-                .split(body);
-            (horizontal[0], Some(horizontal[1]), Some(horizontal[2]))
-        }
-        (true, false) => {
-            let horizontal = Layout::default()
-                .direction(Direction::Horizontal)
-                .constraints([Constraint::Min(40), Constraint::Length(40)])
-                .split(body);
-            (horizontal[0], None, Some(horizontal[1]))
-        }
-        (false, true) => {
-            let horizontal = Layout::default()
-                .direction(Direction::Horizontal)
-                .constraints([Constraint::Min(50), Constraint::Length(32)])
-                .split(body);
-            (horizontal[0], Some(horizontal[1]), None)
-        }
-        (false, false) => (body, None, None),
+pub fn plan_layout(area: Rect, composer_rows: usize) -> LayoutPlan {
+    let margin = if area.width >= 60 { 2 } else { 0 };
+    let content = Rect {
+        x: area.x + margin,
+        width: area.width.saturating_sub(margin * 2),
+        ..area
     };
-
+    let vertical = Layout::vertical([
+        Constraint::Length(2),
+        Constraint::Min(1),
+        Constraint::Length((composer_rows as u16).clamp(1, 6) + 2),
+        Constraint::Length(2),
+    ])
+    .split(content);
     LayoutPlan {
-        header,
-        tabs,
-        timeline,
-        jobs,
-        inspector,
-        composer,
-        footer,
-        tabbed,
-    }
-}
-
-/// The composer grows with the terminal but stays modest.
-fn composer_height(height: u16) -> u16 {
-    match height {
-        0..=16 => 3,
-        17..=30 => 5,
-        _ => 7,
+        header: vertical[0],
+        timeline: vertical[1],
+        composer: vertical[2],
+        footer: vertical[3],
     }
 }
 
@@ -165,25 +75,41 @@ pub fn render(frame: &mut Frame, state: &WorkbenchState, tab: Tab) {
 /// Render with an explicit theme (tests pin one; the shell detects it).
 pub fn render_themed(frame: &mut Frame, state: &WorkbenchState, tab: Tab, theme: &Theme) {
     let area = frame.area();
+    if area.width == 0 || area.height == 0 {
+        return;
+    }
     paint_backdrop(frame, area, theme);
 
-    let plan = plan_layout(area, true);
+    let margin = if area.width >= 60 { 4 } else { 0 };
+    let width = area.width.saturating_sub(margin + 6).max(1) as usize;
+    let rows = state
+        .composer
+        .lines()
+        .iter()
+        .map(|line| hard_wrap(line, width).len())
+        .sum();
+    let plan = plan_layout(area, rows);
 
     render_header(frame, state, plan.header, theme);
-    if let Some(tabs) = plan.tabs {
-        render_tab_strip(frame, tabs, tab, theme);
+    let mut body = plan.timeline;
+    if let Some(pending) = &state.pending {
+        let rows = Layout::vertical([
+            Constraint::Min(1),
+            Constraint::Length(6.min(body.height / 2)),
+        ])
+        .split(body);
+        body = rows[0];
+        frame.render_widget(
+            Paragraph::new(pending.message.as_str())
+                .block(panel(" needs your input ", theme.warn(), theme))
+                .wrap(Wrap { trim: false }),
+            rows[1],
+        );
     }
-
-    match (plan.tabbed, tab) {
-        (false, _) | (_, Tab::Timeline) => render_timeline(frame, state, plan.timeline, theme),
-        (true, Tab::Inspector) => render_inspector(frame, state, plan.timeline, theme),
-        (true, Tab::Tasks) => render_jobs(frame, state, plan.timeline, theme),
-    }
-    if let Some(jobs) = plan.jobs {
-        render_jobs(frame, state, jobs, theme);
-    }
-    if let Some(inspector) = plan.inspector {
-        render_inspector(frame, state, inspector, theme);
+    match tab {
+        Tab::Timeline => render_timeline(frame, state, body, theme),
+        Tab::Inspector => render_inspector(frame, state, body, theme),
+        Tab::Tasks => render_jobs(frame, state, body, theme),
     }
     render_composer(frame, state, plan.composer, theme);
     render_footer(frame, state, plan.footer, theme);
@@ -193,23 +119,17 @@ pub fn render_themed(frame: &mut Frame, state: &WorkbenchState, tab: Tab, theme:
     if let Some(review) = &state.review {
         render_review_themed(frame, review, theme);
         if state.help {
-            render_help(frame, area, theme);
+            render_help(frame, state, area, theme);
         }
         return;
     }
 
     if state.help {
-        render_help(frame, area, theme);
+        render_help(frame, state, area, theme);
     }
 
     if state.palette_open() {
         render_palette(frame, state, area, theme);
-    }
-
-    // The decision inspector is opt-in: the transcript explains the work,
-    // and this pane explains the decisions behind it.
-    if state.show_inspector {
-        render_inspector_overlay(frame, state, area, theme);
     }
 
     // The cursor belongs to the composer, and only when the composer is
@@ -220,6 +140,8 @@ pub fn render_themed(frame: &mut Frame, state: &WorkbenchState, tab: Tab, theme:
         && state.review.is_none()
         && !state.help
         && !state.palette_open()
+        && plan.composer.width > 6
+        && plan.composer.height >= 3
     {
         let area = plan.composer;
         let inner_width = area.width.saturating_sub(6) as usize;
@@ -228,22 +150,17 @@ pub fn render_themed(frame: &mut Frame, state: &WorkbenchState, tab: Tab, theme:
             state.composer.lines(),
             cursor_row,
             cursor_col,
-            inner_width.max(8),
+            inner_width.max(1),
         );
         // Inside the border, after the " ❯ " sigil column.
-        let y = (area.y + 1 + row as u16).min(area.bottom().saturating_sub(2));
+        let scroll = row.saturating_sub(area.height.saturating_sub(3) as usize);
+        let y =
+            (area.y + 1 + row.saturating_sub(scroll) as u16).min(area.bottom().saturating_sub(2));
         let x = (area.x + 4 + col as u16).min(area.right().saturating_sub(2));
         frame.set_cursor_position((x, y));
     }
 }
 
-/// Map the composer's logical cursor onto the wrapped display grid.
-///
-/// Returns `(row, column)` in cells relative to the composer's first inner
-/// row and column. The composer hard-wraps at `inner_width`, so the
-/// mapping is exact: every earlier line contributes as many display rows
-/// as it has full-width chunks, and the cursor's own line contributes the
-/// chunks before its column.
 pub fn composer_cursor_position(
     lines: &[String],
     cursor_row: usize,
@@ -251,37 +168,49 @@ pub fn composer_cursor_position(
     inner_width: usize,
 ) -> (usize, usize) {
     let width = inner_width.max(1);
-    let mut display_row = 0usize;
+    let mut row = 0;
     for (index, line) in lines.iter().enumerate() {
-        // A grapheme is the unit the composer moves by, and one grapheme
-        // occupies one cell for the text this line holds (identifiers,
-        // paths, prose).
-        let cells = line.chars().count();
-        if index == cursor_row {
-            return (display_row + cursor_col / width, cursor_col % width);
+        let mut col = 0;
+        for (offset, grapheme) in line.graphemes(true).enumerate() {
+            let cells = grapheme.width();
+            if col + cells > width || col == width {
+                row += 1;
+                col = 0;
+            }
+            if index == cursor_row && offset == cursor_col {
+                return (row, col);
+            }
+            col += cells;
         }
-        // A line that ends exactly on the boundary occupies a whole extra
-        // display row rather than zero: the caret can sit past its end.
-        display_row += cells / width + 1;
+        if index == cursor_row {
+            return if col >= width {
+                (row + 1, 0)
+            } else {
+                (row, col)
+            };
+        }
+        row += 1 + usize::from(col >= width);
     }
-    (display_row, cursor_col.min(width.saturating_sub(1)))
+    (row, 0)
 }
 
-/// Hard-wrap one line into chunks of exactly `width` cells.
-///
-/// The composer uses this rather than word wrapping so the caret maps to a
-/// cell exactly; it also stops text from reflowing under the cursor while
-/// the user types.
 fn hard_wrap(line: &str, width: usize) -> Vec<String> {
     let width = width.max(1);
-    let chars: Vec<char> = line.chars().collect();
-    if chars.is_empty() {
-        return vec![String::new()];
+    let mut rows = vec![String::new()];
+    let mut cells = 0;
+    for grapheme in line.graphemes(true) {
+        let size = grapheme.width();
+        if cells + size > width || cells == width {
+            rows.push(String::new());
+            cells = 0;
+        }
+        rows.last_mut().unwrap().push_str(grapheme);
+        cells += size;
     }
-    chars
-        .chunks(width)
-        .map(|chunk| chunk.iter().collect())
-        .collect()
+    if cells >= width {
+        rows.push(String::new());
+    }
+    rows
 }
 
 /// Paint the app background, so the shell reads as one surface rather
@@ -328,120 +257,51 @@ fn state_style(state: Option<TaskState>, theme: &Theme) -> Style {
 /// second is instrument (state, model, endpoint, counters). On a narrow
 /// terminal the second row drops fields rather than truncating mid-word.
 fn render_header(frame: &mut Frame, state: &WorkbenchState, area: Rect, theme: &Theme) {
-    if area.height == 0 || area.width == 0 {
-        return;
-    }
     let (marker, label) = state_marker_for(state.task_state, theme);
-    let style = state_style(state.task_state, theme);
-
-    // Row one: brand + workspace.
-    let mut identity: Vec<Span> = Vec::new();
-    identity.push(Span::styled(
-        format!(" {} ", theme.glyphs.knot()),
-        theme.accent().add_modifier(Modifier::BOLD),
-    ));
-    for span in theme.brand_gradient("knut") {
-        identity.push(span.add_modifier(Modifier::BOLD));
-    }
-    identity.push(Span::styled("  ", theme.faint()));
-    let workspace = compact_path(&state.workspace, area.width as usize);
-    identity.push(Span::styled(
-        workspace,
-        theme.text().add_modifier(Modifier::BOLD),
-    ));
+    let workspace = compact_path(&state.workspace, area.width.saturating_sub(26) as usize);
+    let mut identity = vec![
+        Span::styled(" knut ", theme.accent().add_modifier(Modifier::BOLD)),
+        Span::styled(workspace, theme.text()),
+    ];
     if let Some(branch) = &state.branch {
-        identity.push(Span::styled(
-            format!("  {} {branch}", theme.glyphs.separator()),
+        identity.push(Span::styled(format!("  / {branch}"), theme.dim()));
+    }
+    let mut status = vec![
+        Span::styled(
+            format!(" {marker} {label}"),
+            state_style(state.task_state, theme),
+        ),
+        Span::styled(
+            format!("  · {}  {}", state.reasoner_label(), ticker_label(state)),
             theme.dim(),
+        ),
+    ];
+    if !theme.glyphs.unicode {
+        status[1].content = status[1].content.replace('·', "|").into();
+    }
+    if !state.queued.is_empty() {
+        status.push(Span::styled(
+            format!("  / {} queued", state.queued.len()),
+            theme.warn(),
         ));
     }
-
-    // Right-align the ticker when there is room: identity left, state right.
-    let mut row_one = Line::from(identity);
-    if area.width >= 60 {
-        let counters = ticker_label(state);
-        let used: usize = row_one
-            .spans
+    if state.task_state == Some(TaskState::Running)
+        && let Some(card) = state
+            .cards
+            .cards()
             .iter()
-            .map(|span| span.content.chars().count())
-            .sum();
-        let padding = (area.width as usize).saturating_sub(used + counters.chars().count() + 2);
-        row_one
-            .spans
-            .push(Span::styled(" ".repeat(padding.max(1)), theme.faint()));
-        row_one.push_span(Span::styled(counters, theme.faint()));
-    }
-
-    // Row two: state, mode, model, endpoint, checks.
-    let mut row_two: Vec<Span> = Vec::new();
-    row_two.push(Span::styled(
-        format!(" {marker} {label} "),
-        style.add_modifier(Modifier::BOLD),
-    ));
-    row_two.push(Span::styled(theme.glyphs.separator(), theme.faint()));
-    row_two.push(Span::styled(format!(" {}", state.mode), theme.dim()));
-    if area.width >= 70 {
-        row_two.push(Span::styled(
-            format!("  {} {}", theme.glyphs.separator(), state.reasoner_label()),
-            theme.dim(),
+            .rev()
+            .find(|card| card.state == crate::cards::CardState::Running)
+    {
+        status.push(Span::styled(
+            format!("  {} {}", theme.spinner(state.tick), card.title),
+            theme.accent(),
         ));
     }
-    if area.width >= 110 {
-        if let Some(endpoint) = &state.endpoint {
-            row_two.push(Span::styled(
-                format!("  {} {endpoint}", theme.glyphs.separator()),
-                theme.faint(),
-            ));
-        }
-        if state.checks > 0 {
-            row_two.push(Span::styled(
-                format!("  {} {} checks", theme.glyphs.separator(), state.checks),
-                theme.faint(),
-            ));
-        }
-        if state.model_calls > 0 {
-            row_two.push(Span::styled(
-                format!("  {} {} calls", theme.glyphs.separator(), state.model_calls),
-                theme.faint(),
-            ));
-        }
-        // Whether routing is live matters: with a real router a prompt can
-        // reach the workspace tools, and without one it cannot.
-        row_two.push(Span::styled(
-            format!(
-                "  {} routing {}",
-                theme.glyphs.separator(),
-                if state.live_routing {
-                    "live"
-                } else {
-                    "deterministic"
-                }
-            ),
-            theme.faint(),
-        ));
-    }
-
-    frame.render_widget(Paragraph::new(row_one), Rect { height: 1, ..area });
-    if area.height >= 2 {
-        frame.render_widget(
-            Paragraph::new(Line::from(row_two)),
-            Rect {
-                y: area.y + 1,
-                height: 1,
-                ..area
-            },
-        );
-    }
-
-    // A hairline under the header separates chrome from content.
-    if area.height >= 2 {
-        let hairline = Rect {
-            y: area.y + 1,
-            height: 1,
-            ..area
-        };
-        let _ = hairline;
-    }
+    frame.render_widget(
+        Paragraph::new(vec![Line::from(identity), Line::from(status)]),
+        area,
+    );
 }
 
 /// A short ticker for the header's right edge.
@@ -478,30 +338,6 @@ fn compact_path(path: &str, width: usize) -> String {
 }
 
 /// The tab strip for narrow terminals.
-fn render_tab_strip(frame: &mut Frame, area: Rect, tab: Tab, theme: &Theme) {
-    let mut spans: Vec<Span> = Vec::new();
-    spans.push(Span::raw(" "));
-    for (index, candidate) in [Tab::Timeline, Tab::Inspector, Tab::Tasks]
-        .iter()
-        .enumerate()
-    {
-        let selected = *candidate == tab;
-        let style = if selected {
-            theme
-                .accent()
-                .add_modifier(Modifier::BOLD | Modifier::REVERSED)
-        } else {
-            theme.dim()
-        };
-        spans.push(Span::styled(
-            format!(" {} {} ", index + 1, candidate.label()),
-            style,
-        ));
-        spans.push(Span::styled(" ", theme.faint()));
-    }
-    frame.render_widget(Paragraph::new(Line::from(spans)), area);
-}
-
 /// Style for a timeline entry kind.
 fn entry_style(kind: TimelineKind, theme: &Theme) -> Style {
     match kind {
@@ -535,376 +371,110 @@ fn entry_glyph(kind: TimelineKind, theme: &Theme) -> &'static str {
 }
 
 fn render_timeline(frame: &mut Frame, state: &WorkbenchState, area: Rect, theme: &Theme) {
-    if area.height == 0 || area.width == 0 {
-        return;
-    }
-    let inner_height = area.height.saturating_sub(2) as usize;
-    let inner_width = area.width.saturating_sub(2) as usize;
     let entries = state.visible_timeline();
-
     if entries.is_empty() {
         render_welcome(frame, state, area, theme);
         return;
     }
-
-    // Show a window of the newest entries; older ones are virtualized out
-    // of the render path entirely. When the user has scrolled back, the
-    // window follows the selection instead of the tail — a transcript that
-    // scrolls but never moves is worse than no scrolling at all.
-    let start = if state.follow {
-        entries.len().saturating_sub(inner_height)
+    let height = area.height.saturating_sub(1) as usize;
+    let width = area.width.saturating_sub(5).max(1) as usize;
+    let end = if state.follow {
+        entries.len()
     } else {
-        state
-            .selection
-            .min(entries.len().saturating_sub(1))
-            .saturating_sub(inner_height / 2)
-            .min(
-                entries
-                    .len()
-                    .saturating_sub(inner_height.min(entries.len())),
-            )
+        (state.selection + 1).min(entries.len())
     };
-    let mut lines: Vec<Line> = Vec::with_capacity(inner_height + 4);
-    let mut emitted = 0usize;
-
-    for (offset, entry) in entries[start..].iter().enumerate() {
-        if emitted >= inner_height {
+    let mut reversed = Vec::new();
+    let skip = if state.follow {
+        0
+    } else {
+        state.transcript_scroll
+    };
+    for entry in entries[..end].iter().rev() {
+        if matches!(entry.kind, TimelineKind::Routing | TimelineKind::Decision) {
+            continue;
+        }
+        let mut block = Vec::new();
+        for (index, text) in entry.text.lines().enumerate() {
+            for (part, chunk) in hard_wrap(text, width).into_iter().enumerate() {
+                let lead = if index == 0 && part == 0 {
+                    format!(" {} ", entry_glyph(entry.kind, theme))
+                } else {
+                    "   ".to_owned()
+                };
+                block.push(Line::from(vec![
+                    Span::styled(lead, entry_style(entry.kind, theme)),
+                    Span::styled(chunk, entry_style(entry.kind, theme)),
+                ]));
+            }
+        }
+        if matches!(entry.kind, TimelineKind::User | TimelineKind::Assistant) {
+            block.push(Line::from(""));
+        }
+        reversed.extend(block.into_iter().rev());
+        if reversed.len() >= height + skip {
             break;
         }
-        let index = start + offset;
-        let selected = !state.follow && index == state.selection;
-        let style = entry_style(entry.kind, theme);
-        let glyph = entry_glyph(entry.kind, theme);
-        let text_lines: Vec<&str> = entry.text.lines().collect();
-        let text_lines = if text_lines.is_empty() {
-            vec![""]
-        } else {
-            text_lines
-        };
-
-        // A streaming entry is still arriving: mark its last line with a
-        // cursor block so a stalled stream and a live one look different.
-        let is_tail = index + 1 == entries.len();
-
-        for (line_index, text_line) in text_lines.iter().enumerate() {
-            if emitted >= inner_height {
-                break;
-            }
-            let wrapped = wrap_text(text_line, inner_width.saturating_sub(10));
-            for (wrap_index, chunk) in wrapped.iter().enumerate() {
-                if emitted >= inner_height {
-                    break;
-                }
-                // The selected entry gets a rail in the left margin, so
-                // scrolling has a visible cursor even in monochrome.
-                let gutter = if selected { theme.glyphs.rail() } else { " " };
-                let last_chunk =
-                    line_index + 1 == text_lines.len() && wrap_index + 1 == wrapped.len();
-                let cursor = if entry.streaming
-                    && is_tail
-                    && last_chunk
-                    && state.task_state.is_some_and(|task| !task.is_terminal())
-                {
-                    Span::styled(
-                        theme.glyphs.bar().to_owned(),
-                        theme.accent().add_modifier(Modifier::SLOW_BLINK),
-                    )
-                } else {
-                    Span::raw("")
-                };
-                let line = if line_index == 0 && wrap_index == 0 {
-                    Line::from(vec![
-                        Span::styled(gutter.to_owned(), theme.accent()),
-                        Span::styled(format!(" {glyph} "), style),
-                        Span::styled(chunk.clone(), style),
-                        cursor,
-                    ])
-                } else {
-                    Line::from(vec![
-                        Span::styled(gutter.to_owned(), theme.accent()),
-                        Span::styled("   ", theme.faint()),
-                        Span::styled(chunk.clone(), style),
-                        cursor,
-                    ])
-                };
-                lines.push(line);
-                emitted += 1;
-            }
-        }
     }
-
-    let title = if state.timeline_offset > 0 {
+    let skip = skip.min(reversed.len().saturating_sub(height));
+    let lines: Vec<_> = reversed.into_iter().skip(skip).take(height).rev().collect();
+    let title = if state.follow {
         format!(
-            " {} | {} earlier ",
-            Tab::Timeline.label(),
-            state.timeline_offset
+            " conversation{} ",
+            if state.timeline_offset > 0 {
+                " / earlier entries archived"
+            } else {
+                ""
+            }
         )
     } else {
-        format!(" {} ", Tab::Timeline.label())
+        " conversation / scrollback - Esc for latest ".to_owned()
     };
-    let title = if state.focus == Focus::Timeline {
-        format!("{}{} ", title, theme.glyphs.diamond())
-    } else {
-        title
-    };
-    let border = if state.focus == Focus::Timeline {
-        theme.border_focused()
-    } else {
-        theme.border()
-    };
-
     frame.render_widget(
-        Paragraph::new(lines)
-            .block(panel(&title, border, theme))
-            .style(theme.bg(theme.palette.bg_panel)),
+        Paragraph::new(lines).block(Block::default().title(Span::styled(title, theme.faint()))),
         area,
     );
 }
 
-/// The empty-state: the mark, what this is, and how to start.
 fn render_welcome(frame: &mut Frame, state: &WorkbenchState, area: Rect, theme: &Theme) {
-    let inner_width = area.width.saturating_sub(2) as usize;
-    let inner_height = area.height.saturating_sub(2) as usize;
-    let mut lines: Vec<Line<'static>> = Vec::new();
-
-    // The mark, then the block wordmark. A splash screen names the product
-    // at a size body text cannot: that is the whole point of a wordmark.
-    lines.extend(knot::logo_lines(theme, inner_width));
-    for line in knot::wordmark_block(theme.glyphs.unicode).lines {
-        if theme.level.is_color() {
-            lines.push(centered_spans(
-                gradient_over(theme, line, theme.palette.cyan, theme.palette.magenta),
-                inner_width,
-            ));
-        } else {
-            lines.push(centered(line.to_string(), inner_width, theme.text()));
-        }
-    }
-    if inner_width >= 60 {
-        for line in wrap_text(knot::SUBTITLE, inner_width.saturating_sub(6)) {
-            lines.push(centered(line, inner_width, theme.faint()));
-        }
-    }
-
-    // Readiness, stated as an instruction the user can act on.
-    let ready = state.model.is_some();
-    let (status, status_style) = if ready {
-        (
-            "ready - describe the change you want and press Enter".to_owned(),
-            theme.success(),
-        )
+    let width = area.width.saturating_sub(6).max(1) as usize;
+    let mut lines = vec![
+        Line::from(""),
+        Line::from(Span::styled(
+            "  What are we building?",
+            theme.text().add_modifier(Modifier::BOLD),
+        )),
+        Line::from(""),
+    ];
+    let message = if let Some(reason) = &state.unavailable {
+        reason.clone()
+    } else if state.model.is_none() {
+        "Offline. Set KNUT_PROVIDER_API_KEY, then run knut doctor to check your setup.".to_owned()
     } else {
-        (
-            "offline - no reasoner credential is configured".to_owned(),
-            theme.warn(),
-        )
+        "Describe a change, investigate a bug, or ask about this codebase.".to_owned()
     };
-    lines.push(Line::from(""));
-    lines.push(centered(status, inner_width, status_style));
-
-    // What this session can actually do, in columns — the harness's own
-    // inventory, not a promise. Three columns when there is room, stacked
-    // otherwise, because a capability list is the first thing a new user
-    // needs and the first thing a wide screen wastes.
-    lines.push(Line::from(""));
-    if inner_width >= 56 {
-        lines.extend(capability_columns(state, inner_width, theme));
-    } else {
-        lines.extend(capability_stack(state, inner_width, theme));
+    for line in wrap_text(&message, width) {
+        lines.push(Line::from(Span::styled(format!("  {line}"), theme.dim())));
     }
-
-    if inner_width >= 40 {
-        lines.push(Line::from(""));
-        for hint in [
-            "Enter  submit      Ctrl+J  newline     Tab  focus",
-            "F1     help        :       commands    q    quit",
-        ] {
-            lines.push(centered(hint.to_owned(), inner_width, theme.faint()));
-        }
+    if area.height >= 13 {
+        lines.extend([
+            Line::from(""),
+            Line::from(Span::styled("  Try a concrete task", theme.faint())),
+            Line::from(Span::styled(
+                "  Find what causes the failing test",
+                theme.text(),
+            )),
+            Line::from(Span::styled(
+                "  Explain how requests reach the model",
+                theme.text(),
+            )),
+            Line::from(""),
+            Line::from(Span::styled(
+                "  / commands   Ctrl+R changes   ? shortcuts",
+                theme.dim(),
+            )),
+        ]);
     }
-
-    if state.model.is_none() && inner_width >= 60 {
-        lines.push(Line::from(""));
-        for line in wrap_text(
-            "set KNUT_PROVIDER_API_KEY (and optionally KNUT_PROVIDER_BASE_URL / \
-             KNUT_PROVIDER_MODEL), then run `knut doctor`",
-            inner_width.saturating_sub(8),
-        ) {
-            lines.push(centered(line, inner_width, theme.faint()));
-        }
-    }
-
-    // Sit the block a little above centre: text pinned to the exact middle
-    // drifts as the terminal resizes.
-    let pad = inner_height.saturating_sub(lines.len()) * 2 / 5;
-    let mut padded: Vec<Line<'static>> = Vec::with_capacity(lines.len() + pad);
-    for _ in 0..pad {
-        padded.push(Line::from(""));
-    }
-    padded.extend(lines);
-
-    frame.render_widget(
-        Paragraph::new(padded)
-            .block(panel(
-                &format!(" {} ", Tab::Timeline.label()),
-                theme.border(),
-                theme,
-            ))
-            .style(theme.bg(theme.palette.bg_panel)),
-        area,
-    );
-}
-
-/// The session's real capabilities, side by side.
-fn capability_columns(state: &WorkbenchState, width: usize, theme: &Theme) -> Vec<Line<'static>> {
-    let columns: [(&str, Vec<String>); 3] = [
-        (
-            "model",
-            vec![
-                state.reasoner_label(),
-                state
-                    .endpoint
-                    .clone()
-                    .unwrap_or_else(|| "no endpoint".to_owned()),
-                if state.live_routing {
-                    "live routing".to_owned()
-                } else {
-                    "deterministic routing".to_owned()
-                },
-            ],
-        ),
-        (
-            "gate",
-            vec![
-                "tools: read, search, write".to_owned(),
-                "writes need approval".to_owned(),
-                "sandboxed processes".to_owned(),
-            ],
-        ),
-        (
-            "checks",
-            vec![
-                format!("{} configured", state.checks),
-                "revision-bound evidence".to_owned(),
-                "no checks, no done".to_owned(),
-            ],
-        ),
-    ];
-
-    let total: usize = columns.iter().map(|(_, rows)| column_width(rows)).sum();
-    let gaps = 4 * (columns.len().saturating_sub(1));
-    // Fall back to the stacked form when the columns will not fit: three
-    // cramped columns are worse than one readable list.
-    if total + gaps + 4 > width {
-        return capability_stack(state, width, theme);
-    }
-    let spare = width.saturating_sub(total + gaps);
-    let pad = spare / (columns.len() + 1);
-
-    let mut heads: Vec<Span<'static>> = vec![Span::raw(" ".repeat(pad))];
-    for (index, (name, rows)) in columns.iter().enumerate() {
-        let w = column_width(rows);
-        heads.push(Span::styled(
-            format!("{:<w$}", name.to_ascii_uppercase()),
-            theme.accent().add_modifier(Modifier::BOLD),
-        ));
-        if index + 1 < columns.len() {
-            heads.push(Span::raw(" ".repeat(4 + pad)));
-        }
-    }
-
-    let mut outs = vec![Line::from(heads)];
-    let depth = columns
-        .iter()
-        .map(|(_, rows)| rows.len())
-        .max()
-        .unwrap_or(0);
-    for row in 0..depth {
-        let mut spans: Vec<Span<'static>> = vec![Span::raw(" ".repeat(pad))];
-        for (index, (_, rows)) in columns.iter().enumerate() {
-            let w = column_width(rows);
-            let text = rows.get(row).cloned().unwrap_or_default();
-            let text: String = text.chars().take(w).collect();
-            spans.push(Span::styled(
-                format!("{text:<w$}"),
-                if row == 0 {
-                    theme.text()
-                } else {
-                    theme.faint()
-                },
-            ));
-            if index + 1 < columns.len() {
-                spans.push(Span::raw(" ".repeat(4 + pad)));
-            }
-        }
-        outs.push(Line::from(spans));
-    }
-    outs
-}
-
-/// The same capability list, one row per item, for narrow panes.
-fn capability_stack(state: &WorkbenchState, width: usize, theme: &Theme) -> Vec<Line<'static>> {
-    let items = [
-        format!(
-            "model   {} at {}",
-            state.reasoner_label(),
-            state.endpoint.as_deref().unwrap_or("-")
-        ),
-        "tools   read, search, write behind an approval gate".to_owned(),
-        format!(
-            "checks  {} revision-bound checks gate completion",
-            state.checks
-        ),
-    ];
-    let mut out = Vec::new();
-    for item in items {
-        for line in wrap_text(&item, width.saturating_sub(8)) {
-            out.push(centered(line, width, theme.faint()));
-        }
-    }
-    out
-}
-
-/// The width a column needs: its widest row, bounded.
-fn column_width(rows: &[String]) -> usize {
-    rows.iter()
-        .map(|row| row.chars().count())
-        .max()
-        .unwrap_or(0)
-        .min(30)
-}
-
-/// Centre a run of spans inside a width, padding with unstyled spaces.
-fn centered_spans(spans: Vec<Span<'static>>, width: usize) -> Line<'static> {
-    let content: usize = spans.iter().map(|s| s.content.chars().count()).sum();
-    let pad = width.saturating_sub(content) / 2;
-    let mut out = vec![Span::raw(" ".repeat(pad))];
-    out.extend(spans);
-    Line::from(out)
-}
-
-/// One line of text, tinted along a ramp, for the wordmark.
-fn gradient_over(
-    theme: &Theme,
-    text: &str,
-    from: crate::theme::Rgb,
-    to: crate::theme::Rgb,
-) -> Vec<Span<'static>> {
-    let chars: Vec<char> = text.chars().collect();
-    let last = chars.len().saturating_sub(1).max(1);
-    chars
-        .into_iter()
-        .enumerate()
-        .map(|(index, ch)| {
-            let rgb = crate::theme::lerp(from, to, index as f32 / last as f32);
-            Span::styled(ch.to_string(), Style::default().fg(theme.color(rgb)))
-        })
-        .collect()
-}
-
-fn centered(text: String, width: usize, style: Style) -> Line<'static> {
-    let pad = width.saturating_sub(text.chars().count()) / 2;
-    Line::from(vec![Span::raw(" ".repeat(pad)), Span::styled(text, style)])
+    frame.render_widget(Paragraph::new(lines), area);
 }
 
 /// Wrap plain text to a width, preserving nothing but word boundaries.
@@ -1012,9 +582,9 @@ fn render_jobs(frame: &mut Frame, state: &WorkbenchState, area: Rect, theme: &Th
         match &pending.kind {
             crate::session::WaitKind::Approval { approval_key } => {
                 lines.push(Line::from(vec![
-                    Span::styled("  [a] ", theme.success()),
+                    Span::styled("  Alt+A ", theme.success()),
                     Span::styled("approve  ", theme.dim()),
-                    Span::styled("[d] ", theme.danger()),
+                    Span::styled("Alt+D ", theme.danger()),
                     Span::styled("deny", theme.dim()),
                 ]));
                 let key: String = approval_key.chars().take(16).collect();
@@ -1042,7 +612,7 @@ fn render_jobs(frame: &mut Frame, state: &WorkbenchState, area: Rect, theme: &Th
 
     if !active.is_empty() {
         lines.push(Line::from(Span::styled(" active", theme.accent())));
-        for card in active.iter().take(6) {
+        for card in &active {
             lines.push(job_line(card, state.tick, inner_width, theme));
         }
     }
@@ -1052,11 +622,7 @@ fn render_jobs(frame: &mut Frame, state: &WorkbenchState, area: Rect, theme: &Th
             lines.push(Line::from(""));
         }
         lines.push(Line::from(Span::styled(" recent", theme.dim())));
-        let budget = (area.height as usize)
-            .saturating_sub(2)
-            .saturating_sub(lines.len())
-            .max(2);
-        for card in finished.iter().take(budget) {
+        for card in &finished {
             lines.push(job_line(card, state.tick, inner_width, theme));
         }
     }
@@ -1067,7 +633,7 @@ fn render_jobs(frame: &mut Frame, state: &WorkbenchState, area: Rect, theme: &Th
             format!(" queued ({})", state.queued.len()),
             theme.warn(),
         )));
-        for request in state.queued.iter().take(3) {
+        for request in &state.queued {
             let short: String = request.chars().take(inner_width).collect();
             lines.push(Line::from(Span::styled(
                 format!("  {} {}", theme.glyphs.bullet(), short),
@@ -1087,10 +653,16 @@ fn render_jobs(frame: &mut Frame, state: &WorkbenchState, area: Rect, theme: &Th
         }
     }
 
-    let title = format!(" {} ", Tab::Tasks.label());
+    let title = " jobs / PgUp PgDn scroll / Esc close ";
+    let scroll = state.detail_scroll.min(
+        lines
+            .len()
+            .saturating_sub(area.height.saturating_sub(2) as usize) as u16,
+    );
     frame.render_widget(
         Paragraph::new(lines)
-            .block(panel(&title, theme.border(), theme))
+            .scroll((scroll, 0))
+            .block(panel(title, theme.border(), theme))
             .style(theme.bg(theme.palette.bg_panel)),
         area,
     );
@@ -1293,14 +865,27 @@ fn render_inspector(frame: &mut Frame, state: &WorkbenchState, area: Rect, theme
         ]));
     }
 
-    let title = if state.show_inspector {
-        format!(" {} {} ", Tab::Inspector.label(), theme.glyphs.diamond())
-    } else {
-        format!(" {} ", Tab::Inspector.label())
-    };
+    section(&mut lines, "recent decisions");
+    for decision in inspector.decisions().iter().rev().take(30) {
+        for line in wrap_text(&decision.row(), width) {
+            lines.push(Line::from(Span::styled(format!("  {line}"), theme.dim())));
+        }
+        if let Some(reason) = decision.escalation_explanation() {
+            for line in wrap_text(&reason, width) {
+                lines.push(Line::from(Span::styled(format!("  {line}"), theme.warn())));
+            }
+        }
+    }
+    let title = " decisions / PgUp PgDn scroll / Esc close ";
+    let scroll = state.detail_scroll.min(
+        lines
+            .len()
+            .saturating_sub(area.height.saturating_sub(2) as usize) as u16,
+    );
     frame.render_widget(
         Paragraph::new(lines)
-            .block(panel(&title, theme.border(), theme))
+            .scroll((scroll, 0))
+            .block(panel(title, theme.border(), theme))
             .style(theme.bg(theme.palette.bg_panel))
             .wrap(Wrap { trim: false }),
         area,
@@ -1359,9 +944,6 @@ fn render_composer(frame: &mut Frame, state: &WorkbenchState, area: Rect, theme:
 
     for (index, line) in composer_lines.iter().enumerate() {
         for (chunk_index, chunk) in hard_wrap(line, inner_width).into_iter().enumerate() {
-            if lines.len() >= budget {
-                break;
-            }
             let gutter = if index == 0 && chunk_index == 0 {
                 sigil.clone()
             } else {
@@ -1369,27 +951,33 @@ fn render_composer(frame: &mut Frame, state: &WorkbenchState, area: Rect, theme:
             };
             lines.push(Line::from(vec![gutter, Span::styled(chunk, style)]));
         }
-        if lines.len() >= budget {
-            break;
-        }
     }
 
-    if lines.is_empty() {
+    if state.composer.text().is_empty() {
+        lines.clear();
         lines.push(Line::from(vec![
             sigil,
-            Span::styled(
-                if focused { "" } else { "press i to compose" },
-                theme.faint(),
-            ),
+            Span::styled("Describe a task, or / for commands", theme.faint()),
         ]));
     }
 
-    let title = if state.pending.is_some() {
-        " answer, or [a]pprove / [d]eny "
-    } else if focused {
-        " enter submit | ctrl+j newline | : commands "
+    let (cursor_row, cursor_col) = state.composer.cursor();
+    let (display_row, _) =
+        composer_cursor_position(composer_lines, cursor_row, cursor_col, inner_width);
+    let scroll = display_row.saturating_sub(budget.saturating_sub(1));
+    let lines: Vec<_> = lines.into_iter().skip(scroll).take(budget).collect();
+    let title = if state
+        .pending
+        .as_ref()
+        .is_some_and(|p| matches!(p.kind, crate::session::WaitKind::Approval { .. }))
+    {
+        " approval needed: Alt+A allow / Alt+D deny "
+    } else if state.pending.is_some() {
+        " your answer "
+    } else if state.task_state.is_some_and(|s| !s.is_terminal()) {
+        " follow up "
     } else {
-        " i / tab to compose "
+        " message "
     };
     let border = if state.pending.is_some() {
         theme.warn().add_modifier(Modifier::BOLD)
@@ -1407,77 +995,40 @@ fn render_composer(frame: &mut Frame, state: &WorkbenchState, area: Rect, theme:
 }
 
 fn render_footer(frame: &mut Frame, state: &WorkbenchState, area: Rect, theme: &Theme) {
-    if area.height == 0 || area.width == 0 {
-        return;
-    }
-    let key = |keys: &'static str| Span::styled(keys, theme.accent());
-    let label = |text: &'static str| Span::styled(text, theme.faint());
-
-    let mut spans: Vec<Span> = vec![Span::raw(" ")];
-    let push = |spans: &mut Vec<Span>, keys: &'static str, text: &'static str| {
-        spans.push(key(keys));
-        // A visible gap between the key and its action, and between pairs:
-        // "enter submit" reads as one word otherwise.
-        spans.push(label(" "));
-        spans.push(label(text));
-        spans.push(Span::styled("   ", theme.faint()));
+    let hint = if state
+        .pending
+        .as_ref()
+        .is_some_and(|p| matches!(p.kind, crate::session::WaitKind::Approval { .. }))
+    {
+        " Alt+A allow   Alt+D deny   draft preserved"
+    } else if !state.follow {
+        " PgUp/PgDn scroll   Esc latest   type to compose"
+    } else if area.width < 70 {
+        " Enter send   / commands   ? shortcuts"
+    } else {
+        " Enter send   Shift+Enter newline   / commands   ? shortcuts"
     };
-
-    push(&mut spans, "enter", "submit");
-    push(&mut spans, "tab", "focus");
-    if area.width >= 84 {
-        push(&mut spans, ":", "commands");
-        push(&mut spans, "v", "review");
-        push(&mut spans, "V", "verify");
-        push(&mut spans, "i", "decisions");
-    }
-    push(&mut spans, "?", "help");
-
-    // Right edge: the live status, so the shell always says what it is
-    // doing — and, when the provider reported them, what it has spent. Both
-    // Codex and Crush put resource state in the status line; it belongs
-    // where the eye already goes, not buried in an overlay.
-    let left: usize = spans.iter().map(|span| span.content.chars().count()).sum();
-    let status = state.status.clone().or_else(|| {
-        state
-            .task_state
-            .map(|_| state_marker_for(state.task_state, theme).1.to_owned())
-    });
-    let mut tail: Vec<(String, Style)> = Vec::new();
-    if let Some(status) = status {
-        tail.push((status, theme.dim()));
-    }
-    if let Some(tokens) = state.usage_tokens() {
-        tail.push((format!("{tokens} tok"), theme.faint()));
-    }
-    if !tail.is_empty() {
-        let width: usize = tail
-            .iter()
-            .map(|(text, _)| text.chars().count() + 3)
-            .sum::<usize>()
-            + 1;
-        if left + width + 2 < area.width as usize {
-            spans.push(Span::styled(
-                " ".repeat(area.width as usize - left - width),
-                theme.faint(),
-            ));
-            for (index, (text, style)) in tail.iter().enumerate() {
-                if index > 0 {
-                    spans.push(Span::styled(" | ", theme.faint()));
-                }
-                spans.push(Span::styled(text.clone(), *style));
-            }
-            spans.push(Span::raw(" "));
+    let detail = state.status.clone().unwrap_or_else(|| {
+        if state.task_state.is_some_and(|s| !s.is_terminal()) {
+            " Ctrl+C stop task · your next message steers or queues".to_owned()
+        } else {
+            " Ctrl+O jobs   Ctrl+B decisions   Ctrl+C quit".to_owned()
         }
-    }
-
+    });
+    let detail = if theme.glyphs.unicode {
+        detail
+    } else {
+        detail.replace('·', "|")
+    };
     frame.render_widget(
-        Paragraph::new(Line::from(spans)).style(theme.bg(theme.palette.bg_panel)),
+        Paragraph::new(vec![
+            Line::from(Span::styled(hint, theme.dim())),
+            Line::from(Span::styled(detail, theme.faint())),
+        ]),
         area,
     );
 }
 
-/// The review workspace: files, diff and checks side by side.
 pub fn render_review(frame: &mut Frame, view: &crate::review::ReviewView) {
     render_review_themed(frame, view, &Theme::detect());
 }
@@ -1485,93 +1036,30 @@ pub fn render_review(frame: &mut Frame, view: &crate::review::ReviewView) {
 pub fn render_review_themed(frame: &mut Frame, view: &crate::review::ReviewView, theme: &Theme) {
     let area = frame.area();
     paint_backdrop(frame, area, theme);
-    let wide = area.width >= NARROW_WIDTH;
-
-    let (files_area, diff_area, checks_area) = if wide {
-        let horizontal = Layout::default()
-            .direction(Direction::Horizontal)
-            .constraints([
-                Constraint::Length(28),
-                Constraint::Min(30),
-                Constraint::Length(32),
-            ])
-            .split(area);
-        (horizontal[0], horizontal[1], horizontal[2])
-    } else {
-        let vertical = Layout::default()
-            .direction(Direction::Vertical)
-            .constraints([
-                Constraint::Length(6),
-                Constraint::Min(6),
-                Constraint::Length(8),
-            ])
-            .split(area);
-        (vertical[0], vertical[1], vertical[2])
-    };
-
-    render_review_files(frame, view, files_area, theme);
-    render_review_diff(frame, view, diff_area, theme);
-    render_review_checks(frame, view, checks_area, theme);
-}
-
-fn render_review_files(
-    frame: &mut Frame,
-    view: &crate::review::ReviewView,
-    area: Rect,
-    theme: &Theme,
-) {
-    let mut lines = Vec::new();
-    for (index, file) in view
-        .changes
-        .files
-        .iter()
-        .enumerate()
-        .take(area.height.saturating_sub(2) as usize)
-    {
-        let marker = file.kind.marker();
-        let from = file
-            .from
-            .as_ref()
-            .map(|from| format!("{from} -> "))
-            .unwrap_or_default();
-        let label = format!("{marker} {from}{}", file.path);
-        let budget = area.width.saturating_sub(3) as usize;
-        let label: String = label.chars().take(budget).collect();
-        let selected = index == view.file_index;
-
-        let mut spans = vec![Span::styled(
-            if selected {
-                format!(" {} ", theme.glyphs.rail())
-            } else {
-                "   ".to_owned()
-            },
-            theme.accent(),
-        )];
-        spans.push(Span::styled(
-            label,
-            if selected {
-                theme.text().add_modifier(Modifier::BOLD)
-            } else {
-                theme.dim()
-            },
-        ));
-        if area.width >= 24 {
-            spans.push(Span::styled(format!(" +{}", file.added), theme.success()));
-            spans.push(Span::styled(format!(" -{}", file.removed), theme.danger()));
-        }
-        lines.push(Line::from(spans));
-    }
-
-    frame.render_widget(
-        Paragraph::new(lines)
-            .block(panel(
-                &format!(" changes | {} ", view.changes.files.len()),
-                theme.border(),
-                theme,
-            ))
-            .style(theme.bg(theme.palette.bg_panel)),
-        area,
+    let rows = Layout::vertical([
+        Constraint::Length(2),
+        Constraint::Min(3),
+        Constraint::Length(if view.checks.is_empty() {
+            0
+        } else {
+            5.min(area.height / 3)
+        }),
+    ])
+    .split(area);
+    let label = format!(
+        " Changes  {}/{} files   Left/Right file   Up/Down hunk   Esc close",
+        if view.changes.files.is_empty() {
+            0
+        } else {
+            view.file_index + 1
+        },
+        view.changes.files.len()
     );
+    frame.render_widget(Paragraph::new(label).style(theme.dim()), rows[0]);
+    render_review_diff(frame, view, rows[1], theme);
+    if rows[2].height > 0 {
+        render_review_checks(frame, view, rows[2], theme);
+    }
 }
 
 fn render_review_diff(
@@ -1599,16 +1087,7 @@ fn render_review_diff(
         Span::styled(format!(" | {}", file.kind.label()), theme.faint()),
     ]));
 
-    let budget = area.height.saturating_sub(2) as usize;
-    let mut used = 1usize;
-    for (index, hunk) in file.hunks.iter().enumerate() {
-        if used >= budget {
-            lines.push(Line::from(Span::styled(
-                format!("  .. {} more hunk(s)", file.hunks.len() - index),
-                theme.faint(),
-            )));
-            break;
-        }
+    for (index, hunk) in file.hunks.iter().enumerate().skip(view.hunk_index).take(1) {
         let rejected = view.selection.is_rejected(&hunk.id);
         let selected = index == view.hunk_index;
         let style = if selected {
@@ -1627,8 +1106,7 @@ fn render_review_diff(
             Span::styled(marker, theme.danger()),
             Span::styled(hunk.header(), style),
         ]));
-        used += 1;
-        for line in hunk.lines.iter().take(MAX_HUNK_LINES).take(budget - used) {
+        for line in hunk.lines.iter().take(MAX_HUNK_LINES) {
             let (color, glyph) = match line.chars().next() {
                 Some('+') => (theme.success(), "+"),
                 Some('-') => (theme.danger(), "-"),
@@ -1643,61 +1121,25 @@ fn render_review_diff(
                 Span::styled(format!("  {glyph} "), color),
                 Span::styled(content, color),
             ]));
-            used += 1;
         }
         if hunk.lines.len() > MAX_HUNK_LINES {
             lines.push(Line::from(Span::styled(
                 format!("  .. {} more line(s)", hunk.lines.len() - MAX_HUNK_LINES),
                 theme.faint(),
             )));
-            used += 1;
         }
     }
 
-    if let Some(approval) = view.approvals.pending() {
-        lines.push(Line::from(""));
-        lines.push(Line::from(Span::styled(
-            format!(" {} approval required", theme.glyphs.diamond()),
-            theme.warn().add_modifier(Modifier::BOLD),
-        )));
-        lines.push(Line::from(vec![
-            Span::styled("  action  ", theme.faint()),
-            Span::styled(approval.reason.clone(), theme.text()),
-        ]));
-        lines.push(Line::from(vec![
-            Span::styled("  scope   ", theme.faint()),
-            Span::styled(approval.scope.join(", "), theme.dim()),
-        ]));
-        lines.push(Line::from(vec![
-            Span::styled("  network ", theme.faint()),
-            Span::styled(
-                if approval.network {
-                    "allowed"
-                } else {
-                    "denied"
-                }
-                .to_owned(),
-                if approval.network {
-                    theme.warn()
-                } else {
-                    theme.success()
-                },
-            ),
-        ]));
-        lines.push(Line::from(vec![
-            Span::styled("  [a] ", theme.success()),
-            Span::styled("approve  ", theme.dim()),
-            Span::styled("[A] ", theme.success()),
-            Span::styled("always  ", theme.dim()),
-            Span::styled("[d] ", theme.danger()),
-            Span::styled("reject", theme.dim()),
-        ]));
-    }
-
+    let scroll = view.scroll.min(
+        lines
+            .len()
+            .saturating_sub(area.height.saturating_sub(2) as usize),
+    );
     frame.render_widget(
         Paragraph::new(lines)
+            .scroll((scroll.min(u16::MAX as usize) as u16, 0))
             .block(panel(
-                " diff | j/k hunk | n/p file | r reject ",
+                " diff / PgUp PgDn scroll / read only ",
                 theme.border(),
                 theme,
             ))
@@ -1751,197 +1193,102 @@ fn render_review_checks(
 }
 
 /// The decision inspector overlay.
-fn render_inspector_overlay(frame: &mut Frame, state: &WorkbenchState, area: Rect, theme: &Theme) {
-    let width = area.width.saturating_sub(6).min(104);
-    let height = area.height.saturating_sub(4).min(34);
-    let popup = Rect {
-        x: area.x + (area.width.saturating_sub(width)) / 2,
-        y: area.y + (area.height.saturating_sub(height)) / 2,
-        width,
-        height,
-    };
-
-    let inspector = &state.inspector;
-    let mut lines: Vec<Line> = Vec::new();
-
-    lines.push(Line::from(vec![
-        Span::styled(" task ", theme.faint()),
-        Span::styled(
-            format!("{:?}", inspector.task_state()),
-            theme.text().add_modifier(Modifier::BOLD),
-        ),
-        Span::styled("   ", theme.faint()),
-        Span::styled(inspector.graph_summary(), theme.dim()),
-    ]));
-    lines.push(Line::from(""));
-
-    lines.push(Line::from(Span::styled(
-        " OUTSTANDING",
-        theme.accent().add_modifier(Modifier::BOLD),
-    )));
-    for line in inspector.outstanding().render().lines().take(6) {
-        lines.push(Line::from(Span::styled(format!("  {line}"), theme.text())));
-    }
-    lines.push(Line::from(""));
-
-    lines.push(Line::from(Span::styled(
-        " LATENCY",
-        theme.accent().add_modifier(Modifier::BOLD),
-    )));
-    for line in inspector.latency().render().lines().take(4) {
-        lines.push(Line::from(Span::styled(format!("  {line}"), theme.dim())));
-    }
-    lines.push(Line::from(""));
-
-    lines.push(Line::from(Span::styled(
-        " USAGE",
-        theme.accent().add_modifier(Modifier::BOLD),
-    )));
-    for line in inspector.usage().render().lines().take(4) {
-        lines.push(Line::from(Span::styled(format!("  {line}"), theme.dim())));
-    }
-    lines.push(Line::from(""));
-
-    lines.push(Line::from(Span::styled(
-        " DECISIONS | provenance preserved",
-        theme.accent().add_modifier(Modifier::BOLD),
-    )));
-    for record in inspector.decisions().iter().rev().take(10).rev() {
-        let style = match record.provenance {
-            crate::inspector::DecisionProvenance::Model { .. } => theme.text(),
-            crate::inspector::DecisionProvenance::Deterministic { .. } => theme.faint(),
-            crate::inspector::DecisionProvenance::Cached { .. } => theme.fg(theme.palette.sky),
-            crate::inspector::DecisionProvenance::Operator { .. } => theme.accent(),
-            crate::inspector::DecisionProvenance::Fallback { .. } => theme.warn(),
-        };
-        let bounded: String = record.row().chars().take(width as usize - 6).collect();
-        lines.push(Line::from(vec![
-            Span::styled("  * ", theme.faint()),
-            Span::styled(bounded, style),
-        ]));
-    }
-
-    frame.render_widget(Clear, popup);
-    frame.render_widget(
-        Paragraph::new(lines)
-            .block(panel(
-                " decisions | i closes ",
-                theme.border_focused(),
-                theme,
-            ))
-            .style(theme.bg(theme.palette.bg_raise))
-            .wrap(Wrap { trim: false }),
-        popup,
-    );
-}
-
 /// The command palette: every entry states whether it exists.
 fn render_palette(frame: &mut Frame, state: &WorkbenchState, area: Rect, theme: &Theme) {
-    let width = area.width.saturating_sub(10).min(76);
+    let width = area.width.saturating_sub(4).min(80);
     let results = state.palette_results();
-    let height = (results.len() as u16 + 5).min(area.height.saturating_sub(4));
-    let popup = Rect {
-        x: area.x + (area.width.saturating_sub(width)) / 2,
-        y: area.y + 3,
-        width,
-        height,
-    };
-
-    let mut lines = vec![Line::from(vec![
-        Span::styled(
-            format!(" {} ", theme.glyphs.prompt()),
-            theme.accent().add_modifier(Modifier::BOLD),
-        ),
-        Span::styled(state.palette.clone().unwrap_or_default(), theme.text()),
-    ])];
+    let height = (results.len() as u16 + 5).min(area.height.saturating_sub(2));
+    let popup = Rect::new(area.x + (area.width - width) / 2, area.y + 1, width, height);
+    let visible = height.saturating_sub(5).max(1) as usize;
+    let start = state.palette_selection.saturating_sub(visible - 1);
+    let mut lines = vec![
+        Line::from(Span::styled(
+            format!(" /{}_", state.palette.as_deref().unwrap_or("")),
+            theme.text(),
+        )),
+        Line::from(""),
+    ];
     if results.is_empty() {
+        lines.push(Line::from("  No matching command"));
+    }
+    for (index, command) in results.iter().enumerate().skip(start).take(visible) {
+        let selected = index == state.palette_selection;
+        let style = if selected {
+            theme
+                .text()
+                .patch(theme.bg(theme.palette.bg_sel))
+                .add_modifier(Modifier::BOLD)
+        } else if command.is_available() {
+            theme.text()
+        } else {
+            theme.faint()
+        };
+        let detail = match command.availability {
+            CommandAvailability::Available => command.title,
+            CommandAvailability::Unavailable(_) => "not available in this session",
+        };
         lines.push(Line::from(Span::styled(
-            "  no matching command",
-            theme.faint(),
+            format!(
+                " {} {:<12} {}",
+                if selected { ">" } else { " " },
+                command.id,
+                detail
+            ),
+            style,
         )));
     }
-    for command in results.iter().take(height.saturating_sub(3) as usize) {
-        match command.availability {
-            CommandAvailability::Available => lines.push(Line::from(vec![
-                Span::styled(
-                    format!("  {:<10}", command.id),
-                    theme.accent().add_modifier(Modifier::BOLD),
-                ),
-                Span::styled(command.title.to_owned(), theme.text()),
-                Span::styled(format!("  {}", command.description), theme.faint()),
-            ])),
-            CommandAvailability::Unavailable(reason) => lines.push(Line::from(vec![
-                Span::styled(format!("  {:<10}", command.id), theme.faint()),
-                Span::styled(command.title.to_owned(), theme.faint()),
-                Span::styled(format!("  - {reason}"), theme.faint()),
-            ])),
-        }
-    }
-
+    lines.push(Line::from(Span::styled(
+        " Up/Down select  Enter run  Esc close",
+        theme.dim(),
+    )));
     frame.render_widget(Clear, popup);
     frame.render_widget(
         Paragraph::new(lines)
             .block(panel(" commands ", theme.border_focused(), theme))
-            .style(theme.bg(theme.palette.bg_raise))
-            .wrap(Wrap { trim: false }),
+            .style(theme.bg(theme.palette.bg_raise)),
         popup,
     );
 }
 
-fn render_help(frame: &mut Frame, area: Rect, theme: &Theme) {
-    let width = area.width.saturating_sub(10).min(72);
-    let height = area.height.saturating_sub(6).min(24);
-    let popup = Rect {
-        x: area.x + (area.width.saturating_sub(width)) / 2,
-        y: area.y + (area.height.saturating_sub(height)) / 2,
+fn render_help(frame: &mut Frame, state: &WorkbenchState, area: Rect, theme: &Theme) {
+    let mut lines = vec![
+        " Enter          Send message",
+        " Shift+Enter    Newline (Ctrl+J fallback)",
+        " Ctrl+P /       Commands",
+        " Ctrl+R         Review changes",
+        " Ctrl+O / B     Jobs / decisions",
+        " PgUp / PgDn    Scroll",
+        " Ctrl+Z / Y     Undo / redo",
+        " Ctrl+C         Stop / clear / quit",
+    ];
+    if state.review.is_some() {
+        lines = vec![
+            " Left / Right   Previous / next file",
+            " Up / Down      Previous / next hunk",
+            " PgUp / PgDn    Scroll diff",
+            " Esc            Back to conversation",
+        ];
+    } else if state
+        .pending
+        .as_ref()
+        .is_some_and(|pending| matches!(pending.kind, crate::session::WaitKind::Approval { .. }))
+    {
+        lines.insert(0, " Alt+A / D      Allow / deny approval");
+    }
+    lines.push(" ? / F1 / Esc   Close shortcuts");
+    let width = area.width.min(48);
+    let height = area.height.min(lines.len() as u16 + 2);
+    let popup = Rect::new(
+        area.x + (area.width - width) / 2,
+        area.y + (area.height - height) / 2,
         width,
         height,
-    };
-
-    let key = |keys: &'static str| Span::styled(format!("  {keys:<12}"), theme.accent());
-    let text = |what: &'static str| Span::styled(what, theme.text());
-    let lines: Vec<Line> = vec![
-        Line::from(Span::styled(
-            " compose",
-            theme.accent().add_modifier(Modifier::BOLD),
-        )),
-        Line::from(vec![key("i / Tab"), text("focus the composer")]),
-        Line::from(vec![key("Enter"), text("submit the composed task")]),
-        Line::from(vec![key("Ctrl+J"), text("insert a newline")]),
-        Line::from(vec![key("Ctrl+Z/Y"), text("undo / redo")]),
-        Line::from(vec![key("Up / Dn"), text("composer history, or scroll")]),
-        Line::from(""),
-        Line::from(Span::styled(
-            " session",
-            theme.accent().add_modifier(Modifier::BOLD),
-        )),
-        Line::from(vec![key("a / d"), text("approve / deny a gated action")]),
-        Line::from(vec![key("c"), text("cancel the running task")]),
-        Line::from(vec![key("p / r"), text("pause / resume")]),
-        Line::from(vec![key(":"), text("command palette")]),
-        Line::from(vec![key("v"), text("close the review workspace")]),
-        Line::from(""),
-        Line::from(Span::styled(
-            " view",
-            theme.accent().add_modifier(Modifier::BOLD),
-        )),
-        Line::from(vec![
-            key("1 2 3"),
-            text("transcript / state / jobs (narrow)"),
-        ]),
-        Line::from(vec![key("i"), text("decision inspector overlay")]),
-        Line::from(vec![key("F1 / ?"), text("toggle this help")]),
-        Line::from(vec![
-            key("q / Ctrl+C"),
-            text("quit, restoring the terminal"),
-        ]),
-    ];
-
+    );
     frame.render_widget(Clear, popup);
     frame.render_widget(
-        Paragraph::new(lines)
-            .block(panel(" help ", theme.border_focused(), theme))
-            .style(theme.bg(theme.palette.bg_raise)),
+        Paragraph::new(lines.into_iter().map(Line::from).collect::<Vec<_>>())
+            .style(theme.text().patch(theme.bg(theme.palette.bg)))
+            .block(panel(" Keyboard shortcuts ", theme.border_focused(), theme)),
         popup,
     );
 }
@@ -2037,9 +1384,9 @@ mod tests {
         let text = snapshot(&state, 80, 24, Tab::Timeline);
         assert!(text.contains("knut"), "the wordmark is present:\n{text}");
         assert!(text.contains("running"));
-        assert!(text.contains("transcript"));
+        assert!(text.contains("conversation"));
         // The composer and footer are present.
-        assert!(text.contains("enter submit"));
+        assert!(text.contains("Enter send"));
     }
 
     #[test]
@@ -2048,7 +1395,7 @@ mod tests {
         let text = snapshot(&state, 100, 30, Tab::Timeline);
         // The block wordmark spells the name at display size.
         assert!(
-            text.contains('K') || text.contains('█'),
+            text.contains("What are we building?"),
             "the mark is drawn:{text}"
         );
         assert!(
@@ -2059,10 +1406,10 @@ mod tests {
     }
 
     #[test]
-    fn narrow_windows_collapse_to_tabs_without_losing_content() {
+    fn secondary_views_work_at_every_width() {
         let state = populated_state();
         let timeline = snapshot(&state, 60, 24, Tab::Timeline);
-        assert!(timeline.contains("transcript"));
+        assert!(timeline.contains("conversation"));
         assert!(timeline.contains("fix the failing test"));
 
         let jobs = snapshot(&state, 60, 24, Tab::Tasks);
@@ -2073,20 +1420,22 @@ mod tests {
     }
 
     #[test]
-    fn large_layouts_show_the_inspector() {
+    fn wide_layouts_keep_the_conversation_full_width() {
         let state = populated_state();
         let text = snapshot(&state, 140, 40, Tab::Timeline);
-        assert!(text.contains("STATE") || text.contains("state"));
+        assert!(!text.contains("turns"));
         assert!(text.contains("glm-5.3-flash"));
-        assert!(text.contains("turns"));
+        let details = snapshot(&state, 140, 40, Tab::Inspector);
+        assert!(details.contains("turns"));
+        assert_eq!(plan_layout(Rect::new(0, 0, 140, 40), 1).timeline.width, 136);
     }
 
     #[test]
     fn short_windows_drop_the_inspector_instead_of_cramping() {
-        let plan = plan_layout(Rect::new(0, 0, 120, 14), true);
-        assert!(plan.inspector.is_none());
+        let plan = plan_layout(Rect::new(0, 0, 120, 14), 1);
+        assert_eq!(plan.timeline.width, 116);
         assert!(plan.composer.height >= 3);
-        assert_eq!(plan.footer.height, 1);
+        assert_eq!(plan.footer.height, 2);
     }
 
     #[test]
@@ -2166,7 +1515,10 @@ mod tests {
         state.help = true;
         for (width, height) in [(80, 24), (40, 12), (120, 44)] {
             let text = snapshot(&state, width, height, Tab::Timeline);
-            assert!(text.contains("compose"), "help missing at {width}x{height}");
+            assert!(
+                text.contains("Keyboard shortcuts"),
+                "help missing at {width}x{height}"
+            );
         }
     }
 
@@ -2266,12 +1618,14 @@ mod tests {
         }
 
         let theme = Theme::for_level(ColorLevel::TrueColor);
+        let mut terminal = Terminal::new(TestBackend::new(120, 40)).unwrap();
         let mut timings = Vec::new();
         for _ in 0..200 {
             let started = std::time::Instant::now();
-            let mut local = state.clone();
-            local.composer.insert("x");
-            let _ = snapshot_themed(&local, 120, 40, Tab::Timeline, &theme);
+            state.composer.insert("x");
+            terminal
+                .draw(|frame| render_themed(frame, &state, Tab::Timeline, &theme))
+                .unwrap();
             timings.push(started.elapsed());
         }
         timings.sort();
@@ -2325,7 +1679,7 @@ mod tests {
             text: "then update the docs".to_owned(),
         });
 
-        let text = snapshot(&state, 160, 44, Tab::Timeline);
+        let text = snapshot(&state, 160, 44, Tab::Tasks);
         assert!(
             text.contains("run cargo test"),
             "active card visible:\n{text}"
@@ -2389,7 +1743,7 @@ mod tests {
             // The screen never depends on colour to be legible.
             assert!(text.contains("knut"), "{level:?} lost the wordmark");
             assert!(text.contains("running"), "{level:?} lost the state");
-            assert!(text.contains("transcript"), "{level:?} lost the panels");
+            assert!(text.contains("conversation"), "{level:?} lost the panels");
         }
     }
 
@@ -2476,7 +1830,7 @@ mod tests {
         assert_eq!(hard_wrap("", 4), vec![""]);
         // A line exactly on the boundary does not emit a phantom chunk,
         // but the caret math accounts for the row it fills.
-        assert_eq!(hard_wrap("abcd", 4), vec!["abcd"]);
+        assert_eq!(hard_wrap("abcd", 4), vec!["abcd", ""]);
     }
 
     #[test]
@@ -2515,5 +1869,48 @@ mod tests {
         assert!(compact.chars().count() < deep.chars().count());
         // A short path is left alone.
         assert_eq!(compact_path("/tmp/x", 60), "/tmp/x");
+    }
+    #[test]
+    fn composer_tracks_wide_graphemes_and_combining_marks() {
+        let lines = vec!["界e\u{301}界".to_owned()];
+        assert_eq!(composer_cursor_position(&lines, 0, 1, 4), (0, 2));
+        assert_eq!(composer_cursor_position(&lines, 0, 2, 4), (1, 0));
+        assert_eq!(composer_cursor_position(&lines, 0, 3, 4), (1, 2));
+        assert_eq!(hard_wrap(&lines[0], 4), vec!["界e\u{301}", "界"]);
+    }
+
+    #[test]
+    fn a_long_draft_keeps_its_cursor_line_visible() {
+        let mut state = WorkbenchState::new("/tmp/ws");
+        state.composer.paste(
+            &(0..20)
+                .map(|i| format!("draft line {i}"))
+                .collect::<Vec<_>>()
+                .join("\n"),
+        );
+        let text = snapshot(&state, 80, 24, Tab::Timeline);
+        assert!(text.contains("draft line 19"), "{text}");
+        assert!(!text.contains("draft line 0"));
+    }
+
+    #[test]
+    fn streaming_tail_and_scrollback_show_both_ends_of_a_long_answer() {
+        let mut state = populated_state();
+        state.timeline.clear();
+        state.timeline.push(crate::tui_state::TimelineEntry {
+            kind: TimelineKind::Assistant,
+            text: (0..50)
+                .map(|i| format!("answer line {i}"))
+                .collect::<Vec<_>>()
+                .join("\n"),
+            streaming: true,
+        });
+        let tail = snapshot(&state, 80, 24, Tab::Timeline);
+        assert!(tail.contains("answer line 49"), "{tail}");
+        state.follow = false;
+        state.selection = 0;
+        state.transcript_scroll = 100;
+        let start = snapshot(&state, 80, 24, Tab::Timeline);
+        assert!(start.contains("answer line 0"), "{start}");
     }
 }

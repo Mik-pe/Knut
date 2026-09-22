@@ -85,44 +85,6 @@ pub const KNOT_SMALL: Art = Art {
 pub const WORDMARK: &str = "K N U T";
 /// The one-line tagline shown under the mark.
 pub const TAGLINE: &str = "agentic harness";
-/// The sub-line: what the harness actually is.
-pub const SUBTITLE: &str = "System 0 / System 1 routing · gated tools · verified completion";
-
-/// The wordmark as block letters, for the welcome screen.
-///
-/// Drawn as a fixed 5-row block rather than a single line: a wordmark is
-/// branding, and branding that is the same size as body text does not read
-/// as one. Kept to five rows so the welcome screen stays a workbench rather
-/// than a splash screen.
-pub const WORDMARK_BLOCK: Art = Art {
-    lines: &[
-        "█   █ ██  █ █   █ ▀▀█▀▀",
-        "█  █  █ █ █ █   █   █  ",
-        "███   █  ██ █   █   █  ",
-        "█  █  █   █ █   █   █  ",
-        "█   █ █   █  ▀▀▀    █  ",
-    ],
-};
-
-/// The block wordmark in ASCII, for terminals without block glyphs.
-pub const WORDMARK_BLOCK_ASCII: Art = Art {
-    lines: &[
-        "#   # ##  # #   # #####",
-        "#  #  # # # #   #   #  ",
-        "###   #  ## #   #   #  ",
-        "#  #  #   # #   #   #  ",
-        "#   # #   #  ###    #  ",
-    ],
-};
-
-/// The wordmark block for a glyph capability.
-pub fn wordmark_block(unicode: bool) -> Art {
-    if unicode {
-        WORDMARK_BLOCK
-    } else {
-        WORDMARK_BLOCK_ASCII
-    }
-}
 
 /// ASCII twins, used when the terminal cannot be trusted with box art.
 ///

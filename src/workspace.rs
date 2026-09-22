@@ -582,7 +582,7 @@ impl Tool for ReadTool {
             id: "read".to_owned(),
             tool_version: "1".to_owned(),
             capability: CAPABILITY.to_owned(),
-            description: "Read a bounded range of a workspace file".to_owned(),
+            description: "Read at most 400 lines of a workspace file (1-based start_line/end_line). Output includes lines [{line,text}], total_lines, truncated and content_hash. Read subsequent ranges before replacing a truncated file.".to_owned(),
             input_schema: json!({
                 "type": "object",
                 "properties": {
@@ -764,6 +764,97 @@ impl Tool for WriteTool {
     }
 }
 
+pub struct EditTool {
+    workspace: Workspace,
+}
+
+#[derive(serde::Deserialize)]
+#[serde(deny_unknown_fields)]
+struct ExactReplacement {
+    old: String,
+    new: String,
+}
+
+#[async_trait::async_trait]
+impl Tool for EditTool {
+    fn metadata(&self) -> ToolMetadata {
+        ToolMetadata {
+            id: "edit".to_owned(),
+            tool_version: "1".to_owned(),
+            capability: CAPABILITY.to_owned(),
+            description: "Apply 1–32 exact replacements in an existing file. changes is a JSON-encoded string containing [{old,new}]. Each old text must occur exactly once at its step. Requires the read content_hash; all replacements validate before writing. Prefer this over regenerating a whole file for a small change.".to_owned(),
+            input_schema: json!({
+                "type": "object",
+                "properties": {
+                    "path": {"type": "string"},
+                    "expect_hash": {"type": "string"},
+                    "changes": {"type": "string"}
+                },
+                "required": ["path", "expect_hash", "changes"]
+            }),
+            side_effect: SideEffect::IdempotentWrite,
+        }
+    }
+
+    async fn call(&self, input: Value) -> Result<Value, KnutError> {
+        let string = |key: &str| {
+            input
+                .get(key)
+                .and_then(Value::as_str)
+                .ok_or_else(|| KnutError::Tool(format!("edit requires {key}")))
+        };
+        let path = string("path")?;
+        let expected = string("expect_hash")?;
+        let changes = string("changes")?;
+        if changes.len() > MAX_FILE_BYTES as usize {
+            return Err(KnutError::Tool(
+                "edit changes exceed the file-size limit".to_owned(),
+            ));
+        }
+        let changes: Vec<ExactReplacement> = serde_json::from_str(changes)
+            .map_err(|error| KnutError::Tool(format!("invalid exact replacements: {error}")))?;
+        if changes.is_empty() || changes.len() > 32 {
+            return Err(KnutError::Tool(
+                "edit requires 1–32 replacements".to_owned(),
+            ));
+        }
+        let bytes = self.workspace.read_bytes(path)?;
+        if content_hash(&bytes) != expected {
+            return Err(KnutError::Tool(format!(
+                "{path:?} changed since it was read"
+            )));
+        }
+        let mut content = String::from_utf8(bytes)
+            .map_err(|_| KnutError::Tool("edit requires a UTF-8 file".to_owned()))?;
+        for (index, change) in changes.into_iter().enumerate() {
+            let first = content.find(&change.old);
+            let unique = !change.old.is_empty()
+                && first.is_some_and(|start| {
+                    let next = start + change.old.chars().next().unwrap().len_utf8();
+                    !content[next..].contains(&change.old)
+                });
+            if !unique {
+                return Err(KnutError::Tool(format!(
+                    "replacement {index} must match exactly once"
+                )));
+            }
+            content = content.replacen(&change.old, &change.new, 1);
+            if content.len() > MAX_FILE_BYTES as usize {
+                return Err(KnutError::Tool(
+                    "edited file exceeds the file-size limit".to_owned(),
+                ));
+            }
+        }
+        // Reuse the write implementation's path checks and final revision check
+        // under the edit action's existing gate authorization.
+        WriteTool::new(self.workspace.clone())
+            .call(json!({
+                "path": path, "content": content, "expect_hash": expected
+            }))
+            .await
+    }
+}
+
 /// Register the workspace tools into a registry.
 pub fn register_workspace_tools(
     registry: &mut crate::ToolRegistry,
@@ -772,7 +863,8 @@ pub fn register_workspace_tools(
     registry.register(ListTool::new(workspace.clone()))?;
     registry.register(SearchTool::new(workspace.clone()))?;
     registry.register(ReadTool::new(workspace.clone()))?;
-    registry.register(WriteTool::new(workspace))?;
+    registry.register(WriteTool::new(workspace.clone()))?;
+    registry.register(EditTool { workspace })?;
     Ok(())
 }
 
@@ -822,7 +914,8 @@ pub fn discover_instructions(workspace: &Workspace) -> Result<Vec<InstructionFil
         }
     }
     // Shallower directories first: nearer files refine farther ones.
-    directories.sort_by_key(|dir| dir.components().count());
+    directories.sort_by_key(|dir| (dir.components().count(), dir.clone()));
+    directories.dedup();
 
     for directory in directories {
         for (precedence, name) in INSTRUCTION_FILES.iter().enumerate() {
@@ -849,7 +942,7 @@ pub fn discover_instructions(workspace: &Workspace) -> Result<Vec<InstructionFil
                 // truncated: an oversized instruction file is skipped.
                 continue;
             }
-            let Ok(bytes) = std::fs::read(&candidate) else {
+            let Ok(bytes) = workspace.read_bytes(&relative) else {
                 continue;
             };
             if is_binary(&bytes) {
@@ -867,6 +960,26 @@ pub fn discover_instructions(workspace: &Workspace) -> Result<Vec<InstructionFil
     }
 
     Ok(found)
+}
+
+pub fn instruction_context(workspace: &Workspace) -> Result<String, KnutError> {
+    const MAX_CONTEXT_BYTES: usize = 128 * 1024;
+    let mut context = String::new();
+    for instruction in discover_instructions(workspace)? {
+        let scope = instruction
+            .path
+            .rsplit_once('/')
+            .map_or(".", |(directory, _)| directory);
+        let section = format!(
+            "\nRepository instructions from {} (apply only within {scope}/):\n{}\n",
+            instruction.path, instruction.content
+        );
+        if context.len() + section.len() > MAX_CONTEXT_BYTES {
+            return Err(KnutError::Tool("Repository instructions exceed the 128 KiB context budget; narrow the workspace before continuing".to_owned()));
+        }
+        context.push_str(&section);
+    }
+    Ok(context)
 }
 
 #[cfg(test)]
@@ -1158,6 +1271,54 @@ mod tests {
         assert!(crate::validate_schema_supported(&untyped).is_err());
     }
 
+    #[tokio::test]
+    async fn exact_edits_preserve_unmentioned_content_and_reject_stale_replay() {
+        let fixture = Fixture::new("exact-edits");
+        let original = "å\r\nold\r\nlast\n";
+        fixture.write("src/example.rs", original);
+        let tool = EditTool {
+            workspace: fixture.workspace(),
+        };
+        let input = json!({"path":"src/example.rs", "expect_hash":content_hash(original.as_bytes()),
+            "changes": serde_json::to_string(&json!([{ "old":"old", "new":"界" }])).unwrap()});
+        tool.call(input.clone()).await.unwrap();
+        assert_eq!(
+            fixture.workspace().read_bytes("src/example.rs").unwrap(),
+            "å\r\n界\r\nlast\n".as_bytes()
+        );
+        assert!(tool.call(input).await.is_err());
+    }
+
+    #[tokio::test]
+    async fn exact_edits_validate_every_replacement_before_writing() {
+        let fixture = Fixture::new("invalid-exact-edits");
+        let original = "one duplicate duplicate aaa";
+        fixture.write("example.txt", original);
+        let tool = EditTool {
+            workspace: fixture.workspace(),
+        };
+        for changes in [
+            json!([]),
+            json!([{ "old":"", "new":"bad" }]),
+            json!([{ "old":"one", "new":"changed" }, { "old":"duplicate", "new":"bad" }]),
+            json!([{ "old":"missing", "new":"bad" }]),
+            json!([{ "old":"aa", "new":"bad" }]),
+        ] {
+            assert!(
+                tool.call(
+                    json!({"path":"example.txt", "expect_hash":content_hash(original.as_bytes()),
+                "changes":changes.to_string()})
+                )
+                .await
+                .is_err()
+            );
+            assert_eq!(
+                fixture.workspace().read_bytes("example.txt").unwrap(),
+                original.as_bytes()
+            );
+        }
+    }
+
     #[test]
     fn deny_matching_covers_nested_paths_and_basenames() {
         let fixture = Fixture::new("deny");
@@ -1199,8 +1360,7 @@ mod tests {
 
         assert_eq!(registry.capabilities(), vec![CAPABILITY.to_owned()]);
         let candidates = registry.tools_for_capability(CAPABILITY);
-        // Three read-only tools plus the one writing tool.
-        assert_eq!(candidates.len(), 4);
+        assert_eq!(candidates.len(), 5);
         assert_eq!(
             candidates
                 .iter()
@@ -1208,14 +1368,12 @@ mod tests {
                 .count(),
             3
         );
-        // The write tool declares a write, so the gate treats it as one:
-        // nothing here is silently read-only.
         assert_eq!(
             candidates
                 .iter()
                 .filter(|metadata| metadata.side_effect == SideEffect::IdempotentWrite)
                 .count(),
-            1
+            2
         );
     }
 

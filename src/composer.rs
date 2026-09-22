@@ -92,7 +92,11 @@ impl Composer {
 
     /// Character count of the whole buffer.
     pub fn len_chars(&self) -> usize {
-        self.lines.iter().map(|line| line.chars().count()).sum()
+        self.lines
+            .iter()
+            .map(|line| line.chars().count())
+            .sum::<usize>()
+            + self.lines.len().saturating_sub(1)
     }
 
     fn current_line(&self) -> &str {
@@ -171,7 +175,7 @@ impl Composer {
 
     /// Insert a newline (Ctrl+J), splitting the line at the cursor.
     pub fn insert_newline(&mut self) {
-        if self.lines.len() >= 10_000 {
+        if self.lines.len() >= 10_000 || self.len_chars() >= MAX_COMPOSER_CHARS {
             return;
         }
         self.checkpoint();
@@ -327,6 +331,14 @@ impl Composer {
         }
     }
 
+    pub fn clear(&mut self) {
+        self.checkpoint();
+        self.lines = vec![String::new()];
+        self.cursor_row = 0;
+        self.cursor_col = 0;
+        self.history_cursor = None;
+    }
+
     /// Take the buffer for submission and record it in history.
     pub fn take_submission(&mut self) -> Option<String> {
         if self.is_empty() {
@@ -396,6 +408,63 @@ impl Composer {
 
 #[cfg(test)]
 mod tests {
+    fn fill_to(cap: usize) -> Composer {
+        let mut c = Composer::new();
+        c.insert(&"x".repeat(cap));
+        c
+    }
+
+    #[test]
+    fn len_chars_counts_newlines_as_chars() {
+        let mut c = Composer::new();
+        c.insert("ab");
+        c.insert_newline();
+        c.insert("cd");
+        assert_eq!(c.len_chars(), 5);
+        assert_eq!(c.text(), "ab\ncd");
+    }
+
+    #[test]
+    fn len_chars_counts_unicode_scalars() {
+        let mut c = Composer::new();
+        c.insert("aé🦀");
+        c.insert_newline();
+        c.insert("ö");
+        assert_eq!(c.len_chars(), 5);
+    }
+
+    #[test]
+    fn newline_at_capacity_is_noop() {
+        let mut c = fill_to(MAX_COMPOSER_CHARS);
+        c.insert_newline();
+        assert_eq!(c.text(), "x".repeat(MAX_COMPOSER_CHARS));
+        assert_eq!(c.cursor(), (0, MAX_COMPOSER_CHARS));
+        assert_eq!(c.len_chars(), MAX_COMPOSER_CHARS);
+    }
+
+    #[test]
+    fn newline_fits_below_capacity() {
+        let mut c = fill_to(MAX_COMPOSER_CHARS - 1);
+        c.insert_newline();
+        assert_eq!(
+            c.text(),
+            format!("{}\n", "x".repeat(MAX_COMPOSER_CHARS - 1))
+        );
+        assert_eq!(c.cursor(), (1, 0));
+    }
+
+    #[test]
+    fn multiline_paste_respects_limit() {
+        let mut c = Composer::new();
+        let text = "y".repeat(MAX_COMPOSER_CHARS + 5);
+        let pasted = format!("a\n{}\nb", text);
+        c.paste(&pasted);
+        assert!(c.last_paste_truncated);
+        assert_eq!(c.len_chars(), MAX_COMPOSER_CHARS);
+        assert!(c.text().starts_with("a\n"));
+        assert!(c.text().contains('\n'));
+    }
+
     use super::*;
 
     /// Type text the way a user would: a newline is a line break, not a

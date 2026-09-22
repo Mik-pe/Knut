@@ -96,67 +96,94 @@ repository:
 | `KNUT_PROVIDER_API_KEY` | reasoner credential (required for `run`) |
 | `KNUT_PROVIDER_BASE_URL` | endpoint; defaults to the Z.ai coding endpoint |
 | `KNUT_PROVIDER_MODEL` | model id; defaults to `glm-5.3-flash` |
+| `KNUT_PROVIDER_REASONING_EFFORT` | explicit effort; GLM-5.3 supports `low`, `high`, `max` (default) |
+| `KNUT_PROVIDER_TIMEOUT_SECONDS` | positive request timeout; default 120 seconds |
 | `TYPESAFE_API_KEY` | Jev credential (optional; decisions fall back to deterministic rules) |
 | `KNUT_MODE` | `quality` (default) or `adaptive` |
 
 `knut doctor` reports what is missing with actionable guidance, and makes
 no paid request unless you pass `--live`.
 
-## The workbench (`knut tui`)
+To inspect generator calls during a real coding run:
 
-`knut tui` opens the shell over the same `SessionRuntime` that `knut run`
-uses: the real provider, the real workspace tools, the same approval gate
-and the same revision-bound checks. Nothing in the UI is a simulation of
-work; the shell renders what the runtime published and nothing else.
-
-```text
- ──────────────────────────────────────────────────────────────
-  ⟠ knut  ~/Work/Knut  ▏ main                        01:24
-  ▸ running ▏ quality  ▏ glm-5.3-flash  ▏ api.z.ai  ▏ 3 checks
- ╭─ transcript ─────────────────────────╮╭─ jobs ────────────────╮
- │ ❯ fix the failing test in src/lib.rs ││ active                │
- │ ▏ ▸ reading src/lib.rs               ││  ⠹ run cargo test     │
- │   ✔ read: ok {"lines": 42}           ││ recent                │
- │ ◆ system one [recovery v1]: verify   ││  ✔ read       120ms   │
- ╰──────────────────────────────────────╯╰───────────────────────╯
- ╭─ enter submit | ctrl+j newline | : commands ─────────────────╮
- │ ❯ █                                                          │
- ╰──────────────────────────────────────────────────────────────╯
+```sh
+./target/debug/knut run "fix the failing test" --census /tmp/knut-census.json
 ```
 
-What is deliberate:
+The output path must be new. The report records model/tier, call purpose,
+buffered/streaming mode, outcome, latency, and reported token usage—even when the
+run fails. It excludes prompt/response bodies and error text. Unknown usage stays
+unknown. Jev calls, cached-token breakdowns and costs are not yet included.
+This runs the normal coding task and can incur provider charges; `--census`
+does not grant write approval.
 
-- **Degrade, never lie.** Colour is detected (`COLORTERM`, `TERM`,
-  `NO_COLOR`, or an explicit `KNUT_TUI_COLORS=truecolor|256|16|none`).
-  A 256-colour terminal gets the nearest cube entry, a 16-colour terminal
-  gets the nearest classic colour, and a terminal with no colour gets
-  weight and glyph contrast instead. Status is always carried by a word
-  *and* a glyph, so nothing becomes unreadable when the palette collapses.
-- **The transcript is a rail, not a wall.** Each entry kind has its own
-  glyph and colour, and a streaming turn shows a live cursor block, so a
-  stalled stream and a live one look different.
-- **Jobs are honest.** A card that stopped says *how*: cancelled, timed
-  out and failed are distinct words, and a narrow pane drops the summary
-  before it drops the state.
-- **Nothing runs on the keystroke path.** Checks run on a worker and come
-  back as messages; a slow provider cannot block typing, scrolling or the
-  decision inspector.
+Small edits can use `files/edit`: a read hash plus a JSON-encoded array of exact
+`{old,new}` replacements. Ambiguous matches and stale revisions fail without
+writing. A run gets at most three plan/execute/check attempts; a blocked approval
+ends the scripted run, and successful existing tests cannot hide failed edits.
 
-| key | action |
+For a live repository-edit comparison with Ante, see
+[the measured pilot](HARNESS_COMPARISON.md) and
+[the comparison runner](scripts/compare-harnesses.mjs). Prepare an empty temporary
+directory, then run each harness against its isolated snapshot:
+
+```sh
+trial_dir=$(mktemp -d /var/tmp/knut-comparison.XXXXXX)
+node scripts/compare-harnesses.mjs prepare "$trial_dir"
+node scripts/compare-harnesses.mjs run "$trial_dir" knut high
+node scripts/compare-harnesses.mjs run "$trial_dir" ante high
+node scripts/compare-harnesses.mjs verify "$trial_dir" knut high
+node scripts/compare-harnesses.mjs verify "$trial_dir" ante high
+```
+
+Requires Linux Bubblewrap, Node, Ante and a built `target/debug/knut`.
+Live runs use credentials from the environment or local `.env` and may incur
+provider charges. Both use GLM-5.3 Flash on the coding-plan endpoint with the
+requested native effort. Prompts/tools differ by harness; this is a development
+pilot, not proof of Jev savings. Logs and diffs can contain repository content.
+The source repository is mounted read-only and masked inside the test sandbox;
+edits happen only in the temporary copies. Compiler caches remain writable.
+
+## Interactive CLI
+
+Run `knut` in a terminal (or `knut tui`) to open a coding session. The main
+screen is one conversation, a compact status line, and an input that grows with
+your draft. Jobs, routing details, and changes open only when requested.
+
+Type a task and press Enter. During a task, the next message goes through the
+runtime's steering/queue handling. Approvals are shown above the input; sending
+a message while an approval is pending preserves the draft.
+
+| Key | Action |
 | --- | --- |
-| `Enter` | submit the composed task |
-| `Ctrl+J` | newline in the composer |
-| `Tab` | cycle focus (composer → transcript → state) |
-| `↑` `↓` `PgUp` `PgDn` `Home` `End` | scroll the transcript |
-| `a` / `d` | approve or deny a gated action |
-| `c` / `p` / `r` | cancel / pause / resume the running task |
-| `v` | review: recorded changes and check evidence |
-| `V` | run the workspace's real checks now |
-| `i` | decision inspector (System 0/1 provenance) |
-| `:` | command palette (every entry states whether it exists) |
-| `1` `2` `3` | transcript / state / jobs on narrow terminals |
-| `F1` / `?` | help |
-| `q` / `Ctrl+C` | quit, restoring the terminal |
+| Enter | Send a task, answer a question, or follow up |
+| Shift+Enter | New line (Ctrl+J fallback for terminals without enhanced keyboard support) |
+| Up / Down | Move through input lines; recall history at its edges |
+| Ctrl+A / Ctrl+E | Start / end of input line |
+| Ctrl+Z / Ctrl+Y | Undo / redo, including an idle draft cleared with Ctrl+C |
+| / at empty input, Ctrl+P, Ctrl+K | Search working commands |
+| Up / Down, Enter in commands | Select and run a command |
+| Ctrl+R | Open/close recorded changes and checks |
+| Ctrl+O | Open/close jobs and queued requests |
+| Ctrl+B | Open/close decision details |
+| PgUp / PgDn | Scroll the conversation or current detail view |
+| Tab / Shift+Tab | Switch input and conversation navigation |
+| Esc | Close a detail view or return to the latest output |
+| Alt+A / Alt+D | Allow / deny the exact pending approval |
+| Ctrl+C | Close an overlay; otherwise stop work, clear an idle draft, or exit |
+| Ctrl+D | Exit when idle with an empty draft |
+| ? / F1 | Quick shortcut modal (`?` with empty input; F1 anytime) |
+
+In changes, Left/Right selects a file, Up/Down selects a hunk, and PgUp/PgDn
+scrolls it. The review is read-only; it does not pretend to revert applied edits.
+Use the command menu for pause, resume, cancel, setup diagnostics, and checks.
+
+The theme uses warm text, muted teal accents, and explicit state labels. It
+adapts to truecolor, 256 colors, 16 colors, and `NO_COLOR`; configure
+`KNUT_TUI_COLORS=truecolor|256|16|none` to override detection. Bracketed paste
+does not submit text, and the terminal is restored on exit.
+
+See [CLI_UX.md](CLI_UX.md) for the design and remaining usability work.
 
 ## Commands
 
@@ -215,15 +242,16 @@ this commit), on Linux:
 
 **Known limitations, stated rather than implied:**
 
-- `knut run` wires the real provider, workspace tools, gate, sandbox and
-  check runner, and executes a validated plan. On the fixture used here,
-  the model's plan asked to pass a *search result* as a `read` node's
-  `path`, which the plan language cannot express: `$ref` substitutes a
-  whole value, and a search result is not a path string. The node failed
-  and the task honestly reported "not verified" instead of claiming
-  success. Extracting a typed field out of a referenced artifact is
-  future work; until then, `run` is a real harness that may not
-  autonomously complete every task, and never pretends otherwise.
+- TUI, `run`, and JSONL now drive the same session runtime. It performs
+  real reads/edits, resumes exact approved plans, and runs repository checks
+  against the edited revision. Failed checks and tool failures have a bounded
+  repair budget. This integration is regression-tested; the earlier measured
+  Ante pilot used the previous standalone CLI loop.
+- Check discovery currently covers Rust and a basic TypeScript/Node profile;
+  project-specific scripts and other package managers need richer setup support.
+- Typed artifact references support JSON-pointer projections, including a
+  search hit's path and a read's content hash. Unsupported or missing selected
+  values fail explicitly.
 - `bench` is a pilot: six fixture tasks, all offline. It is not the
   30-task held-out evaluation the roadmap calls for.
 - Language servers are reported but never started implicitly; LSP

@@ -39,6 +39,7 @@ pub enum ReasoningEffort {
     Low,
     Medium,
     High,
+    Max,
 }
 
 impl ReasoningEffort {
@@ -47,6 +48,7 @@ impl ReasoningEffort {
             ReasoningEffort::Low => "low",
             ReasoningEffort::Medium => "medium",
             ReasoningEffort::High => "high",
+            ReasoningEffort::Max => "max",
         }
     }
 }
@@ -107,10 +109,17 @@ impl ProviderConfig {
         base_url: impl Into<String>,
         model: impl Into<String>,
     ) -> Self {
+        let base_url = base_url.into().trim_end_matches('/').to_owned();
+        let model = model.into();
+        let supports_reasoning_effort = matches!(model.as_str(), "glm-5.3" | "glm-5.3-flash")
+            && matches!(
+                base_url.as_str(),
+                "https://api.z.ai/api/coding/paas/v4" | "https://api.z.ai/api/paas/v4"
+            );
         Self {
             api_key: api_key.into(),
-            base_url: base_url.into().trim_end_matches('/').to_owned(),
-            model: model.into(),
+            base_url,
+            model,
             tier: ModelTier::Reasoner,
             timeout: Duration::from_secs(120),
             billing: BillingPath::Unknown,
@@ -118,8 +127,8 @@ impl ProviderConfig {
             // commonly use `reasoning_content` too, and `reasoning` is
             // accepted as an alternate when reported.
             reasoning_field: "reasoning_content".to_owned(),
-            supports_reasoning_effort: false,
-            reasoning_effort: None,
+            supports_reasoning_effort,
+            reasoning_effort: supports_reasoning_effort.then_some(ReasoningEffort::Max),
             supports_usage_in_stream: true,
         }
     }
@@ -192,12 +201,39 @@ impl ProviderConfig {
     /// Keys are read from the environment, never from the repository.
     pub fn from_env() -> Result<Self, KnutError> {
         let api_key = std::env::var("KNUT_PROVIDER_API_KEY")
+            .or_else(|_| std::env::var("ZAI_API_KEY"))
             .map_err(|_| KnutError::Model("KNUT_PROVIDER_API_KEY is not set".to_owned()))?;
         let base_url = std::env::var("KNUT_PROVIDER_BASE_URL")
             .unwrap_or_else(|_| "https://api.z.ai/api/coding/paas/v4".to_owned());
         let model =
             std::env::var("KNUT_PROVIDER_MODEL").unwrap_or_else(|_| "glm-5.3-flash".to_owned());
         let mut config = Self::new(api_key, base_url, model);
+        if let Ok(seconds) = std::env::var("KNUT_PROVIDER_TIMEOUT_SECONDS") {
+            let seconds = seconds
+                .parse::<u64>()
+                .ok()
+                .filter(|value| *value > 0)
+                .ok_or_else(|| {
+                    KnutError::Model(
+                        "KNUT_PROVIDER_TIMEOUT_SECONDS must be a positive integer".to_owned(),
+                    )
+                })?;
+            config.timeout = Duration::from_secs(seconds);
+        }
+        if let Ok(effort) = std::env::var("KNUT_PROVIDER_REASONING_EFFORT") {
+            config.reasoning_effort = Some(match effort.as_str() {
+                "low" => ReasoningEffort::Low,
+                "medium" => ReasoningEffort::Medium,
+                "high" => ReasoningEffort::High,
+                "max" => ReasoningEffort::Max,
+                _ => {
+                    return Err(KnutError::Model(
+                        "reasoning effort must be low/medium/high/max".to_owned(),
+                    ));
+                }
+            });
+        }
+        config.validate_reasoning()?;
         if let Ok(tier) = std::env::var("KNUT_PROVIDER_TIER") {
             config.tier = match tier.to_ascii_lowercase().as_str() {
                 "fast" => ModelTier::Fast,
@@ -211,6 +247,27 @@ impl ProviderConfig {
             };
         }
         Ok(config)
+    }
+
+    fn validate_reasoning(&self) -> Result<(), KnutError> {
+        if self.reasoning_effort.is_some() && !self.supports_reasoning_effort {
+            return Err(KnutError::Model(
+                "reasoning effort is not supported by this configured endpoint/model".to_owned(),
+            ));
+        }
+        if self.model.starts_with("glm-5.3")
+            && self.reasoning_effort == Some(ReasoningEffort::Medium)
+        {
+            return Err(KnutError::Model(
+                "GLM-5.3 reasoning effort must be low/high/max; choose an explicit native level"
+                    .to_owned(),
+            ));
+        }
+        Ok(())
+    }
+
+    pub fn reasoning_effort(&self) -> Option<&'static str> {
+        self.reasoning_effort.map(ReasoningEffort::as_str)
     }
 
     /// A secret-free summary for `doctor` and logs.
@@ -265,6 +322,7 @@ impl std::fmt::Debug for OpenAiCompatibleModel {
 
 impl OpenAiCompatibleModel {
     pub fn new(config: ProviderConfig) -> Result<Self, KnutError> {
+        config.validate_reasoning()?;
         // No redirects: a redirect is exactly how credentials would cross
         // origins.
         let http = reqwest::Client::builder()
@@ -346,6 +404,9 @@ impl OpenAiCompatibleModel {
             && let Some(effort) = self.config.reasoning_effort
         {
             body["reasoning_effort"] = json!(effort.as_str());
+            if self.config.model.starts_with("glm-5.3") {
+                body["thinking"] = json!({"type": "enabled"});
+            }
         }
 
         let _ = ExpectedArtifact::Json; // shape contract stays with the caller
@@ -1524,6 +1585,36 @@ mod tests {
     }
 
     #[test]
+    fn glm_native_reasoning_levels_are_sent_and_unsupported_levels_refused() {
+        for effort in [
+            ReasoningEffort::Low,
+            ReasoningEffort::High,
+            ReasoningEffort::Max,
+        ] {
+            let model = OpenAiCompatibleModel::new(
+                ProviderConfig::glm_coding("k").with_reasoning_effort(effort),
+            )
+            .unwrap();
+            let body = model.body(&ModelRequest::new("x", ExpectedArtifact::Text), false, None);
+            assert_eq!(body["reasoning_effort"], effort.as_str());
+            assert_eq!(body["thinking"]["type"], "enabled");
+        }
+        assert!(
+            OpenAiCompatibleModel::new(
+                ProviderConfig::glm_coding("k").with_reasoning_effort(ReasoningEffort::Medium)
+            )
+            .is_err()
+        );
+        assert!(
+            OpenAiCompatibleModel::new(
+                ProviderConfig::new("k", "http://localhost:1234", "unknown")
+                    .with_reasoning_effort(ReasoningEffort::High)
+            )
+            .is_err()
+        );
+    }
+
+    #[test]
     fn capability_report_is_honest_about_reasoning_controls() {
         let model = OpenAiCompatibleModel::new(ProviderConfig::glm_coding("k")).unwrap();
         let caps = model.capabilities();
@@ -1531,9 +1622,7 @@ mod tests {
         assert!(caps.tools);
         assert!(caps.continuation);
         assert!(caps.usage);
-        // GLM's coding endpoint does not accept `reasoning_effort` here,
-        // so the report must not claim it.
-        assert!(!caps.reasoning);
+        assert!(caps.reasoning);
     }
 
     #[test]

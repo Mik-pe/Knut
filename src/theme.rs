@@ -106,27 +106,24 @@ pub struct Palette {
 
 impl Default for Palette {
     fn default() -> Self {
-        // A night-city palette: near-black blues for surfaces, one hot
-        // cyan for "the machine is doing something", and a warm rose for
-        // anything the user must not miss.
         Self {
-            bg: (0x07, 0x0A, 0x10),
-            bg_panel: (0x0B, 0x11, 0x19),
-            bg_raise: (0x11, 0x1A, 0x25),
-            bg_sel: (0x16, 0x23, 0x33),
-            border: (0x1E, 0x2C, 0x3C),
-            border_focus: (0x22, 0xD3, 0xEE),
-            text: (0xDC, 0xE7, 0xF5),
-            dim: (0x7A, 0x8C, 0xA3),
-            faint: (0x46, 0x56, 0x69),
-            cyan: (0x22, 0xD3, 0xEE),
-            sky: (0x38, 0xBD, 0xF8),
-            violet: (0xA7, 0x8B, 0xFA),
-            magenta: (0xF4, 0x72, 0xB6),
-            lime: (0xA3, 0xE6, 0x35),
-            green: (0x4A, 0xDE, 0x80),
-            amber: (0xFB, 0xBF, 0x24),
-            rose: (0xFB, 0x71, 0x85),
+            bg: (0x17, 0x19, 0x1C),
+            bg_panel: (0x17, 0x19, 0x1C),
+            bg_raise: (0x20, 0x23, 0x27),
+            bg_sel: (0x2B, 0x38, 0x38),
+            border: (0x3C, 0x42, 0x46),
+            border_focus: (0x8B, 0xC5, 0xB5),
+            text: (0xE5, 0xE2, 0xDC),
+            dim: (0xAA, 0xAF, 0xAD),
+            faint: (0x80, 0x88, 0x89),
+            cyan: (0x8B, 0xC5, 0xB5),
+            sky: (0x93, 0xB7, 0xD0),
+            violet: (0xB5, 0xA6, 0xCF),
+            magenta: (0xC5, 0xA1, 0xB5),
+            lime: (0xB8, 0xC5, 0x91),
+            green: (0xA2, 0xC2, 0x9B),
+            amber: (0xE2, 0xBC, 0x7D),
+            rose: (0xE0, 0x95, 0x95),
         }
     }
 }
@@ -272,6 +269,10 @@ impl Theme {
         match self.level {
             ColorLevel::TrueColor => Color::Rgb(rgb.0, rgb.1, rgb.2),
             ColorLevel::Ansi256 => Color::Indexed(to_ansi256(rgb)),
+            ColorLevel::Ansi16 if rgb == self.palette.green => Color::Green,
+            ColorLevel::Ansi16 if rgb == self.palette.rose => Color::LightRed,
+            ColorLevel::Ansi16 if rgb == self.palette.amber => Color::Yellow,
+            ColorLevel::Ansi16 if rgb == self.palette.cyan => Color::Cyan,
             ColorLevel::Ansi16 => to_ansi16(rgb),
             ColorLevel::Mono => Color::Reset,
         }
@@ -561,26 +562,27 @@ mod tests {
 
     #[test]
     fn ansi16_keeps_roles_distinguishable() {
-        let palette = Palette::default();
+        let theme = Theme::for_level(ColorLevel::Ansi16);
+        let palette = theme.palette;
         // The roles that must never be confused on a 16-colour terminal.
         assert!(matches!(
-            to_ansi16(palette.green),
+            theme.color(palette.green),
             Color::Green | Color::LightGreen
         ));
         assert!(matches!(
-            to_ansi16(palette.rose),
+            theme.color(palette.rose),
             Color::Red | Color::LightRed
         ));
         assert!(matches!(
-            to_ansi16(palette.amber),
+            theme.color(palette.amber),
             Color::Yellow | Color::LightYellow
         ));
         assert!(matches!(
-            to_ansi16(palette.cyan),
+            theme.color(palette.cyan),
             Color::Cyan | Color::LightCyan
         ));
         // Success and failure must stay apart.
-        assert_ne!(to_ansi16(palette.green), to_ansi16(palette.rose));
+        assert_ne!(theme.color(palette.green), theme.color(palette.rose));
     }
 
     #[test]
@@ -601,8 +603,8 @@ mod tests {
         let text: String = spans.iter().map(|s| s.content.to_string()).collect();
         assert_eq!(text, "KNUT");
         // Ends are exactly the ramp endpoints.
-        assert_eq!(spans[0].style.fg, Some(Color::Rgb(0x22, 0xD3, 0xEE)));
-        assert_eq!(spans[3].style.fg, Some(Color::Rgb(0xF4, 0x72, 0xB6)));
+        assert_eq!(spans[0].style.fg, Some(theme.color(theme.palette.cyan)));
+        assert_eq!(spans[3].style.fg, Some(theme.color(theme.palette.magenta)));
         // And it is monotonic in between: no duplicated stops.
         assert_ne!(spans[1].style.fg, spans[2].style.fg);
     }

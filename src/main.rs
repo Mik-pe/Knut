@@ -97,10 +97,17 @@ async fn run(args: Vec<String>) -> Result<(), KnutError> {
     let mut confidence_floor: Option<f32> = None;
     let mut backend = String::from("static");
     let mut approve_writes = false;
+    let mut census_path = None;
 
     let mut iter = args.into_iter();
     let Some(command) = iter.next() else {
-        return Err(KnutError::SystemOne(usage()));
+        if std::io::IsTerminal::is_terminal(&std::io::stdin())
+            && std::io::IsTerminal::is_terminal(&std::io::stdout())
+        {
+            return tui().await;
+        }
+        println!("{}", usage());
+        return Ok(());
     };
 
     while let Some(arg) = iter.next() {
@@ -110,6 +117,11 @@ async fn run(args: Vec<String>) -> Result<(), KnutError> {
             // a write blocks and the exact approval key is printed.
             "--yes" | "-y" => approve_writes = true,
             "--json" => as_json = true,
+            "--census" => {
+                census_path = Some(iter.next().ok_or_else(|| {
+                    KnutError::Tool("--census needs a new output file path".to_owned())
+                })?);
+            }
             "--capability" | "-c" => {
                 let value = iter
                     .next()
@@ -133,6 +145,11 @@ async fn run(args: Vec<String>) -> Result<(), KnutError> {
         }
     }
 
+    if census_path.is_some() && command != "run" {
+        return Err(KnutError::Tool(
+            "--census is supported only by knut run".to_owned(),
+        ));
+    }
     let system_one = match backend.as_str() {
         "static" => SystemOneBackend::Static(MockIngress),
         "jev" => SystemOneBackend::Jev(Arc::new(JevSystemOne::new(TypeSafeConfig::from_env()?)?)),
@@ -169,7 +186,15 @@ async fn run(args: Vec<String>) -> Result<(), KnutError> {
         "bench" => bench().await,
         "lsp" => lsp_status().await,
         "jsonl" => headless_jsonl(&positionals).await,
-        "run" => coding_run(&positionals, verbose, approve_writes).await,
+        "run" => {
+            coding_run_with_census(
+                &positionals,
+                verbose,
+                approve_writes,
+                census_path.as_deref(),
+            )
+            .await
+        }
         "release" => release_artifacts().await,
         "--help" | "-h" | "help" => {
             println!("{}", usage());
@@ -183,27 +208,31 @@ async fn run(args: Vec<String>) -> Result<(), KnutError> {
 }
 
 fn usage() -> String {
-    "knut playground
+    "Knut — a coding agent for your terminal
 
 USAGE:
-  knut route <prompt> [--capability <id>]... [--confidence <f32>] [--verbose] [--json]
-  knut repl [--capability <id>]... [--verbose]
-  knut demo-tree [--verbose]
-  knut eval
-  knut doctor [--live]
-  knut verify [--json]     run the workspace's real checks for the current revision
-  knut tui                 open the workbench shell (Ratatui)
+  knut                     open the interactive coding session
+  knut run <prompt> [--yes]  run one coding task (--yes approves writes)
+                           --census <new.json> records generator calls, including failures
+  knut tui                 open the interactive coding session explicitly
+  knut doctor [--live]      diagnose setup (--live calls configured providers)
+  knut verify [--json]      run build, test and lint checks
   knut bench               run the pilot benchmark and write an inspectable report
   knut lsp                 report language-server availability and negotiated features
   knut jsonl [prompt]      headless JSONL: commands on stdin, events on stdout
-  knut run <prompt> [--yes]  run one real coding task: provider + tools + checks
   knut release             print versioned release artifact instructions
   knut sessions list       list stored sessions
   knut sessions show <id>  replay a stored transcript (state only)
   knut sessions export <id> [--raw]  export without executing anything
   knut sessions plan <id>  report whether a session can be resumed
 
-System One backends (--backend):
+OFFLINE PLAYGROUND:
+  knut route <prompt> [--capability <id>]... [--confidence <f32>] [--verbose] [--json]
+  knut repl [--capability <id>]... [--verbose]
+  knut demo-tree [--verbose]
+  knut eval
+
+Playground backends (--backend):
   static (default)   deterministic mock, fully offline
   jev                live TypeSafe System One API; reads TYPESAFE_API_KEY,
                      optional TYPESAFE_BASE_URL / TYPESAFE_MODEL
@@ -692,47 +721,63 @@ async fn bench() -> Result<(), KnutError> {
 /// commands are read line by line from stdin.
 async fn headless_jsonl(positionals: &[String]) -> Result<(), KnutError> {
     let mut adapter = knut::HeadlessAdapter::new(format!("headless-{}", std::process::id()));
+    let (engine, _) = knut::build_here();
+    let (event_tx, mut events) = tokio::sync::mpsc::unbounded_channel();
+    let (command_tx, commands) = tokio::sync::mpsc::unbounded_channel();
+    let (input_tx, mut inputs) = tokio::sync::mpsc::unbounded_channel();
+    let one_shot = !positionals.is_empty();
+    if one_shot {
+        let _ = command_tx.send(knut::SessionCommand::Submit {
+            prompt: positionals.join(" "),
+        });
+    } else {
+        std::thread::spawn(move || {
+            use std::io::BufRead;
+            for line in std::io::stdin().lock().lines() {
+                if input_tx.send(line).is_err() {
+                    break;
+                }
+            }
+        });
+    }
     emit(&knut::HeadlessEvent::Ready {
         protocol_version: knut::JSONL_PROTOCOL_VERSION,
         session: adapter.session.id.clone(),
     });
-
-    // A one-shot prompt from the command line, for scripting.
-    if !positionals.is_empty() {
-        let prompt = positionals.join(" ");
-        let event = knut::SessionEvent::TaskStarted {
-            task: knut::TaskId(1),
-            prompt: prompt.clone(),
-        };
-        emit(&adapter.translate(&event));
-        let routed = adapter.outcome(&knut::SessionEvent::TaskFailed {
-            task: knut::TaskId(1),
-            reason: "no reasoner configured: set KNUT_PROVIDER_API_KEY to run tasks headlessly"
-                .to_owned(),
-        });
-        if let Some(routed) = routed {
-            emit(&routed);
+    let client = async move {
+        let mut command_tx = Some(command_tx);
+        loop {
+            tokio::select! {
+                event = events.recv() => {
+                    let Some(event) = event else { break; };
+                    emit(&adapter.translate(&event));
+                    let terminal = adapter.outcome(&event);
+                    if let Some(outcome) = &terminal { emit(outcome); }
+                    if one_shot && (terminal.is_some() || matches!(event, knut::SessionEvent::WaitingForUser { .. })) {
+                        command_tx.take();
+                    }
+                }
+                line = inputs.recv(), if !one_shot && command_tx.is_some() => {
+                    match line {
+                        Some(Ok(line)) if line.trim().is_empty() => {}
+                        Some(Ok(line)) => match adapter.handle_line(&line) {
+                            Ok(None) => { command_tx.take(); }
+                            Ok(Some(command)) => {
+                                let _ = command_tx.as_ref().unwrap().send(command);
+                            }
+                            Err(error) => emit(&knut::HeadlessEvent::Error { protocol_version: knut::JSONL_PROTOCOL_VERSION, error }),
+                        },
+                        Some(Err(error)) => {
+                            eprintln!("reading stdin: {error}");
+                            command_tx.take();
+                        }
+                        None => { command_tx.take(); }
+                    }
+                }
+            }
         }
-        return Ok(());
-    }
-
-    // Otherwise read commands from stdin, one JSON object per line.
-    use std::io::BufRead;
-    let stdin = std::io::stdin();
-    for line in stdin.lock().lines() {
-        let line = line.map_err(|err| KnutError::Tool(format!("reading stdin: {err}")))?;
-        if line.trim().is_empty() {
-            continue;
-        }
-        for event in adapter.handle_line(&line) {
-            emit(&event);
-        }
-    }
-
-    // stdin closed: the session stops.
-    for event in adapter.handle_line(r#"{"type":"close"}"#) {
-        emit(&event);
-    }
+    };
+    tokio::join!(knut::run_engine(engine, commands, event_tx), client);
     Ok(())
 }
 
@@ -788,254 +833,120 @@ async fn lsp_status() -> Result<(), KnutError> {
 /// and no accept-all verifier: it wires the configured provider, the real
 /// workspace tools, the mandatory gate, the sandboxed supervisor and the
 /// revision-bound check runner.
+async fn coding_run_with_census(
+    prompts: &[String],
+    verbose: bool,
+    yes: bool,
+    census_path: Option<&str>,
+) -> Result<(), KnutError> {
+    let Some(path) = census_path else {
+        return coding_run(prompts, verbose, yes).await;
+    };
+    let mut options = std::fs::OpenOptions::new();
+    options.write(true).create_new(true);
+    #[cfg(unix)]
+    {
+        use std::os::unix::fs::OpenOptionsExt;
+        options.mode(0o600);
+    }
+    let mut file = options
+        .open(path)
+        .map_err(|err| KnutError::Tool(format!("cannot create census {path:?}: {err}")))?;
+    let started = std::time::Instant::now();
+    let (result, calls) = knut::capture_model_calls(coding_run(prompts, verbose, yes)).await;
+    let report = knut::ModelCallReport::new(
+        calls,
+        result.is_ok(),
+        started.elapsed().as_millis().min(u64::MAX as u128) as u64,
+    );
+    serde_json::to_writer_pretty(&mut file, &report)
+        .map_err(|err| KnutError::Tool(format!("cannot write census {path:?}: {err}")))?;
+    file.sync_all()
+        .map_err(|err| KnutError::Tool(format!("cannot persist census {path:?}: {err}")))?;
+    eprintln!("generator census: {} calls → {path}", report.calls.len());
+    result
+}
+
 async fn coding_run(prompts: &[String], verbose: bool, yes: bool) -> Result<(), KnutError> {
-    if prompts.is_empty() {
+    let prompt = prompts.join(" ");
+    if prompt.trim().is_empty() {
         return Err(KnutError::Tool("knut run needs a prompt".to_owned()));
     }
-    let prompt = prompts.join(" ");
-
-    // Configuration: actionable guidance when something is missing, never
-    // a silent mock or an unexplained hang.
-    let provider_key = std::env::var("KNUT_PROVIDER_API_KEY")
-        .or_else(|_| std::env::var("ZAI_API_KEY"))
-        .map_err(|_| {
-            KnutError::Tool(
-                "no reasoner configured. Set KNUT_PROVIDER_API_KEY (and optionally \
-                 KNUT_PROVIDER_BASE_URL / KNUT_PROVIDER_MODEL), or ZAI_API_KEY for the \
-                 default Z.ai endpoint. Run `knut doctor` to check your setup."
-                    .to_owned(),
-            )
-        })?;
-    let provider_config = knut::ProviderConfig::from_env()
-        .unwrap_or_else(|_| knut::ProviderConfig::glm_coding(provider_key.clone()));
-    let model = knut::OpenAiCompatibleModel::new(provider_config.clone())?;
-
-    // Workspace and tools: the real bounded read/search/patch tools.
     let workspace = knut::Workspace::open(".")?;
-    let revision = {
-        let supervisor = Arc::new(knut::Supervisor::new(workspace.clone()));
-        knut::CheckRunner::new(workspace.clone(), supervisor, knut::CheckProfile::rust())
-            .current_revision("workspace")
-            .map(|revision| revision.revision)
-            .unwrap_or_else(|_| "unversioned".to_owned())
-    };
-
+    let (engine, report) = knut::build_with_write_approval(workspace, yes);
+    if let Some(reason) = report.unavailable {
+        return Err(KnutError::Tool(reason));
+    }
     println!("knut run: {prompt}");
-    println!("  workspace {}", workspace.root().display());
-    println!("  revision  {revision}");
     println!(
-        "  reasoner  {} ({})",
-        provider_config.model(),
-        provider_config.base_url()
+        "  reasoner  {}",
+        report.model.as_deref().unwrap_or("unavailable")
     );
-
-    // The engine: one cascade, one registry, one gate.
-    let cascade = Arc::new(knut::ComputeCascade::empty().with_reasoner(model));
-    let mut registry = knut::ToolRegistry::default();
-    knut::register_workspace_tools(&mut registry, workspace.clone())?;
-    let registry = Arc::new(registry);
-
-    let supervisor = Arc::new(knut::Supervisor::new(workspace.clone()));
-    println!(
-        "  sandbox   {:?}",
-        supervisor
-            .backend()
-            .map(|b| format!("{b:?}"))
-            .unwrap_or_else(|e| e.to_string())
-    );
-    println!("  tools     {}", registry.capabilities().join(", "));
-
-    // Jev at the coding-loop boundaries, when a key is configured.
-    let frames: Option<Arc<dyn knut::FrameRouter>> = match std::env::var("TYPESAFE_API_KEY") {
-        Ok(_) => match knut::JevSystemOne::new(knut::TypeSafeConfig::from_env()?) {
-            Ok(jev) => {
-                println!("  jev       configured (coding-loop decisions on)");
-                Some(Arc::new(jev))
+    println!("  checks    {}", report.checks.join(", "));
+    let (event_tx, mut events) = tokio::sync::mpsc::unbounded_channel();
+    let (command_tx, commands) = tokio::sync::mpsc::unbounded_channel();
+    let _ = command_tx.send(knut::SessionCommand::Submit { prompt });
+    let client = async move {
+        let mut command_tx = Some(command_tx);
+        let mut complete = false;
+        while let Some(event) = events.recv().await {
+            print_run_event(&event, verbose);
+            match event {
+                knut::SessionEvent::TaskCompleted { .. } => {
+                    complete = true;
+                    command_tx.take();
+                }
+                knut::SessionEvent::TaskFailed { .. }
+                | knut::SessionEvent::TaskCancelled { .. }
+                | knut::SessionEvent::WaitingForUser { .. } => {
+                    command_tx.take();
+                }
+                _ => {}
             }
-            Err(err) => {
-                println!("  jev       unavailable: {err}");
-                None
-            }
-        },
-        Err(_) => {
-            println!("  jev       not configured (deterministic decisions only)");
-            None
         }
+        complete
     };
-
-    // The real check contract: build/test gate completion, lint advisory.
-    let check_profile = knut::CheckProfile::rust();
-    let runner = Arc::new(knut::CheckRunner::new(
-        workspace.clone(),
-        Arc::clone(&supervisor),
-        check_profile.clone(),
-    ));
-    let requirements = runner.requirements();
-
-    let mut planner_registry = knut::ToolRegistry::default();
-    knut::register_workspace_tools(&mut planner_registry, workspace.clone())?;
-    println!(
-        "  checks    {}",
-        check_profile
-            .checks
-            .iter()
-            .map(|check| check.name.clone())
-            .collect::<Vec<_>>()
-            .join(", ")
-    );
-
-    // The gate: writes need approval unless the operator has explicitly
-    // trusted this run with `--yes`.
-    let gate = knut::ExecutionGate::new(if yes {
-        println!("  policy    writes pre-approved (--yes): the gate still records every action");
-        knut::SideEffectPolicy::new()
-            .allow(knut::SideEffect::ReadOnly)
-            .allow(knut::SideEffect::IdempotentWrite)
-    } else {
-        knut::SideEffectPolicy::new()
-            .allow(knut::SideEffect::ReadOnly)
-            .require_approval(knut::SideEffect::IdempotentWrite)
-    });
-    let gate = Arc::new(gate);
-
-    // The generator produces a plan for the requested work.
-    let context = knut::PlanningContext::from_registry(prompt.clone(), &planner_registry);
-    let verifier: Arc<dyn knut::Verifier> = Arc::new(knut::AcceptAllVerifier);
-    let validated = knut::Planner::new(Arc::clone(&cascade))
-        .plan(
-            &context,
-            &registry,
-            &[
-                knut::ModelTier::Fast,
-                knut::ModelTier::Standard,
-                knut::ModelTier::Reasoner,
-            ],
-            verifier.as_ref(),
-        )
-        .await?;
-    println!(
-        "  plan      {} node(s), depth {}",
-        validated.node_count, validated.depth
-    );
-    if verbose {
-        println!("{plan:#?}", plan = validated.plan);
-    }
-
-    if verbose {
-        println!("  plan detail:");
-        println!("{plan:#?}", plan = validated.plan);
-    }
-
-    // Execute the plan through the mandatory gate. A blocked write is
-    // surfaced with the exact fingerprint the operator would approve --
-    // never applied silently, and never reported as success.
-    let executor = knut::TreeExecutor::new(
-        Arc::clone(&registry),
-        Arc::clone(&gate),
-        Arc::clone(&cascade),
-        Arc::clone(&verifier),
-    );
-    let cancel = Arc::new(std::sync::atomic::AtomicBool::new(false));
-    let run = executor.run(&validated, cancel).await?;
-    println!();
-    println!("  execution:");
-    for (label, status) in &run.statuses {
-        let output = run
-            .outputs
-            .get(label)
-            .map(|value| value.to_string())
-            .unwrap_or_default();
-        let bounded: String = output.chars().take(200).collect();
-        println!("    {label}: {status:?} {bounded}");
-        // A failed node with no output is itself a diagnostic gap: say so
-        // rather than printing an empty line.
-        if *status == knut::NodeStatus::Failed && bounded.trim().is_empty() {
-            println!("      (the node failed without producing output)");
-        }
-    }
-
-    if run
-        .statuses
-        .values()
-        .any(|status| *status == knut::NodeStatus::Blocked)
-        && !yes
-    {
-        // Surface the exact pending action with its approval fingerprint.
-        if let Some(plan_node) = first_tool_input(&validated.plan) {
-            let (capability, tool_id, input) = plan_node;
-            if let Ok(metadata) = registry.find_exact(capability, tool_id)
-                && let Err(KnutError::ApprovalRequired { approval_key, .. }) = gate
-                    .authorize(&metadata, input, None, knut::Risk::Low)
-                    .await
-            {
-                println!();
-                println!("  approval required for {capability}/{tool_id}");
-                println!("  approval key: {approval_key}");
-                println!(
-                    "  re-run with --yes to approve writes for this run, or approve in the TUI"
-                );
-            }
-        }
-    }
-
-    // Run the real checks for this revision, so the outcome is
-    // evidence-gated rather than model-asserted.
-    println!("\n  running checks for revision {revision}...");
-    let check_revision = knut::ArtifactRevision::new("workspace", revision.clone());
-    let evidence = runner.run_all(&check_revision).await;
-    let report = knut::EvidenceReport::build(
-        &requirements,
-        check_revision.clone(),
-        evidence,
-        Vec::new(),
-        None,
-    );
-    print!("{}", report.summary());
-
-    if let Some(frames) = frames
-        && let Ok(decision) = knut::decide_continuation(
-            frames.as_ref(),
-            &knut::DecisionFrame::new(knut::FrameKind::Continuation, 1, 1, prompt.clone())
-                .with_unit("checks")
-                .with_observation(serde_json::json!({
-                    "completed": report.complete,
-                    "outstanding": report.outstanding,
-                }))
-                .with_remaining(report.outstanding.clone()),
-        )
-        .await
-    {
-        println!("  jev says {decision:?} for the check result");
-    }
-
-    if report.is_green() {
-        println!("\nverified: every blocking check passed for revision {revision}");
+    let (_, complete) = tokio::join!(knut::run_engine(engine, commands, event_tx), client);
+    if complete {
         Ok(())
     } else {
-        println!("\nnot verified: see the evidence above");
-        Err(KnutError::Tool(
-            "the task did not reach a verified state".to_owned(),
-        ))
+        Err(KnutError::Tool("The task did not reach a verified state. Use a TUI/JSONL session to answer questions or approve writes, or --yes to pre-approve writes in a new run".to_owned()))
     }
 }
 
-/// Find the first tool node in a plan, for surfacing its approval key.
-fn first_tool_input(plan: &knut::PlanNode) -> Option<(&str, &str, &serde_json::Value)> {
-    if let knut::PlanNode::Tool {
-        capability,
-        tool_id,
-        input,
-        ..
-    } = plan
-    {
-        return Some((capability, tool_id, input));
-    }
-    for child in plan.children() {
-        if let Some(found) = first_tool_input(child) {
-            return Some(found);
+fn print_run_event(event: &knut::SessionEvent, verbose: bool) {
+    match event {
+        knut::SessionEvent::Generating { .. } => println!("  generating..."),
+        knut::SessionEvent::PlanStarted { node_count, .. } => {
+            println!("  plan: {node_count} nodes")
         }
+        knut::SessionEvent::NodeResult {
+            node_label,
+            status,
+            output,
+            ..
+        } => {
+            println!("  {node_label}: {status:?}");
+            if verbose || *status != knut::NodeStatus::Succeeded {
+                println!(
+                    "    {}",
+                    output.to_string().chars().take(6000).collect::<String>()
+                );
+            }
+        }
+        knut::SessionEvent::ToolCallProposed {
+            name, arguments, ..
+        } => println!("  proposed {name}: {arguments}"),
+        knut::SessionEvent::TextDelta { text, .. } => print!("{text}"),
+        knut::SessionEvent::WaitingForUser { message, wait, .. } => {
+            println!("  {message} ({wait:?})")
+        }
+        knut::SessionEvent::TaskCompleted { summary, .. } => println!("\n{summary}"),
+        knut::SessionEvent::TaskFailed { reason, .. } => eprintln!("\nnot verified: {reason}"),
+        knut::SessionEvent::TaskCancelled { .. } => eprintln!("\ncancelled"),
+        knut::SessionEvent::RuntimeError { message, .. } => eprintln!("{message}"),
+        _ => {}
     }
-    None
 }
 
 /// `release`: the versioned artifact instructions and checksums.
@@ -1299,8 +1210,7 @@ async fn doctor(live: bool) -> Result<(), KnutError> {
         });
     match reasoner_key {
         Some(_) => {
-            let config = knut::ProviderConfig::from_env()
-                .unwrap_or_else(|_| knut::ProviderConfig::glm_coding(String::new()));
+            let config = knut::ProviderConfig::from_env()?;
             let summary = config.summary();
             println!(
                 "  reasoner:    configured (model {}, tier {:?}, billing {:?})",
@@ -1519,4 +1429,60 @@ fn print_metrics(label: &str, metrics: &Metrics) {
         metrics.estimated_cost,
         metrics.reasoner_turns
     );
+}
+
+#[cfg(test)]
+mod census_tests {
+    use super::*;
+
+    #[tokio::test]
+    async fn failed_run_exports_a_report_and_existing_output_is_preserved() {
+        let path = std::env::temp_dir().join(format!(
+            "knut-census-{}-{}.json",
+            std::process::id(),
+            std::time::SystemTime::now()
+                .duration_since(std::time::UNIX_EPOCH)
+                .unwrap()
+                .as_nanos(),
+        ));
+        let result = coding_run_with_census(&[], false, false, path.to_str()).await;
+        assert!(result.is_err());
+        let original = std::fs::read(&path).unwrap();
+        let report: knut::ModelCallReport = serde_json::from_slice(&original).unwrap();
+        assert!(!report.run_succeeded);
+        assert!(report.calls.is_empty());
+        #[cfg(unix)]
+        {
+            use std::os::unix::fs::PermissionsExt;
+            assert_eq!(
+                std::fs::metadata(&path).unwrap().permissions().mode() & 0o777,
+                0o600
+            );
+        }
+        assert!(
+            coding_run_with_census(&[], false, false, path.to_str())
+                .await
+                .is_err()
+        );
+        assert_eq!(std::fs::read(&path).unwrap(), original);
+        std::fs::remove_file(path).unwrap();
+    }
+
+    #[tokio::test]
+    async fn census_flag_requires_a_path_and_a_run_command() {
+        assert!(
+            run(vec!["run".to_owned(), "--census".to_owned()])
+                .await
+                .is_err()
+        );
+        assert!(
+            run(vec![
+                "tui".to_owned(),
+                "--census".to_owned(),
+                "unused.json".to_owned()
+            ])
+            .await
+            .is_err()
+        );
+    }
 }

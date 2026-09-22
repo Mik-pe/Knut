@@ -2,6 +2,7 @@ mod attach;
 mod bench;
 mod calibration;
 mod cards;
+mod census;
 mod completion;
 mod composer;
 mod concurrency;
@@ -61,6 +62,7 @@ pub use cards::{
     ActionCard, CardList, CardState, MAX_CARD_DETAIL, MAX_CARDS, sanitize_for_display,
     summarize_value,
 };
+pub use census::{CallOutcome, CallPurpose, ModelCallRecord, ModelCallReport, capture_model_calls};
 pub use completion::{
     ArtifactRevision, ArtifactVerifier, CompletionRequirements, Evidence, Requirement,
     gather_evidence,
@@ -79,7 +81,10 @@ pub use decision::{Action, Decision, DecisionInput, ModelTier, RetrievalSource, 
 pub use edge::{
     EdgeChoice, EdgeJudgment, EdgeRouter, EdgeSelector, EdgeState, MAX_STEP_ATTEMPTS, NodeOutcome,
 };
-pub use engine::{Engine, EngineReport, action_label, build_here, run_engine, source_label};
+pub use engine::{
+    Engine, EngineReport, action_label, build_here, build_with_write_approval, run_engine,
+    source_label,
+};
 pub use error::{KnutError, SystemOneFailure, redacted};
 pub use evals::{
     Benchmark, BenchmarkComparison, BenchmarkTask, CostModel, Expectation, Metrics,
@@ -181,8 +186,7 @@ pub use tree::{
 };
 pub use tui::{ShellAction, TerminalGuard, handle_key, run_shell};
 pub use tui_render::{
-    LayoutPlan, NARROW_WIDTH, Tab, plan_layout, render, render_review, render_review_themed,
-    render_themed,
+    LayoutPlan, Tab, plan_layout, render, render_review, render_review_themed, render_themed,
 };
 pub use tui_state::{
     Focus, MAX_ENTRY_CHARS, MAX_TIMELINE, PendingPrompt, TimelineEntry, TimelineKind,

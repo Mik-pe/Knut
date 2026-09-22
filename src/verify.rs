@@ -192,6 +192,27 @@ impl CheckProfile {
         }
     }
 
+    pub fn for_workspace(workspace: &Workspace) -> Result<Self, KnutError> {
+        let profiles = discover_profiles(workspace);
+        if profiles.is_empty() {
+            return Err(KnutError::Tool("No repository checks configured: expected Cargo.toml, package.json, or tsconfig.json".to_owned()));
+        }
+        let multiple = profiles.len() > 1;
+        let mut checks = Vec::new();
+        for profile in profiles {
+            for mut check in profile.checks {
+                if multiple {
+                    check.name = format!("{}:{}", profile.name, check.name);
+                }
+                checks.push(check);
+            }
+        }
+        Ok(Self {
+            name: "workspace".to_owned(),
+            checks,
+        })
+    }
+
     /// Whether this profile's primary toolchain is present.
     pub fn tool_available(&self) -> bool {
         self.checks
@@ -408,6 +429,10 @@ impl CheckRunner {
         }
     }
 
+    pub fn workspace(&self) -> &Workspace {
+        &self.workspace
+    }
+
     pub fn profile(&self) -> &CheckProfile {
         &self.profile
     }
@@ -418,7 +443,7 @@ impl CheckRunner {
         for check in &self.profile.checks {
             // Build and test gate completion; lint is advisory so a style
             // warning is visible without blocking a correct fix.
-            let blocking = matches!(check.name.as_str(), "build" | "test" | "typecheck");
+            let blocking = !matches!(check.name.rsplit(':').next(), Some("lint"));
             requirements =
                 requirements.require(check.name.clone(), check.description.clone(), blocking);
         }
@@ -490,14 +515,16 @@ impl CheckRunner {
                             "the command succeeded but produced none of its expected output markers"
                                 .to_owned(),
                         )
-                    } else if check.name == "test" && !counts.ran_any() {
+                    } else if check.name.rsplit(':').next() == Some("test") && !counts.ran_any() {
                         (
                             CheckOutcome::Inconclusive,
                             Some(*code),
                             None,
                             "the test runner reported no tests at all".to_owned(),
                         )
-                    } else if check.name == "test" && counts.failed.unwrap_or(0) > 0 {
+                    } else if check.name.rsplit(':').next() == Some("test")
+                        && counts.failed.unwrap_or(0) > 0
+                    {
                         (
                             CheckOutcome::Failed,
                             Some(*code),

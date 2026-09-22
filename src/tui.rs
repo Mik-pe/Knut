@@ -48,305 +48,290 @@ pub enum ShellAction {
 /// Pure and synchronous, so keyboard behaviour is unit-testable without a
 /// terminal.
 pub fn handle_key(state: &mut WorkbenchState, key: KeyEvent, tab: &mut Tab) -> ShellAction {
-    // Only key presses act; a release/repeat must not double-apply.
-    if key.kind != KeyEventKind::Press {
+    if key.kind == KeyEventKind::Release {
         return ShellAction::Continue;
     }
-
     let ctrl = key.modifiers.contains(KeyModifiers::CONTROL);
-
-    if ctrl {
-        return match key.code {
-            // Raw mode delivers Ctrl+C as a key rather than a signal in
-            // most terminals; both paths lead here.
-            KeyCode::Char('c') | KeyCode::Char('C') => ShellAction::Quit,
-            KeyCode::Char('j') => {
-                // Newline in the composer without submitting.
-                state.composer.insert_newline();
-                ShellAction::Continue
-            }
-            // Undo/redo: Ctrl+Z / Ctrl+Y.
-            KeyCode::Char('z') => {
-                state.composer.undo();
-                ShellAction::Continue
-            }
-            KeyCode::Char('y') => {
-                state.composer.redo();
-                ShellAction::Continue
-            }
-            KeyCode::Char('p') => ShellAction::Command(SessionCommand::Pause),
-            KeyCode::Char('r') => ShellAction::Command(SessionCommand::Resume),
-            _ => ShellAction::Continue,
-        };
+    let alt = key.modifiers.contains(KeyModifiers::ALT);
+    if key.kind == KeyEventKind::Repeat && (ctrl || alt || key.code == KeyCode::Enter) {
+        return ShellAction::Continue;
     }
-
+    if ctrl && key.code == KeyCode::Char('c') {
+        if state.help || state.palette_open() || state.review.is_some() || *tab != Tab::Timeline {
+            state.help = false;
+            state.close_palette();
+            state.review = None;
+            *tab = Tab::Timeline;
+            state.focus = Focus::Composer;
+        } else if state.task_state.is_some_and(|s| !s.is_terminal()) {
+            return ShellAction::Command(SessionCommand::Cancel);
+        } else if !state.composer.is_empty() {
+            state.clear_composer();
+            state.status = Some("Draft cleared · Ctrl+C again to quit".to_owned());
+        } else {
+            return ShellAction::Quit;
+        }
+        return ShellAction::Continue;
+    }
     if state.help {
-        // While help is open, only dismissal keys act.
         if matches!(key.code, KeyCode::Esc | KeyCode::F(1) | KeyCode::Char('?')) {
             state.help = false;
         }
         return ShellAction::Continue;
     }
-
-    // The palette owns the keyboard while it is open: a submit cannot
-    // fire from inside a command dialog.
     if state.palette_open() {
         return match key.code {
             KeyCode::Esc => {
                 state.close_palette();
                 ShellAction::Continue
             }
+            KeyCode::Up => {
+                state.palette_selection = state.palette_selection.saturating_sub(1);
+                ShellAction::Continue
+            }
+            KeyCode::Down => {
+                state.palette_selection = (state.palette_selection + 1)
+                    .min(state.palette_results().len().saturating_sub(1));
+                ShellAction::Continue
+            }
             KeyCode::Backspace => {
                 if let Some(query) = state.palette.as_mut() {
                     query.pop();
                 }
+                state.palette_selection = 0;
                 ShellAction::Continue
             }
-            KeyCode::Char(c) => {
+            KeyCode::Char(c) if !ctrl && !alt => {
                 if let Some(query) = state.palette.as_mut() {
                     query.push(c);
                 }
+                state.palette_selection = 0;
                 ShellAction::Continue
             }
             KeyCode::Enter => {
-                // Only an implemented command can be selected; the palette
-                // never pretends an unavailable entry worked.
                 let selected = state
                     .palette_results()
-                    .into_iter()
-                    .find(|command| command.is_available());
-                state.close_palette();
+                    .get(state.palette_selection)
+                    .cloned();
                 match selected {
-                    Some(command) => ShellAction::PaletteCommand(command.id),
-                    None => ShellAction::Continue,
+                    Some(command) if command.is_available() => {
+                        state.close_palette();
+                        palette_action(state, tab, command.id)
+                    }
+                    _ => ShellAction::Continue,
                 }
             }
             _ => ShellAction::Continue,
         };
     }
-
-    match key.code {
-        KeyCode::F(1) | KeyCode::Char('?') if state.focus != Focus::Composer => {
-            state.help = true;
-            ShellAction::Continue
-        }
-        // The inspector: optional, and off the ordinary transcript.
-        KeyCode::Char('i') if state.focus == Focus::Inspector => {
-            state.show_inspector = !state.show_inspector;
-            ShellAction::Continue
-        }
-        // The palette: every listed command states whether it exists.
-        KeyCode::Char(':') if state.focus != Focus::Composer => {
-            state.open_palette();
-            ShellAction::Continue
-        }
-        // Review navigation when a review is open: the review owns the
-        // keyboard, so a hunk decision cannot be confused with composing.
-        KeyCode::Char('j')
-        | KeyCode::Char('k')
-        | KeyCode::Char('n')
-        | KeyCode::Char('p')
-        | KeyCode::Char('r')
-        | KeyCode::Char('y')
-            if state.review.is_some() && state.focus != Focus::Composer =>
-        {
-            let Some(review) = state.review.as_mut() else {
-                return ShellAction::Continue;
-            };
-            match key.code {
-                KeyCode::Char('j') => review.next_hunk(),
-                KeyCode::Char('k') => review.previous_hunk(),
-                KeyCode::Char('n') => review.next_file(),
-                KeyCode::Char('p') => review.previous_file(),
-                // `r` rejects the current hunk; `y` keeps it again.
-                KeyCode::Char('r') => {
-                    review.reject_current_hunk();
-                }
-                KeyCode::Char('y') => {
-                    review.keep_current_hunk();
-                }
-                _ => {}
+    if key.code == KeyCode::F(1)
+        || (key.code == KeyCode::Char('?')
+            && !ctrl
+            && !alt
+            && (state.composer.text().is_empty() || state.review.is_some()))
+    {
+        state.help = true;
+        return ShellAction::Continue;
+    }
+    if ctrl {
+        return match key.code {
+            KeyCode::Char('p') | KeyCode::Char('k') => {
+                state.open_palette();
+                ShellAction::Continue
             }
-            ShellAction::Continue
-        }
-        // `v` toggles the review workspace: it shows the session's recorded
-        // changes and checks, and closes when already open.
-        KeyCode::Char('v') if state.focus != Focus::Composer => ShellAction::Review,
-        // `V` runs the workspace's real checks now, so the user can verify
-        // the current revision without waiting for the agent to ask.
-        KeyCode::Char('V') if state.focus != Focus::Composer => ShellAction::Verify,
-        KeyCode::Esc => {
-            state.focus = Focus::Timeline;
-            ShellAction::Continue
-        }
-        KeyCode::Tab => {
-            // Cycle focus: composer -> timeline -> inspector -> composer.
-            state.focus = match state.focus {
-                Focus::Composer => Focus::Timeline,
-                Focus::Timeline => Focus::Inspector,
-                Focus::Inspector => Focus::Composer,
-            };
-            ShellAction::Continue
-        }
-        KeyCode::Char('i') if state.focus != Focus::Composer => {
-            state.focus = Focus::Composer;
-            ShellAction::Continue
-        }
-        // A plain quit key, independent of terminal signal handling.
-        KeyCode::Char('q') if state.focus != Focus::Composer => ShellAction::Quit,
-        KeyCode::Char('c') if state.focus != Focus::Composer => {
-            ShellAction::Command(SessionCommand::Cancel)
-        }
-        KeyCode::Char('p') if state.focus != Focus::Composer => {
-            ShellAction::Command(SessionCommand::Pause)
-        }
-        KeyCode::Char('r') if state.focus != Focus::Composer => {
-            ShellAction::Command(SessionCommand::Resume)
-        }
-        KeyCode::Char('a') if state.focus != Focus::Composer => match &state.pending {
-            Some(pending) => match &pending.kind {
-                crate::session::WaitKind::Approval { approval_key } => {
-                    ShellAction::Command(SessionCommand::Approve {
-                        approval_key: approval_key.clone(),
-                    })
-                }
-                crate::session::WaitKind::Question => ShellAction::Continue,
-            },
-            None => ShellAction::Continue,
-        },
-        KeyCode::Char('d') if state.focus != Focus::Composer => match &state.pending {
-            Some(pending) => match &pending.kind {
-                crate::session::WaitKind::Approval { approval_key } => {
-                    ShellAction::Command(SessionCommand::Deny {
-                        approval_key: approval_key.clone(),
-                    })
-                }
-                crate::session::WaitKind::Question => ShellAction::Continue,
-            },
-            None => ShellAction::Continue,
-        },
-        KeyCode::Up => {
-            if state.focus == Focus::Composer {
-                state.composer.up();
-            } else {
-                state.follow = false;
-                state.selection = state.selection.saturating_sub(1);
+            KeyCode::Char('r') => ShellAction::Review,
+            KeyCode::Char('o') => {
+                state.detail_scroll = 0;
+                *tab = if *tab == Tab::Tasks {
+                    Tab::Timeline
+                } else {
+                    Tab::Tasks
+                };
+                state.focus = Focus::Composer;
+                ShellAction::Continue
             }
-            ShellAction::Continue
-        }
-        KeyCode::Down => {
-            if state.focus == Focus::Composer {
-                state.composer.down();
-            } else {
-                state.selection = (state.selection + 1).min(state.timeline.len().saturating_sub(1));
-                if state.selection + 1 >= state.timeline.len() {
-                    state.follow = true;
-                }
+            KeyCode::Char('b') => {
+                state.detail_scroll = 0;
+                *tab = if *tab == Tab::Inspector {
+                    Tab::Timeline
+                } else {
+                    Tab::Inspector
+                };
+                state.focus = Focus::Composer;
+                ShellAction::Continue
             }
-            ShellAction::Continue
-        }
-        KeyCode::PageUp if state.focus != Focus::Composer => {
-            state.follow = false;
-            state.selection = state.selection.saturating_sub(10);
-            ShellAction::Continue
-        }
-        KeyCode::PageDown if state.focus != Focus::Composer => {
-            state.selection = (state.selection + 10).min(state.timeline.len().saturating_sub(1));
-            if state.selection + 1 >= state.timeline.len() {
-                state.follow = true;
+            KeyCode::Char('d')
+                if state.composer.is_empty()
+                    && !state.task_state.is_some_and(|s| !s.is_terminal()) =>
+            {
+                ShellAction::Quit
             }
-            ShellAction::Continue
-        }
-        KeyCode::Left => {
-            if state.focus == Focus::Composer {
-                state.composer.left();
-            }
-            ShellAction::Continue
-        }
-        KeyCode::Right => {
-            if state.focus == Focus::Composer {
-                state.composer.right();
-            }
-            ShellAction::Continue
-        }
-        KeyCode::Home => {
-            if state.focus == Focus::Composer {
+            KeyCode::Char('a') if state.review.is_none() => {
                 state.composer.home();
-            } else {
-                // Outside the composer, Home/End jump to the ends of the
-                // transcript; End also re-arms following the tail.
-                state.follow = false;
-                state.selection = 0;
+                ShellAction::Continue
             }
-            ShellAction::Continue
-        }
-        KeyCode::End => {
-            if state.focus == Focus::Composer {
+            KeyCode::Char('e') if state.review.is_none() => {
                 state.composer.end();
-            } else {
+                ShellAction::Continue
+            }
+            KeyCode::Char('j') if state.review.is_none() => {
+                state.composer.insert_newline();
+                ShellAction::Continue
+            }
+            KeyCode::Char('z') if state.review.is_none() => {
+                state.composer.undo();
+                ShellAction::Continue
+            }
+            KeyCode::Char('y') if state.review.is_none() => {
+                state.composer.redo();
+                ShellAction::Continue
+            }
+            KeyCode::End => {
+                state.resume_follow();
+                ShellAction::Continue
+            }
+            _ => ShellAction::Continue,
+        };
+    }
+    if alt {
+        if let Some(pending) = &state.pending
+            && let crate::session::WaitKind::Approval { approval_key } = &pending.kind
+        {
+            return match key.code {
+                KeyCode::Char('a') => ShellAction::Command(SessionCommand::Approve {
+                    approval_key: approval_key.clone(),
+                }),
+                KeyCode::Char('d') => ShellAction::Command(SessionCommand::Deny {
+                    approval_key: approval_key.clone(),
+                }),
+                _ => ShellAction::Continue,
+            };
+        }
+        return ShellAction::Continue;
+    }
+    if key.code == KeyCode::Esc {
+        state.review = None;
+        *tab = Tab::Timeline;
+        state.focus = Focus::Composer;
+        state.resume_follow();
+        return ShellAction::Continue;
+    }
+    if let Some(review) = state.review.as_mut() {
+        match key.code {
+            KeyCode::PageUp => review.scroll = review.scroll.saturating_sub(10),
+            KeyCode::PageDown => review.scroll = review.scroll.saturating_add(10),
+            KeyCode::Down | KeyCode::Char('j') => review.next_hunk(),
+            KeyCode::Up | KeyCode::Char('k') => review.previous_hunk(),
+            KeyCode::Right | KeyCode::Char('n') => review.next_file(),
+            KeyCode::Left | KeyCode::Char('p') => review.previous_file(),
+            _ => {}
+        }
+        return ShellAction::Continue;
+    }
+    match key.code {
+        KeyCode::PageUp if *tab != Tab::Timeline => {
+            state.detail_scroll = state.detail_scroll.saturating_sub(10);
+        }
+        KeyCode::PageDown if *tab != Tab::Timeline => {
+            state.detail_scroll = state.detail_scroll.saturating_add(10);
+        }
+        KeyCode::PageUp => {
+            state.follow = false;
+            state.transcript_scroll = state.transcript_scroll.saturating_add(10);
+        }
+        KeyCode::PageDown => {
+            state.transcript_scroll = state.transcript_scroll.saturating_sub(10);
+            if state.transcript_scroll == 0 {
                 state.resume_follow();
             }
-            ShellAction::Continue
         }
-        KeyCode::Delete => {
-            if state.focus == Focus::Composer {
-                state.composer.delete();
-            }
-            ShellAction::Continue
+        KeyCode::Tab | KeyCode::BackTab => {
+            state.focus = if state.focus == Focus::Composer {
+                Focus::Timeline
+            } else {
+                Focus::Composer
+            };
+            *tab = Tab::Timeline;
         }
-        KeyCode::Backspace => {
-            if state.focus == Focus::Composer {
-                state.composer.backspace();
-            }
-            ShellAction::Continue
+        KeyCode::Up if state.focus != Focus::Composer => {
+            state.follow = false;
+            state.selection = state.selection.saturating_sub(1);
+        }
+        KeyCode::Down if state.focus != Focus::Composer => {
+            state.selection = (state.selection + 1).min(state.timeline.len().saturating_sub(1));
+            state.follow = state.selection + 1 >= state.timeline.len();
+        }
+        KeyCode::Up => state.composer.up(),
+        KeyCode::Down => state.composer.down(),
+        KeyCode::Left => state.composer.left(),
+        KeyCode::Right => state.composer.right(),
+        KeyCode::Home => state.composer.home(),
+        KeyCode::End => state.composer.end(),
+        KeyCode::Delete => state.composer.delete(),
+        KeyCode::Backspace => state.composer.backspace(),
+        KeyCode::Enter if key.modifiers.contains(KeyModifiers::SHIFT) => {
+            state.composer.insert_newline()
         }
         KeyCode::Enter => {
-            if state.focus != Focus::Composer {
-                return ShellAction::Continue;
-            }
-            let Some(text) = state.composer.take_submission() else {
-                return ShellAction::Continue;
-            };
-            // A pending question is answered. Otherwise: while a task is
-            // active, a short directive steers it and anything else is
-            // queued for the next task — the user chose which, and the
-            // session revision mechanism is what validates the steering.
-            match &state.pending {
-                Some(pending) if pending.kind == crate::session::WaitKind::Question => {
-                    ShellAction::Command(SessionCommand::Answer { value: text })
-                }
-                Some(_) => ShellAction::Continue,
-                None => {
-                    if state.task_state.is_some_and(|s| !s.is_terminal()) {
-                        ShellAction::Command(SessionCommand::SteerOrQueue { text })
-                    } else {
-                        ShellAction::Command(SessionCommand::Submit { prompt: text })
-                    }
-                }
-            }
+            *tab = Tab::Timeline;
+            state.focus = Focus::Composer;
+            return submit_composer(state);
         }
-        KeyCode::Char(c) if state.focus == Focus::Composer => {
+        KeyCode::Char('/') if state.composer.is_empty() => state.open_palette(),
+        KeyCode::Char(c) => {
+            state.focus = Focus::Composer;
+            *tab = Tab::Timeline;
             state.composer.insert(&c.to_string());
-            ShellAction::Continue
         }
-        // On narrow layouts, digits select panes directly.
-        KeyCode::Char(c) if tabbed_shortcut(c).is_some() => {
-            if let Some(selected) = tabbed_shortcut(c) {
-                *tab = selected;
-            }
-            ShellAction::Continue
-        }
-        _ => ShellAction::Continue,
+        _ => {}
+    }
+    ShellAction::Continue
+}
+
+fn submit_composer(state: &mut WorkbenchState) -> ShellAction {
+    if state
+        .pending
+        .as_ref()
+        .is_some_and(|p| matches!(p.kind, crate::session::WaitKind::Approval { .. }))
+    {
+        state.status = Some("Approval needed: Alt+A allow · Alt+D deny. Draft kept.".to_owned());
+        return ShellAction::Continue;
+    }
+    let Some(text) = state.composer.take_submission() else {
+        return ShellAction::Continue;
+    };
+    state.resume_follow();
+    if state.pending.is_some() {
+        ShellAction::Command(SessionCommand::Answer { value: text })
+    } else if state.task_state.is_some_and(|s| !s.is_terminal()) {
+        ShellAction::Command(SessionCommand::SteerOrQueue { text })
+    } else {
+        ShellAction::Command(SessionCommand::Submit { prompt: text })
     }
 }
 
-/// Digit shortcuts for the tabbed (narrow) layout.
-fn tabbed_shortcut(c: char) -> Option<Tab> {
-    match c {
-        '1' => Some(Tab::Timeline),
-        '2' => Some(Tab::Inspector),
-        '3' => Some(Tab::Tasks),
-        _ => None,
+fn palette_action(state: &mut WorkbenchState, tab: &mut Tab, id: &'static str) -> ShellAction {
+    match id {
+        "submit" | "steer" => {
+            *tab = Tab::Timeline;
+            state.focus = Focus::Composer;
+            submit_composer(state)
+        }
+        "review" => ShellAction::Review,
+        "verify" => ShellAction::Verify,
+        "jobs" => {
+            *tab = Tab::Tasks;
+            ShellAction::Continue
+        }
+        "decisions" => {
+            *tab = Tab::Inspector;
+            ShellAction::Continue
+        }
+        "help" => {
+            state.help = true;
+            ShellAction::Continue
+        }
+        _ => ShellAction::PaletteCommand(id),
     }
 }
 
@@ -370,7 +355,14 @@ impl TerminalGuard {
     pub fn enter() -> std::io::Result<Self> {
         let mut stdout = std::io::stdout();
         enable_raw_mode()?;
-        execute!(stdout, EnterAlternateScreen)?;
+        execute!(
+            stdout,
+            EnterAlternateScreen,
+            crossterm::event::EnableBracketedPaste,
+            crossterm::event::PushKeyboardEnhancementFlags(
+                crossterm::event::KeyboardEnhancementFlags::DISAMBIGUATE_ESCAPE_CODES
+            )
+        )?;
         let backend = CrosstermBackend::new(stdout);
         // A fixed viewport means no cursor-position query is needed, and
         // the full-screen layout still comes from the real terminal size.
@@ -421,7 +413,12 @@ impl Drop for TerminalGuard {
 fn restore_terminal() -> std::io::Result<()> {
     disable_raw_mode()?;
     let mut stdout = std::io::stdout();
-    execute!(stdout, LeaveAlternateScreen)?;
+    execute!(
+        stdout,
+        crossterm::event::PopKeyboardEnhancementFlags,
+        crossterm::event::DisableBracketedPaste,
+        LeaveAlternateScreen
+    )?;
     terminal::disable_raw_mode()?;
     Ok(())
 }
@@ -611,11 +608,6 @@ pub async fn run_shell(
                         ShellAction::Command(command) => {
                             let _ = commands.send(command);
                         }
-                        ShellAction::PaletteCommand("submit") => {
-                            if let Some(text) = state.composer.take_submission() {
-                                let _ = commands.send(SessionCommand::Submit { prompt: text });
-                            }
-                        }
                         ShellAction::PaletteCommand("pause") => {
                             let _ = commands.send(SessionCommand::Pause);
                         }
@@ -625,42 +617,12 @@ pub async fn run_shell(
                         ShellAction::PaletteCommand("cancel") => {
                             let _ = commands.send(SessionCommand::Cancel);
                         }
-                        ShellAction::PaletteCommand("steer") => {
-                            if let Some(text) = state.composer.take_submission() {
-                                let _ = commands.send(SessionCommand::SteerOrQueue { text });
-                            }
-                        }
-                        ShellAction::PaletteCommand("help") => {
-                            state.help = true;
-                        }
-                        ShellAction::PaletteCommand("verify") => {
-                            if checks.get().is_none() {
-                                checks.start();
-                                state.status = Some("running checks…".to_owned());
-                                let tx = check_tx.clone();
-                                tokio::spawn(async move {
-                                    let outcome = run_checks_blocking().await;
-                                    let _ = tx.send(outcome);
-                                });
-                            }
-                        }
-                        ShellAction::PaletteCommand("review") => {
-                            let known = state.known_checks();
-                            let files = state.review_changes();
-                            if known.is_empty() && files.is_empty() {
-                                state.status =
-                                    Some("no changes or checks to review yet".to_owned());
-                            } else {
-                                let mut view = crate::review::ReviewView::new(files);
-                                view.checks = known;
-                                state.review = Some(view);
-                            }
-                        }
                         ShellAction::PaletteCommand("doctor") => {
                             // The shell already knows its own engine
                             // configuration; reporting it needs no
                             // subprocess and no invented task.
-                            state.status = Some(state.setup_summary());
+                            state.show_setup();
+                            tab = Tab::Timeline;
                         }
                         ShellAction::Verify => {
                             // The checks are the binary's real ones, run
@@ -707,8 +669,17 @@ pub async fn run_shell(
                         ShellAction::PaletteCommand(_) | ShellAction::Continue => {}
                     }
                 }
-                Event::Resize(_, _) => {
-                    // The next draw uses the new area; nothing to do here.
+                Event::Paste(text) => {
+                    if !state.help && !state.palette_open() && state.review.is_none() {
+                        state.composer.paste(&text);
+                        state.focus = Focus::Composer;
+                        tab = Tab::Timeline;
+                    }
+                }
+                Event::Resize(cols, rows) => {
+                    guard
+                        .terminal()
+                        .resize(ratatui::layout::Rect::new(0, 0, cols, rows))?;
                 }
                 _ => {}
             }
@@ -764,6 +735,37 @@ mod tests {
     }
 
     #[test]
+    fn question_mark_opens_shortcuts_but_remains_punctuation_in_a_draft() {
+        let mut state = WorkbenchState::new("/tmp/ws");
+        let mut tab = Tab::Timeline;
+        handle_key(&mut state, key(KeyCode::Char('?')), &mut tab);
+        assert!(state.help);
+        assert!(state.composer.text().is_empty());
+        handle_key(&mut state, key(KeyCode::Esc), &mut tab);
+        state.composer.insert("why");
+        handle_key(&mut state, key(KeyCode::Char('?')), &mut tab);
+        assert_eq!(state.composer.text(), "why?");
+        assert!(!state.help);
+    }
+
+    #[test]
+    fn shift_enter_inserts_a_newline_without_submitting() {
+        let mut state = WorkbenchState::new("/tmp/ws");
+        let mut tab = Tab::Timeline;
+        state.composer.insert("first");
+        assert_eq!(
+            handle_key(
+                &mut state,
+                KeyEvent::new(KeyCode::Enter, KeyModifiers::SHIFT),
+                &mut tab
+            ),
+            ShellAction::Continue
+        );
+        state.composer.insert("second");
+        assert_eq!(state.composer.text(), "first\nsecond");
+    }
+
+    #[test]
     fn ctrl_j_inserts_a_newline_without_submitting() {
         let mut state = WorkbenchState::new("/tmp/ws");
         state.focus = Focus::Composer;
@@ -815,13 +817,21 @@ mod tests {
         let mut tab = Tab::Timeline;
 
         assert_eq!(
-            handle_key(&mut state, key(KeyCode::Char('a')), &mut tab),
+            handle_key(
+                &mut state,
+                KeyEvent::new(KeyCode::Char('a'), KeyModifiers::ALT),
+                &mut tab
+            ),
             ShellAction::Command(SessionCommand::Approve {
                 approval_key: "fingerprint-1".to_owned()
             })
         );
         assert_eq!(
-            handle_key(&mut state, key(KeyCode::Char('d')), &mut tab),
+            handle_key(
+                &mut state,
+                KeyEvent::new(KeyCode::Char('d'), KeyModifiers::ALT),
+                &mut tab
+            ),
             ShellAction::Command(SessionCommand::Deny {
                 approval_key: "fingerprint-1".to_owned()
             })
@@ -850,43 +860,40 @@ mod tests {
     }
 
     #[test]
-    fn keys_pressed_while_not_composing_do_not_type() {
+    fn typing_returns_to_composer_without_command_modes() {
         let mut state = WorkbenchState::new("/tmp/ws");
         state.focus = Focus::Timeline;
-        let mut tab = Tab::Timeline;
-
+        let mut tab = Tab::Tasks;
         for c in "cancel and resume".chars() {
-            handle_key(&mut state, key(KeyCode::Char(c)), &mut tab);
+            assert_eq!(
+                handle_key(&mut state, key(KeyCode::Char(c)), &mut tab),
+                ShellAction::Continue
+            );
         }
-        // Nothing landed in the composer: those were commands.
-        assert!(state.is_composer_empty());
+        assert_eq!(state.composer_text(), "cancel and resume");
+        assert_eq!(tab, Tab::Timeline);
     }
 
     #[test]
-    fn cancel_pause_and_resume_reach_the_session() {
+    fn interrupt_cancels_work_then_clears_draft_then_exits() {
         let mut state = WorkbenchState::new("/tmp/ws");
-        state.focus = Focus::Timeline;
         let mut tab = Tab::Timeline;
-
+        state.composer.insert("keep this");
+        state.task_state = Some(crate::session::TaskState::Running);
         assert_eq!(
-            handle_key(&mut state, key(KeyCode::Char('c')), &mut tab),
+            handle_key(&mut state, ctrl('c'), &mut tab),
             ShellAction::Command(SessionCommand::Cancel)
         );
+        assert_eq!(state.composer_text(), "keep this");
+        state.task_state = Some(crate::session::TaskState::Cancelled);
         assert_eq!(
-            handle_key(&mut state, key(KeyCode::Char('p')), &mut tab),
-            ShellAction::Command(SessionCommand::Pause)
+            handle_key(&mut state, ctrl('c'), &mut tab),
+            ShellAction::Continue
         );
+        assert!(state.composer.is_empty());
         assert_eq!(
-            handle_key(&mut state, key(KeyCode::Char('r')), &mut tab),
-            ShellAction::Command(SessionCommand::Resume)
-        );
-        assert_eq!(
-            handle_key(&mut state, ctrl('p'), &mut tab),
-            ShellAction::Command(SessionCommand::Pause)
-        );
-        assert_eq!(
-            handle_key(&mut state, ctrl('r'), &mut tab),
-            ShellAction::Command(SessionCommand::Resume)
+            handle_key(&mut state, ctrl('c'), &mut tab),
+            ShellAction::Quit
         );
     }
 
@@ -912,21 +919,12 @@ mod tests {
     }
 
     #[test]
-    fn focus_cycles_through_the_panes() {
+    fn tab_switches_only_between_conversation_and_input() {
         let mut state = WorkbenchState::new("/tmp/ws");
-        state.focus = Focus::Composer;
         let mut tab = Tab::Timeline;
-
         handle_key(&mut state, key(KeyCode::Tab), &mut tab);
         assert_eq!(state.focus, Focus::Timeline);
         handle_key(&mut state, key(KeyCode::Tab), &mut tab);
-        assert_eq!(state.focus, Focus::Inspector);
-        handle_key(&mut state, key(KeyCode::Tab), &mut tab);
-        assert_eq!(state.focus, Focus::Composer);
-
-        // `i` returns to the composer from a read-only pane.
-        handle_key(&mut state, key(KeyCode::Tab), &mut tab);
-        handle_key(&mut state, key(KeyCode::Char('i')), &mut tab);
         assert_eq!(state.focus, Focus::Composer);
     }
 
@@ -957,14 +955,17 @@ mod tests {
     }
 
     #[test]
-    fn numeric_shortcuts_select_tabs_on_narrow_layouts() {
+    fn detail_shortcuts_work_from_the_composer_and_escape_restores_it() {
         let mut state = WorkbenchState::new("/tmp/ws");
-        state.focus = Focus::Timeline;
+        state.composer.insert("draft");
         let mut tab = Tab::Timeline;
-        handle_key(&mut state, key(KeyCode::Char('3')), &mut tab);
+        handle_key(&mut state, ctrl('o'), &mut tab);
         assert_eq!(tab, Tab::Tasks);
-        handle_key(&mut state, key(KeyCode::Char('2')), &mut tab);
+        handle_key(&mut state, ctrl('b'), &mut tab);
         assert_eq!(tab, Tab::Inspector);
+        handle_key(&mut state, key(KeyCode::Esc), &mut tab);
+        assert_eq!(tab, Tab::Timeline);
+        assert_eq!(state.composer_text(), "draft");
     }
 
     #[test]
@@ -973,9 +974,9 @@ mod tests {
         state.focus = Focus::Timeline;
         let mut tab = Tab::Timeline;
 
-        // Open with ':'; typing filters the catalog.
+        // Filtering must not leak text into the draft.
         assert_eq!(
-            handle_key(&mut state, key(KeyCode::Char(':')), &mut tab),
+            handle_key(&mut state, ctrl('p'), &mut tab),
             ShellAction::Continue
         );
         assert!(state.palette_open());
@@ -993,22 +994,45 @@ mod tests {
     }
 
     #[test]
-    fn a_submit_inside_the_palette_does_not_fire() {
+    fn palette_navigation_and_dismissal_preserve_the_draft() {
         let mut state = WorkbenchState::new("/tmp/ws");
-        state.focus = Focus::Composer;
         let mut tab = Tab::Timeline;
         state.composer.insert("a queued prompt");
-
-        // Open the palette, then press Enter: nothing is submitted and the
-        // composer keeps its text.
-        state.open_palette();
-        handle_key(&mut state, key(KeyCode::Enter), &mut tab);
-        assert_eq!(state.composer_text(), "a queued prompt");
-
-        // Escape closes it and the composer still has the text.
+        handle_key(&mut state, ctrl('p'), &mut tab);
+        handle_key(&mut state, key(KeyCode::Down), &mut tab);
+        assert_eq!(state.palette_selection, 1);
+        let id = state.palette_results()[1].id;
+        assert_eq!(id, "steer");
         handle_key(&mut state, key(KeyCode::Esc), &mut tab);
         assert!(!state.palette_open());
         assert_eq!(state.composer_text(), "a queued prompt");
+    }
+
+    #[test]
+    fn approval_enter_never_discards_the_draft() {
+        let mut state = WorkbenchState::new("/tmp/ws");
+        state.pending = Some(crate::tui_state::PendingPrompt {
+            kind: WaitKind::Approval {
+                approval_key: "exact".into(),
+            },
+            message: "Write file?".into(),
+        });
+        state.composer.insert("my follow-up");
+        assert_eq!(
+            handle_key(&mut state, key(KeyCode::Enter), &mut Tab::Timeline),
+            ShellAction::Continue
+        );
+        assert_eq!(state.composer_text(), "my follow-up");
+    }
+
+    #[test]
+    fn help_owns_editing_shortcuts_and_opens_while_composing() {
+        let mut state = WorkbenchState::new("/tmp/ws");
+        let mut tab = Tab::Timeline;
+        handle_key(&mut state, key(KeyCode::F(1)), &mut tab);
+        assert!(state.help);
+        handle_key(&mut state, ctrl('j'), &mut tab);
+        assert!(state.composer.is_empty());
     }
 
     #[test]
@@ -1019,11 +1043,12 @@ mod tests {
 
         // Search for a command that is explicitly unavailable.
         state.open_palette();
-        for c in "review".chars() {
+        for c in "model".chars() {
             handle_key(&mut state, key(KeyCode::Char(c)), &mut tab);
         }
         let action = handle_key(&mut state, key(KeyCode::Enter), &mut tab);
         // No palette command fires: the entry is honestly unavailable.
-        assert_ne!(action, ShellAction::PaletteCommand("review"));
+        assert_eq!(action, ShellAction::Continue);
+        assert!(state.palette_open());
     }
 }

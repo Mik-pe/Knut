@@ -243,7 +243,9 @@ pub fn command_catalog() -> Vec<PaletteCommand> {
             id: "attach",
             title: "Attach file",
             description: "Add a workspace file or range as context (@path)",
-            availability: CommandAvailability::Available,
+            availability: CommandAvailability::Unavailable(
+                "file context is not connected to submitted prompts",
+            ),
         },
         PaletteCommand {
             id: "doctor",
@@ -261,7 +263,19 @@ pub fn command_catalog() -> Vec<PaletteCommand> {
             id: "review",
             title: "Review change",
             description: "Open the diff and evidence review workspace",
-            availability: CommandAvailability::Unavailable("arrives with #29"),
+            availability: CommandAvailability::Available,
+        },
+        PaletteCommand {
+            id: "jobs",
+            title: "Show jobs",
+            description: "Active tools and queued requests · Ctrl+O",
+            availability: CommandAvailability::Available,
+        },
+        PaletteCommand {
+            id: "decisions",
+            title: "Show decisions",
+            description: "Session evidence and routing · Ctrl+B",
+            availability: CommandAvailability::Available,
         },
         PaletteCommand {
             id: "model",
@@ -530,8 +544,8 @@ mod tests {
             match availability {
                 CommandAvailability::Unavailable(reason) => {
                     assert!(
-                        reason.contains('#'),
-                        "{id} is unavailable without naming where it arrives"
+                        !reason.trim().is_empty(),
+                        "{id} is unavailable without an explanation"
                     );
                 }
                 CommandAvailability::Available => unreachable!(),

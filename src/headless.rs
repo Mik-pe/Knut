@@ -366,54 +366,25 @@ impl HeadlessAdapter {
         self.generation
     }
 
-    /// Handle one input line, returning the lines to write.
-    pub fn handle_line(&mut self, line: &str) -> Vec<HeadlessEvent> {
+    pub fn handle_line(&mut self, line: &str) -> Result<Option<SessionCommand>, ProtocolError> {
         if self.session.is_closed() {
-            // A disconnected client cannot dispatch new work.
-            return vec![HeadlessEvent::Error {
-                protocol_version: JSONL_PROTOCOL_VERSION,
-                error: ProtocolError::Malformed {
-                    detail: "the session is closed; no further commands are accepted".to_owned(),
-                },
-            }];
+            return Err(ProtocolError::Malformed {
+                detail: "the session is closed; no further commands are accepted".to_owned(),
+            });
         }
-
-        let command = match HeadlessCommand::parse(line) {
-            Ok(command) => command,
-            Err(error) => {
-                return vec![HeadlessEvent::Error {
-                    protocol_version: JSONL_PROTOCOL_VERSION,
-                    error,
-                }];
-            }
-        };
-
+        let command = HeadlessCommand::parse(line)?;
         if command == HeadlessCommand::Close {
             self.session.disconnect();
-            return vec![HeadlessEvent::Outcome {
-                protocol_version: JSONL_PROTOCOL_VERSION,
-                state: HeadlessOutcome::Cancelled,
-                reason: Some("the client closed the input".to_owned()),
-            }];
+            return Ok(None);
         }
-
-        // Approvals are checked against the exact pending fingerprint
-        // before they become an engine command.
-        if let HeadlessCommand::Approve { approval_key } = &command
-            && let Err(refusal) = self.session.check_approval(approval_key)
-        {
-            return vec![HeadlessEvent::Error {
-                protocol_version: JSONL_PROTOCOL_VERSION,
-                error: ProtocolError::Malformed {
+        if let HeadlessCommand::Approve { approval_key } = &command {
+            self.session
+                .check_approval(approval_key)
+                .map_err(|refusal| ProtocolError::Malformed {
                     detail: refusal.to_string(),
-                },
-            }];
+                })?;
         }
-
-        match command.to_session_command() {
-            Some(_) => vec![],
-            None => vec![],
-        }
+        Ok(command.to_session_command())
     }
 
     /// Translate one engine event into the headless vocabulary.
@@ -1128,25 +1099,14 @@ mod tests {
     #[test]
     fn a_malformed_line_is_a_protocol_error_not_a_task_failure() {
         let mut adapter = HeadlessAdapter::new("s1");
-        let events = adapter.handle_line("{not json");
-        assert_eq!(events.len(), 1);
-        match &events[0] {
-            HeadlessEvent::Error { error, .. } => {
-                assert!(error.is_protocol_error());
-                assert!(matches!(error, ProtocolError::Malformed { .. }));
-            }
-            other => panic!("expected a protocol error, got {other:?}"),
-        }
-
-        // An oversized line is refused with the bound named.
+        let error = adapter.handle_line("{not json").unwrap_err();
+        assert!(error.is_protocol_error());
+        assert!(matches!(error, ProtocolError::Malformed { .. }));
         let huge = "x".repeat(MAX_LINE_BYTES + 10);
-        match &adapter.handle_line(&huge)[0] {
-            HeadlessEvent::Error {
-                error: ProtocolError::OversizedLine { bytes, limit },
-                ..
-            } => {
-                assert!(*bytes > MAX_LINE_BYTES);
-                assert_eq!(*limit, MAX_LINE_BYTES);
+        match adapter.handle_line(&huge).unwrap_err() {
+            ProtocolError::OversizedLine { bytes, limit } => {
+                assert!(bytes > MAX_LINE_BYTES);
+                assert_eq!(limit, MAX_LINE_BYTES);
             }
             other => panic!("expected an oversized-line error, got {other:?}"),
         }
@@ -1166,22 +1126,23 @@ mod tests {
     #[test]
     fn stdin_close_stops_the_session() {
         let mut adapter = HeadlessAdapter::new("s1");
-        adapter.handle_line(r#"{"type":"submit","prompt":"do work"}"#);
-        assert!(!adapter.session.is_closed());
-
-        let events = adapter.handle_line(r#"{"type":"close"}"#);
-        assert!(adapter.session.is_closed());
         assert!(matches!(
-            &events[0],
-            HeadlessEvent::Outcome {
-                state: HeadlessOutcome::Cancelled,
-                ..
-            }
+            adapter.handle_line(r#"{"type":"submit","prompt":"do work"}"#).unwrap(),
+            Some(SessionCommand::Submit { prompt }) if prompt == "do work"
         ));
-
-        // A disconnected client cannot dispatch new work.
-        let after = adapter.handle_line(r#"{"type":"submit","prompt":"more"}"#);
-        assert!(matches!(&after[0], HeadlessEvent::Error { .. }));
+        assert!(!adapter.session.is_closed());
+        assert!(
+            adapter
+                .handle_line(r#"{"type":"close"}"#)
+                .unwrap()
+                .is_none()
+        );
+        assert!(adapter.session.is_closed());
+        assert!(
+            adapter
+                .handle_line(r#"{"type":"submit","prompt":"more"}"#)
+                .is_err()
+        );
     }
 
     #[test]
@@ -1475,12 +1436,14 @@ mod tests {
 
         // A different key is refused before it reaches the engine.
         let refused = adapter.handle_line(r#"{"type":"approve","approval_key":"other"}"#);
-        assert!(matches!(&refused[0], HeadlessEvent::Error { .. }));
+        assert!(refused.is_err());
 
         // The exact key is accepted.
         let accepted =
             adapter.handle_line(r#"{"type":"approve","approval_key":"exact-fingerprint"}"#);
-        assert!(accepted.is_empty());
+        assert!(
+            matches!(accepted.unwrap(), Some(SessionCommand::Approve { approval_key }) if approval_key == "exact-fingerprint")
+        );
     }
 
     #[test]
@@ -1507,7 +1470,7 @@ mod tests {
 
         // So the old fingerprint is refused.
         let refused = adapter.handle_line(r#"{"type":"approve","approval_key":"old"}"#);
-        assert!(matches!(&refused[0], HeadlessEvent::Error { .. }));
+        assert!(refused.is_err());
     }
 
     #[test]
