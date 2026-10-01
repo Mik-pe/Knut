@@ -15,6 +15,9 @@
 
 use unicode_segmentation::UnicodeSegmentation;
 
+mod memory;
+pub(crate) use memory::ComposerMemory;
+
 /// Maximum characters accepted from one paste.
 ///
 /// Pasted code can be huge; the composer keeps a bounded amount in the
@@ -42,6 +45,7 @@ pub struct Composer {
     history: Vec<String>,
     /// Current position while browsing history, if browsing.
     history_cursor: Option<usize>,
+    history_draft: Option<Snapshot>,
     /// Whether the last paste was truncated.
     pub last_paste_truncated: bool,
 }
@@ -63,6 +67,7 @@ impl Default for Composer {
             redo: Vec::new(),
             history: Vec::new(),
             history_cursor: None,
+            history_draft: None,
             last_paste_truncated: false,
         }
     }
@@ -260,12 +265,72 @@ impl Composer {
         }
     }
 
+    pub fn word_left(&mut self) {
+        (self.cursor_row, self.cursor_col) = self.word_left_target();
+    }
+
+    fn word_left_target(&self) -> (usize, usize) {
+        let mut row = self.cursor_row;
+        let mut col = self.cursor_col;
+        if col == 0 && row > 0 {
+            row -= 1;
+            col = self.lines[row].graphemes(true).count();
+        }
+        let graphemes: Vec<_> = self.lines[row].graphemes(true).collect();
+        while col > 0 && graphemes[col - 1].chars().all(char::is_whitespace) {
+            col -= 1;
+        }
+        while col > 0 && !graphemes[col - 1].chars().all(char::is_whitespace) {
+            col -= 1;
+        }
+        (row, col)
+    }
+
+    pub fn word_right(&mut self) {
+        if self.cursor_col == self.current_graphemes() && self.cursor_row + 1 < self.lines.len() {
+            self.cursor_row += 1;
+            self.cursor_col = 0;
+        }
+        let graphemes: Vec<_> = self.lines[self.cursor_row].graphemes(true).collect();
+        while self.cursor_col < graphemes.len()
+            && graphemes[self.cursor_col].chars().all(char::is_whitespace)
+        {
+            self.cursor_col += 1;
+        }
+        while self.cursor_col < graphemes.len()
+            && !graphemes[self.cursor_col].chars().all(char::is_whitespace)
+        {
+            self.cursor_col += 1;
+        }
+    }
+
+    pub fn delete_word_left(&mut self) {
+        let (row, col) = self.word_left_target();
+        if (row, col) == self.cursor() {
+            return;
+        }
+        self.checkpoint();
+        let head: String = self.lines[row].graphemes(true).take(col).collect();
+        let tail: String = self
+            .current_line()
+            .graphemes(true)
+            .skip(self.cursor_col)
+            .collect();
+        self.lines.splice(row..=self.cursor_row, [head + &tail]);
+        self.cursor_row = row;
+        self.cursor_col = col;
+        self.history_cursor = None;
+    }
+
     /// Move up a line, keeping the cursor in range.
     pub fn up(&mut self) {
         if self.cursor_row > 0 {
             self.cursor_row -= 1;
             self.cursor_col = self.cursor_col.min(self.current_graphemes());
         } else if let Some(index) = self.history_previous() {
+            if self.history_cursor.is_none() {
+                self.history_draft = Some(self.snapshot());
+            }
             self.history_cursor = Some(index);
             self.load_history(index);
         }
@@ -284,9 +349,9 @@ impl Composer {
                 }
                 None => {
                     self.history_cursor = None;
-                    self.lines = vec![String::new()];
-                    self.cursor_row = 0;
-                    self.cursor_col = 0;
+                    if let Some(draft) = self.history_draft.take() {
+                        self.restore(draft);
+                    }
                 }
             }
         }
@@ -308,27 +373,48 @@ impl Composer {
     /// to the bound) and never auto-submits. Truncation is reported so the
     /// user knows the buffer is not the whole paste.
     pub fn paste(&mut self, text: &str) {
-        let incoming = text.chars().count();
-        let available = MAX_COMPOSER_CHARS.saturating_sub(self.len_chars());
-        let (accepted, truncated) = if incoming > available {
-            let bounded: String = text.chars().take(available).collect();
-            (bounded, true)
-        } else {
-            (text.to_owned(), false)
-        };
-        self.last_paste_truncated = truncated;
-
+        let normalized = text.replace("\r\n", "\n");
+        let available = MAX_COMPOSER_CHARS
+            .saturating_sub(self.len_chars())
+            .min(MAX_PASTE_CHARS);
+        let mut characters = 0;
+        let mut newlines = 0;
+        let mut end = 0;
+        for (offset, grapheme) in normalized.grapheme_indices(true) {
+            let cost = grapheme.chars().count();
+            let lines = usize::from(grapheme == "\n");
+            if characters + cost > available || self.lines.len() + newlines + lines > 10_000 {
+                break;
+            }
+            characters += cost;
+            newlines += lines;
+            end = offset + grapheme.len();
+        }
+        self.last_paste_truncated = end < normalized.len();
+        if end == 0 {
+            return;
+        }
         self.checkpoint();
-        // A paste with newlines becomes multiple lines rather than being
-        // mangled into one.
-        let mut parts = accepted.split('\n');
-        if let Some(first) = parts.next() {
-            self.insert(first);
-        }
-        for part in parts {
-            self.insert_newline();
-            self.insert(part);
-        }
+        let head: String = self
+            .current_line()
+            .graphemes(true)
+            .take(self.cursor_col)
+            .collect();
+        let tail: String = self
+            .current_line()
+            .graphemes(true)
+            .skip(self.cursor_col)
+            .collect();
+        let mut inserted: Vec<String> = normalized[..end].split('\n').map(str::to_owned).collect();
+        inserted[0].insert_str(0, &head);
+        let last = inserted.len() - 1;
+        let col = inserted[last].graphemes(true).count();
+        inserted[last].push_str(&tail);
+        self.lines
+            .splice(self.cursor_row..=self.cursor_row, inserted);
+        self.cursor_row += last;
+        self.cursor_col = col;
+        self.history_cursor = None;
     }
 
     pub fn clear(&mut self) {
@@ -350,6 +436,7 @@ impl Composer {
             self.history.remove(0);
         }
         self.history_cursor = None;
+        self.history_draft = None;
         self.lines = vec![String::new()];
         self.cursor_row = 0;
         self.cursor_col = 0;
@@ -394,15 +481,6 @@ impl Composer {
             self.cursor_row = self.lines.len() - 1;
             self.cursor_col = self.current_graphemes();
         }
-    }
-
-    /// Whether the buffer is a steering-style prompt (a short directive
-    /// rather than new work). Used only for labelling; the session owns
-    /// the actual steering decision.
-    pub fn looks_like_steering(&self) -> bool {
-        let text = self.text();
-        let trimmed = text.trim();
-        !trimmed.is_empty() && !trimmed.contains('\n') && trimmed.chars().count() <= 160
     }
 }
 
@@ -657,12 +735,50 @@ mod tests {
     }
 
     #[test]
-    fn steering_shaped_prompts_are_recognised_without_owning_the_decision() {
-        let composer = typed("use the simpler approach");
-        assert!(composer.looks_like_steering());
+    fn multiline_paste_is_one_undo_and_normalizes_windows_newlines() {
+        let mut composer = typed("before after");
+        composer.home();
+        for _ in 0..7 {
+            composer.right();
+        }
+        composer.paste("first\r\nsecond\n");
+        assert_eq!(composer.text(), "before first\nsecond\nafter");
+        assert_eq!(composer.cursor(), (2, 0));
+        assert!(composer.undo());
+        assert_eq!(composer.text(), "before after");
+        assert_eq!(composer.cursor(), (0, 7));
+        assert!(composer.redo());
+        assert_eq!(composer.text(), "before first\nsecond\nafter");
+    }
 
-        let mut composer = Composer::new();
-        composer.paste("a longer multi-line\nrequest describing new work");
-        assert!(!composer.looks_like_steering());
+    #[test]
+    fn history_browsing_restores_the_unsubmitted_draft_and_cursor() {
+        let mut composer = typed("old prompt");
+        composer.take_submission();
+        composer.paste("unfinished\ndraft");
+        composer.home();
+        composer.up();
+        assert_eq!(composer.cursor(), (0, 0));
+        composer.up();
+        assert_eq!(composer.text(), "old prompt");
+        composer.down();
+        assert_eq!(composer.text(), "unfinished\ndraft");
+        assert_eq!(composer.cursor(), (0, 0));
+    }
+
+    #[test]
+    fn word_editing_keeps_unicode_clusters_and_crosses_lines_atomically() {
+        let mut composer = typed("keep e\u{301} 👩‍💻\nnext");
+        composer.home();
+        composer.delete_word_left();
+        assert_eq!(composer.text(), "keep e\u{301} next");
+        composer.undo();
+        assert_eq!(composer.text(), "keep e\u{301} 👩‍💻\nnext");
+        composer.word_left();
+        assert_eq!(composer.cursor(), (0, 7));
+        composer.word_left();
+        assert_eq!(composer.cursor(), (0, 5));
+        composer.word_right();
+        assert_eq!(composer.cursor(), (0, 6));
     }
 }

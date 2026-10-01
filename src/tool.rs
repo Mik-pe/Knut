@@ -368,60 +368,90 @@ pub fn validate_schema_supported(schema: &Value) -> Result<(), SchemaError> {
 }
 
 pub fn validate_arguments(schema: &Value, input: &Value) -> Result<(), SchemaError> {
-    fn check(schema: &Value, input: &Value, path: &str) -> Result<(), SchemaError> {
-        let err = |reason: &str| SchemaError {
-            path: path.to_owned(),
-            reason: reason.to_owned(),
-        };
-        if let Some(options) = schema.get("enum").and_then(Value::as_array)
-            && !options.contains(input)
-        {
-            return Err(err("value is not one of the enum options"));
-        }
-        match schema.get("type").and_then(Value::as_str) {
-            Some("string") if input.is_string() => Ok(()),
-            Some("number") if input.is_number() => Ok(()),
-            Some("boolean") if input.is_boolean() => Ok(()),
-            Some("array") => {
-                let items = schema
-                    .get("items")
-                    .ok_or_else(|| err("array schema needs items"))?;
-                let list = input.as_array().ok_or_else(|| err("expected an array"))?;
-                for (index, value) in list.iter().enumerate() {
-                    check(items, value, &format!("{path}[{index}]"))?;
-                }
-                Ok(())
-            }
-            Some("object") => {
-                let object = input
-                    .as_object()
-                    .ok_or_else(|| err("expected a JSON object"))?;
-                for required in schema
-                    .get("required")
-                    .and_then(Value::as_array)
-                    .into_iter()
-                    .flatten()
-                {
-                    if let Some(required) = required.as_str()
-                        && !object.contains_key(required)
-                    {
-                        return Err(err(&format!("missing required field {required:?}")));
-                    }
-                }
-                if let Some(properties) = schema.get("properties").and_then(Value::as_object) {
-                    for (key, field) in properties {
-                        if let Some(value) = object.get(key) {
-                            check(field, value, &format!("{path}.{key}"))?;
-                        }
-                    }
-                }
-                Ok(())
-            }
-            _ => Err(err("value does not match its declared schema type")),
-        }
-    }
     validate_schema_supported(schema)?;
-    check(schema, input, "$")
+    check_arguments(schema, input, "$", false)
+}
+
+pub(crate) fn validate_planned_arguments(schema: &Value, input: &Value) -> Result<(), SchemaError> {
+    validate_schema_supported(schema)?;
+    check_arguments(schema, input, "$", true)
+}
+
+fn check_arguments(
+    schema: &Value,
+    input: &Value,
+    path: &str,
+    defer_refs: bool,
+) -> Result<(), SchemaError> {
+    let err = |reason: String| SchemaError {
+        path: path.to_owned(),
+        reason,
+    };
+    let kind = schema
+        .get("type")
+        .and_then(Value::as_str)
+        .ok_or_else(|| err("schema missing supported type".to_owned()))?;
+    if defer_refs
+        && input
+            .as_object()
+            .is_some_and(|object| object.contains_key("$ref"))
+    {
+        let reference = crate::tree::ref_spec(input)
+            .map_err(|error| err(error.to_string()))?
+            .expect("reference object");
+        if (reference.kind == crate::tree::ArtifactKind::Text) != (kind == "string") {
+            return Err(err(format!(
+                "reference selects {:?}, but this argument requires {kind}",
+                reference.kind
+            )));
+        }
+        return Ok(());
+    }
+    if let Some(options) = schema.get("enum").and_then(Value::as_array)
+        && !options.contains(input)
+    {
+        return Err(err("value is not one of the enum options".to_owned()));
+    }
+    match kind {
+        "string" if input.is_string() => Ok(()),
+        "number" if input.is_number() => Ok(()),
+        "boolean" if input.is_boolean() => Ok(()),
+        "object" => {
+            let object = input
+                .as_object()
+                .ok_or_else(|| err("expected a JSON object".to_owned()))?;
+            if let Some(required) = schema.get("required").and_then(Value::as_array) {
+                for key in required.iter().filter_map(Value::as_str) {
+                    if !object.contains_key(key) {
+                        return Err(err(format!("missing required field {key:?}")));
+                    }
+                }
+            }
+            if let Some(properties) = schema.get("properties").and_then(Value::as_object) {
+                for (key, value) in object {
+                    if let Some(field) = properties.get(key) {
+                        check_arguments(field, value, &format!("{path}.{key}"), defer_refs)?;
+                    } else if schema.get("additionalProperties") == Some(&Value::Bool(false)) {
+                        return Err(err(format!("unknown field {key:?}")));
+                    }
+                }
+            }
+            Ok(())
+        }
+        "array" => {
+            let values = input
+                .as_array()
+                .ok_or_else(|| err("expected an array".to_owned()))?;
+            let items = schema
+                .get("items")
+                .ok_or_else(|| err("array schema missing items".to_owned()))?;
+            for (index, value) in values.iter().enumerate() {
+                check_arguments(items, value, &format!("{path}[{index}]"), defer_refs)?;
+            }
+            Ok(())
+        }
+        _ => Err(err(format!("expected {kind}, received {input}"))),
+    }
 }
 
 fn terms(text: &str) -> Vec<String> {
@@ -616,5 +646,27 @@ mod tests {
         ] {
             assert!(validate_arguments(&schema, &input).is_err(), "{input}");
         }
+    }
+
+    #[test]
+    fn planned_arguments_check_sibling_literals_and_reference_types() {
+        let schema = json!({"type":"object", "required":["path","expect_hash"], "properties":{
+            "path":{"type":"string"}, "expect_hash":{"type":"string"}
+        }});
+        let valid =
+            json!({"path":{"$ref":"read","kind":"text","pointer":"/path"}, "expect_hash":"fresh"});
+        assert!(validate_planned_arguments(&schema, &valid).is_ok());
+        assert!(validate_arguments(&schema, &valid).is_err());
+        let wrong_literal =
+            json!({"path":{"$ref":"read","kind":"text","pointer":"/path"}, "expect_hash":9});
+        assert!(
+            validate_planned_arguments(&schema, &wrong_literal)
+                .unwrap_err()
+                .path
+                .contains("expect_hash")
+        );
+        let wrong_ref =
+            json!({"path":{"$ref":"read","kind":"json","pointer":"/path"}, "expect_hash":"fresh"});
+        assert!(validate_planned_arguments(&schema, &wrong_ref).is_err());
     }
 }

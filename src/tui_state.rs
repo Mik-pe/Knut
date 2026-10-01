@@ -114,7 +114,10 @@ pub struct WorkbenchState {
     pub cards: crate::cards::CardList,
     /// Requests queued while a task is running (issue #28): these start a
     /// *new* task when the current one ends and never modify it.
-    pub queued: Vec<String>,
+    pub queued: Vec<crate::session::QueuedRequest>,
+    pub queued_selection: usize,
+    pub steer_draft: bool,
+    pub queue_edit: Option<(u64, crate::composer::Composer)>,
     pub timeline: Vec<TimelineEntry>,
     /// Number of entries dropped from the front (virtualization).
     pub timeline_offset: usize,
@@ -125,8 +128,12 @@ pub struct WorkbenchState {
     pub transcript_scroll: usize,
     pub detail_scroll: u16,
     pub pending: Option<PendingPrompt>,
+    pub proposed_action: Option<(String, String, serde_json::Value)>,
+    pub approval_open: bool,
+    pub approval_scroll: usize,
     /// Whether a help overlay is open.
     pub help: bool,
+    pub help_scroll: usize,
     /// Command palette state: the query when open.
     pub palette: Option<String>,
     pub palette_selection: usize,
@@ -198,6 +205,9 @@ impl WorkbenchState {
             composer: crate::composer::Composer::new(),
             cards: crate::cards::CardList::new(),
             queued: Vec::new(),
+            queued_selection: 0,
+            steer_draft: false,
+            queue_edit: None,
             timeline: Vec::new(),
             timeline_offset: 0,
             selection: 0,
@@ -205,7 +215,11 @@ impl WorkbenchState {
             transcript_scroll: 0,
             detail_scroll: 0,
             pending: None,
+            proposed_action: None,
+            approval_open: false,
+            approval_scroll: 0,
             help: false,
+            help_scroll: 0,
             palette: None,
             palette_selection: 0,
             attachments: Vec::new(),
@@ -224,10 +238,23 @@ impl WorkbenchState {
         self
     }
 
-    /// Advance the animation tick. The shell calls this once per frame;
-    /// spinners read from it so rendering stays a pure function of state.
-    pub fn advance(&mut self) {
-        self.tick = self.tick.wrapping_add(1);
+    pub fn brand_tick(&self) -> u64 {
+        if self.task_state == Some(TaskState::Running) {
+            self.tick
+        } else if self.timeline.is_empty() {
+            self.tick.min(crate::knot::INTRO_TICKS)
+        } else {
+            crate::knot::INTRO_TICKS
+        }
+    }
+
+    pub fn animating(&self) -> bool {
+        !self.theme.reduced_motion
+            && !self.help
+            && !self.palette_open()
+            && self.review.is_none()
+            && (self.task_state == Some(TaskState::Running)
+                || (self.timeline.is_empty() && self.tick < crate::knot::INTRO_TICKS))
     }
 
     /// Seconds since the current task started (0 when idle).
@@ -289,17 +316,23 @@ impl WorkbenchState {
         self.resume_follow();
     }
 
-    /// Queue a request for after the current task (never a steering edit).
-    pub fn queue_request(&mut self, text: impl Into<String>) {
-        self.queued.push(text.into());
+    pub fn edit_queued(&mut self) {
+        let Some(request) = self.queued.get(self.queued_selection) else {
+            return;
+        };
+        if self.queue_edit.is_some() {
+            return;
+        }
+        let mut editor = crate::composer::Composer::new();
+        editor.insert(&request.prompt);
+        let draft = std::mem::replace(&mut self.composer, editor);
+        self.queue_edit = Some((request.id, draft));
+        self.focus = Focus::Composer;
     }
 
-    /// Take the next queued request, if any.
-    pub fn take_queued(&mut self) -> Option<String> {
-        if self.queued.is_empty() {
-            None
-        } else {
-            Some(self.queued.remove(0))
+    pub fn restore_draft(&mut self) {
+        if let Some((_, draft)) = self.queue_edit.take() {
+            self.composer = draft;
         }
     }
 
@@ -358,15 +391,14 @@ impl WorkbenchState {
         // adds nothing the runtime did not report.
         self.inspector.apply(event);
         match event {
-            SessionEvent::SessionStarted { .. } => {
-                self.status = None;
-            }
             SessionEvent::TaskStarted { prompt, .. } => {
                 self.usage_limit = false;
                 self.status = None;
+                self.steer_draft = false;
                 self.push(TimelineKind::User, prompt.clone(), false);
                 self.task_state = Some(TaskState::Running);
                 self.pending = None;
+                self.approval_open = false;
                 // The header ticker measures the *current* task; a finished
                 // task keeps its last duration instead of counting forever.
                 self.task_started = Some(std::time::Instant::now());
@@ -404,15 +436,46 @@ impl WorkbenchState {
                     false,
                 );
             }
-            SessionEvent::RequestQueued { text } => {
-                // Queued work is shown as queued, never as a change to the
-                // running task.
-                self.queue_request(text.clone());
+            SessionEvent::RequestQueued { request } => {
+                self.queued.push(request.clone());
                 self.push(
                     TimelineKind::Action,
-                    format!("queued for next task: {text}"),
+                    format!("Queued #{}: {}", request.id, request.prompt),
                     false,
                 );
+            }
+            SessionEvent::RequestUpdated { request } => {
+                if let Some(queued) = self
+                    .queued
+                    .iter_mut()
+                    .find(|queued| queued.id == request.id)
+                {
+                    *queued = request.clone();
+                }
+                if self
+                    .queue_edit
+                    .as_ref()
+                    .is_some_and(|(id, _)| *id == request.id)
+                {
+                    self.restore_draft();
+                }
+                self.status = Some(format!("Updated queued request #{}", request.id));
+            }
+            SessionEvent::RequestRemoved { id } => {
+                self.queued.retain(|request| request.id != *id);
+                self.queued_selection = self
+                    .queued_selection
+                    .min(self.queued.len().saturating_sub(1));
+                if self
+                    .queue_edit
+                    .as_ref()
+                    .is_some_and(|(editing, _)| editing == id)
+                {
+                    self.status = Some(
+                        "That request left the queue. Your edit is kept; Esc restores your draft."
+                            .to_owned(),
+                    );
+                }
             }
             SessionEvent::CardStarted { card_id, title, .. } => {
                 self.cards.start(card_id.clone(), title.clone());
@@ -526,10 +589,16 @@ impl WorkbenchState {
                     message: message.clone(),
                 });
                 self.task_state = Some(TaskState::Waiting);
+                self.approval_open = matches!(wait, WaitKind::Approval { .. });
+                self.approval_scroll = 0;
+                if self.approval_open {
+                    self.review = None;
+                }
                 self.push(TimelineKind::Wait, message.clone(), false);
             }
             SessionEvent::WaitResolved { .. } => {
                 self.pending = None;
+                self.approval_open = false;
                 self.task_state = Some(TaskState::Running);
                 self.status = Some("resuming…".to_owned());
             }
@@ -544,6 +613,7 @@ impl WorkbenchState {
             SessionEvent::TaskCompleted { summary, .. } => {
                 self.status = None;
                 self.pending = None;
+                self.approval_open = false;
                 self.finish_timing();
                 self.task_state = Some(TaskState::Completed);
                 let text = if self.last_response_contains(summary) {
@@ -559,6 +629,7 @@ impl WorkbenchState {
                         || reason.contains("subscription_sharing_usage_"));
                 self.status = None;
                 self.pending = None;
+                self.approval_open = false;
                 self.finish_timing();
                 self.task_state = Some(TaskState::Failed);
                 self.push(TimelineKind::Error, reason.clone(), false);
@@ -566,6 +637,7 @@ impl WorkbenchState {
             SessionEvent::TaskCancelled { .. } => {
                 self.status = None;
                 self.pending = None;
+                self.approval_open = false;
                 self.finish_timing();
                 self.task_state = Some(TaskState::Cancelled);
                 self.push(TimelineKind::Terminal, "cancelled", false);
@@ -580,11 +652,17 @@ impl WorkbenchState {
                 );
             }
             SessionEvent::ToolCallProposed {
-                name, arguments, ..
+                call_id,
+                name,
+                arguments,
+                ..
             } => {
+                self.proposed_action = Some((call_id.clone(), name.clone(), arguments.clone()));
                 self.push(
                     TimelineKind::Action,
-                    format!("tool call {name} {arguments}"),
+                    format!(
+                        "Proposed {name} · Alt+V shows the full action when approval is requested"
+                    ),
                     false,
                 );
             }
@@ -603,7 +681,7 @@ impl WorkbenchState {
             SessionEvent::RuntimeError { message, .. } => {
                 self.push(TimelineKind::Error, message.clone(), false);
             }
-            SessionEvent::ModelCallReported { .. } => {}
+            SessionEvent::SessionStarted { .. } | SessionEvent::ModelCallReported { .. } => {}
         }
     }
 
@@ -743,9 +821,7 @@ fn summarize(output: &serde_json::Value) -> String {
     if output.is_null() {
         return String::new();
     }
-    let text = output.to_string();
-    let bounded: String = text.chars().take(160).collect();
-    format!(" {bounded}")
+    format!(" {}", crate::cards::summarize_value(output))
 }
 
 /// A short label for a revision identity, so the transcript does not carry
@@ -805,6 +881,35 @@ mod tests {
             node: crate::session::NodeId(1),
             text: text.to_owned(),
         }
+    }
+
+    #[test]
+    fn intro_settles_and_only_active_work_keeps_the_knot_animated() {
+        let mut state = WorkbenchState::new("/workspace")
+            .with_theme(Theme::for_level(crate::ColorLevel::TrueColor));
+        assert!(state.animating());
+        state.tick = crate::knot::INTRO_TICKS + 1;
+        assert!(!state.animating());
+        let settled = state.brand_tick();
+        state.tick += 100;
+        assert_eq!(state.brand_tick(), settled);
+        state.apply(&task_started("test"));
+        assert!(state.animating());
+        assert_eq!(state.brand_tick(), state.tick);
+        for status in [
+            TaskState::Waiting,
+            TaskState::Paused,
+            TaskState::Completed,
+            TaskState::Cancelled,
+            TaskState::Failed,
+        ] {
+            state.task_state = Some(status);
+            assert!(!state.animating());
+            assert_eq!(state.brand_tick(), settled);
+        }
+        state.task_state = Some(TaskState::Running);
+        state.theme.reduced_motion = true;
+        assert!(!state.animating());
     }
 
     #[test]

@@ -53,7 +53,7 @@ pub fn plan_layout(area: Rect, composer_rows: usize) -> LayoutPlan {
         ..area
     };
     let vertical = Layout::vertical([
-        Constraint::Length(2),
+        Constraint::Length(if area.height >= 18 { 3 } else { 2 }),
         Constraint::Min(1),
         Constraint::Length((composer_rows as u16).clamp(1, 6) + 2),
         Constraint::Length(2),
@@ -129,7 +129,9 @@ pub fn render_themed(frame: &mut Frame, state: &WorkbenchState, tab: Tab, theme:
         return;
     }
     let mut body = plan.timeline;
-    if let Some(pending) = &state.pending {
+    if let Some(pending) = &state.pending
+        && !state.approval_open
+    {
         let rows = Layout::vertical([
             Constraint::Min(1),
             Constraint::Length(6.min(body.height / 2)),
@@ -143,10 +145,14 @@ pub fn render_themed(frame: &mut Frame, state: &WorkbenchState, tab: Tab, theme:
             rows[1],
         );
     }
-    match tab {
-        Tab::Timeline => render_timeline(frame, state, body, theme),
-        Tab::Inspector => render_inspector(frame, state, body, theme),
-        Tab::Tasks => render_jobs(frame, state, body, theme),
+    if state.approval_open {
+        render_approval(frame, state, body, theme);
+    } else {
+        match tab {
+            Tab::Timeline => render_timeline(frame, state, body, theme),
+            Tab::Inspector => render_inspector(frame, state, body, theme),
+            Tab::Tasks => render_jobs(frame, state, body, theme),
+        }
     }
     render_composer(frame, state, plan.composer, theme);
     render_footer(frame, state, plan.footer, theme);
@@ -288,42 +294,70 @@ fn state_style(state: Option<TaskState>, theme: &Theme) -> Style {
     }
 }
 
-/// The header: the mark, the workspace, and the session's vital signs.
-///
-/// Two rows, always. The first is identity (mark, workspace, branch); the
-/// second is instrument (state, model, endpoint, counters). On a narrow
-/// terminal the second row drops fields rather than truncating mid-word.
 fn render_header(frame: &mut Frame, state: &WorkbenchState, area: Rect, theme: &Theme) {
+    let mark_width = if area.width >= 50 && area.height >= 3 {
+        8
+    } else {
+        0
+    };
+    if mark_width > 0 {
+        frame.render_widget(
+            Paragraph::new(crate::knot::logo_lines(
+                theme,
+                mark_width as usize,
+                3,
+                state.brand_tick(),
+            )),
+            Rect::new(area.x, area.y, mark_width, 3),
+        );
+    }
+    let text_area = Rect::new(
+        area.x + mark_width,
+        area.y,
+        area.width.saturating_sub(mark_width),
+        area.height,
+    );
     let (marker, label) = state_marker_for(state.task_state, theme);
-    let workspace = compact_path(&state.workspace, area.width.saturating_sub(26) as usize);
+    let branch = state.branch.as_deref().unwrap_or_default();
+    let workspace = compact_path(
+        &state.workspace,
+        text_area
+            .width
+            .saturating_sub(12 + branch.width().min(20) as u16) as usize,
+    );
     let mut identity = vec![
         Span::styled(" knut ", theme.accent().add_modifier(Modifier::BOLD)),
         Span::styled(workspace, theme.text()),
     ];
-    if let Some(branch) = &state.branch {
-        identity.push(Span::styled(format!("  / {branch}"), theme.dim()));
+    if !branch.is_empty() && text_area.width >= 40 {
+        identity.push(Span::styled(
+            format!("  / {}", clipped(branch, 20)),
+            theme.faint(),
+        ));
     }
-    let mut status = vec![
-        Span::styled(
-            format!(" {marker} {label}"),
-            state_style(state.task_state, theme),
-        ),
-        Span::styled(
+    let mut status = vec![Span::styled(
+        format!(" {marker} {label}"),
+        state_style(state.task_state, theme),
+    )];
+    if text_area.width >= 35 {
+        status.push(Span::styled(
             format!(
-                "  · {}{}  {}",
-                state.reasoner_label(),
-                if state.chatgpt_plan {
-                    " · Using ChatGPT plan"
-                } else {
-                    ""
-                },
-                ticker_label(state)
+                "  {} {}",
+                if theme.glyphs.unicode { "·" } else { "|" },
+                clipped(
+                    &state.reasoner_label(),
+                    text_area.width.saturating_sub(29) as usize
+                )
             ),
             theme.dim(),
-        ),
-    ];
-    if !theme.glyphs.unicode {
-        status[1].content = status[1].content.replace('·', "|").into();
+        ));
+    }
+    let elapsed = ticker_label(state);
+    if !elapsed.is_empty() && text_area.width >= 46 {
+        status.push(Span::styled(format!("  {elapsed}"), theme.faint()));
+    }
+    if state.chatgpt_plan && text_area.width >= 55 {
+        status.push(Span::styled(" · Using ChatGPT plan", theme.dim()));
     }
     if !state.queued.is_empty() {
         status.push(Span::styled(
@@ -331,23 +365,23 @@ fn render_header(frame: &mut Frame, state: &WorkbenchState, area: Rect, theme: &
             theme.warn(),
         ));
     }
-    if state.task_state == Some(TaskState::Running)
-        && let Some(card) = state
-            .cards
-            .cards()
-            .iter()
-            .rev()
-            .find(|card| card.state == crate::cards::CardState::Running)
-    {
-        status.push(Span::styled(
-            format!("  {} {}", theme.spinner(state.tick), card.title),
-            theme.accent(),
-        ));
-    }
     frame.render_widget(
         Paragraph::new(vec![Line::from(identity), Line::from(status)]),
-        area,
+        text_area,
     );
+}
+
+fn clipped(text: &str, width: usize) -> String {
+    let mut result = String::new();
+    let mut cells = 0;
+    for grapheme in text.graphemes(true) {
+        if cells + grapheme.width() > width {
+            break;
+        }
+        result.push_str(grapheme);
+        cells += grapheme.width();
+    }
+    result
 }
 
 /// A short ticker for the header's right edge.
@@ -360,27 +394,29 @@ fn ticker_label(state: &WorkbenchState) -> String {
     }
 }
 
-/// Shorten a path to its last two segments, so the header stays readable
-/// on a deep working directory.
 fn compact_path(path: &str, width: usize) -> String {
-    let budget = (width / 3).clamp(16, 48);
-    if path.chars().count() <= budget {
+    let width = width.min(36);
+    if path.width() <= width {
         return path.to_owned();
     }
-    let parts: Vec<&str> = path.split('/').filter(|part| !part.is_empty()).collect();
-    let tail = match parts.len() {
-        0 => return path.to_owned(),
-        1 => parts[0].to_owned(),
-        _ => format!("{}/{}", parts[parts.len() - 2], parts[parts.len() - 1]),
-    };
-    if tail.chars().count() + 2 > budget {
-        format!(
-            "~{}",
-            &tail[tail.len().saturating_sub(budget.saturating_sub(1))..]
-        )
-    } else {
-        format!("~/{tail}")
+    let parts: Vec<_> = path.split('/').filter(|part| !part.is_empty()).collect();
+    let tail = parts[parts.len().saturating_sub(2)..].join("/");
+    if tail.width() + 2 <= width {
+        return format!("~/{tail}");
     }
+    if width == 0 {
+        return String::new();
+    }
+    let mut cells = 1;
+    let mut suffix = Vec::new();
+    for grapheme in tail.graphemes(true).rev() {
+        if cells + grapheme.width() > width {
+            break;
+        }
+        suffix.push(grapheme);
+        cells += grapheme.width();
+    }
+    format!("~{}", suffix.into_iter().rev().collect::<String>())
 }
 
 /// The tab strip for narrow terminals.
@@ -481,52 +517,55 @@ fn render_timeline(frame: &mut Frame, state: &WorkbenchState, area: Rect, theme:
     );
 }
 
-fn render_welcome(frame: &mut Frame, state: &WorkbenchState, area: Rect, theme: &Theme) {
-    let width = area.width.saturating_sub(6).max(1) as usize;
-    let mut lines = vec![
-        Line::from(""),
-        Line::from(Span::styled(
-            "  What are we building?",
-            theme.text().add_modifier(Modifier::BOLD),
-        )),
-        Line::from(""),
-    ];
-    let message = if let Some(reason) = &state.unavailable {
-        reason.clone()
-    } else if state.model.is_none() {
-        "Offline. Open / account to continue with ChatGPT, or configure an API key.".to_owned()
-    } else {
-        "Describe a change, investigate a bug, or ask about this codebase.".to_owned()
+fn render_approval(frame: &mut Frame, state: &WorkbenchState, area: Rect, theme: &Theme) {
+    let Some(pending) = &state.pending else {
+        return;
     };
-    if state.model.is_none() {
-        lines.push(Line::from(Span::styled(
-            "  F2 settings  >  Continue with ChatGPT",
-            theme.accent(),
-        )));
+    let mut text = pending.message.clone();
+    if let crate::WaitKind::Approval { approval_key } = &pending.kind {
+        if let Some((key, name, arguments)) = &state.proposed_action
+            && key == approval_key
+        {
+            text = crate::review::approval_text(name, arguments);
+        }
+        text.push_str(&format!("\n\nApproval identity: {approval_key}\n"));
     }
-    for line in wrap_text(&message, width) {
-        lines.push(Line::from(Span::styled(format!("  {line}"), theme.dim())));
-    }
-    if area.height >= 13 {
-        lines.extend([
-            Line::from(""),
-            Line::from(Span::styled("  Try a concrete task", theme.faint())),
-            Line::from(Span::styled(
-                "  Find what causes the failing test",
-                theme.text(),
-            )),
-            Line::from(Span::styled(
-                "  Explain how requests reach the model",
-                theme.text(),
-            )),
-            Line::from(""),
-            Line::from(Span::styled(
-                "  / commands   Ctrl+R changes   ? shortcuts",
-                theme.dim(),
-            )),
-        ]);
-    }
-    frame.render_widget(Paragraph::new(lines), area);
+    let text = crate::cards::sanitize_for_display(&text);
+    let lines: Vec<_> = text
+        .lines()
+        .flat_map(|line| hard_wrap(line, area.width.saturating_sub(2).max(1) as usize))
+        .map(|line| {
+            let style = if line.starts_with('+') {
+                theme.success()
+            } else if line.starts_with('-') {
+                theme.danger()
+            } else {
+                theme.text()
+            };
+            Line::from(Span::styled(line, style))
+        })
+        .collect();
+    let height = area.height.saturating_sub(2) as usize;
+    let scroll = state
+        .approval_scroll
+        .min(lines.len().saturating_sub(height));
+    let title = format!(
+        " proposed action / lines {}-{} / {} ",
+        scroll + 1,
+        (scroll + height).min(lines.len()),
+        lines.len()
+    );
+    frame.render_widget(
+        Paragraph::new(
+            lines
+                .into_iter()
+                .skip(scroll)
+                .take(height)
+                .collect::<Vec<_>>(),
+        )
+        .block(panel(&title, theme.warn(), theme)),
+        area,
+    );
 }
 
 fn render_connection(
@@ -605,53 +644,131 @@ fn render_connection(
     );
 }
 
-/// Wrap plain text to a width, preserving nothing but word boundaries.
-fn wrap_text(text: &str, width: usize) -> Vec<String> {
-    let width = width.max(8);
-    let mut out: Vec<String> = Vec::new();
-    let mut current = String::new();
-    let mut current_width = 0usize;
+fn render_welcome(frame: &mut Frame, state: &WorkbenchState, area: Rect, theme: &Theme) {
+    let rich = area.width >= 66 && area.height >= 14;
+    let compact = !rich && area.width >= 42 && area.height >= 9;
+    let content_width = area.width.saturating_sub(4).min(72);
+    let left = area.x + area.width.saturating_sub(content_width) / 2;
+    let top = area.y + area.height.saturating_sub(if rich { 15 } else { 10 }) / 3;
+    let (text_x, text_y, text_width, after) = if rich || compact {
+        let (mark_width, mark_height) = if rich { (30, 10) } else { (18, 6) };
+        frame.render_widget(
+            Paragraph::new(crate::knot::logo_lines(
+                theme,
+                mark_width,
+                mark_height,
+                state.brand_tick(),
+            )),
+            Rect::new(left, top, mark_width as u16, mark_height as u16),
+        );
+        (
+            left + mark_width as u16 + 3,
+            top + 1,
+            content_width.saturating_sub(mark_width as u16 + 3),
+            top + mark_height as u16,
+        )
+    } else {
+        (left, top, content_width, top + 2)
+    };
+    let mut brand = theme.brand_gradient("knut");
+    for span in &mut brand {
+        span.style = span.style.add_modifier(Modifier::BOLD);
+    }
+    brand.push(Span::styled(
+        format!("  v{}", env!("CARGO_PKG_VERSION")),
+        theme.faint(),
+    ));
+    let mut lines = vec![Line::from(brand)];
+    if rich || compact {
+        lines.push(Line::from(Span::styled(
+            "Your code, untangled.",
+            theme.dim(),
+        )));
+        lines.push(Line::from(""));
+    }
+    for line in wrap_text("What are we building?", text_width as usize) {
+        lines.push(Line::from(Span::styled(
+            line,
+            theme.text().add_modifier(Modifier::BOLD),
+        )));
+    }
+    if rich {
+        lines.push(Line::from(""));
+        for line in wrap_text(
+            "Describe a change, investigate a bug, or explore this codebase.",
+            text_width as usize,
+        ) {
+            lines.push(Line::from(Span::styled(line, theme.dim())));
+        }
+    }
+    frame.render_widget(
+        Paragraph::new(lines),
+        Rect::new(
+            text_x,
+            text_y,
+            text_width,
+            area.bottom().saturating_sub(text_y),
+        ),
+    );
+    let message = if let Some(reason) = &state.unavailable {
+        Some(reason.clone())
+    } else if state.model.is_none() {
+        Some("Offline. F2 settings > Continue with ChatGPT, or configure an API key.".to_owned())
+    } else if !rich {
+        Some("Describe a change or ask about this codebase.".to_owned())
+    } else {
+        None
+    };
+    let mut details = Vec::new();
+    if let Some(message) = message {
+        for line in wrap_text(&message, content_width as usize) {
+            details.push(Line::from(Span::styled(line, theme.dim())));
+        }
+    } else if area.height >= 18 {
+        details.push(Line::from(vec![
+            Span::styled("Try  ", theme.faint()),
+            Span::styled("Find what causes the failing test", theme.text()),
+        ]));
+        details.push(Line::from(vec![
+            Span::styled("     ", theme.faint()),
+            Span::styled("Explain how requests reach the model", theme.text()),
+        ]));
+    }
+    let detail_y = after + 1;
+    frame.render_widget(
+        Paragraph::new(details),
+        Rect::new(
+            left,
+            detail_y.min(area.bottom()),
+            content_width,
+            area.bottom().saturating_sub(detail_y),
+        ),
+    );
+}
 
-    for word in text.split(' ') {
-        let word_width = word.chars().count();
-        if current_width == 0 {
-            if word_width <= width {
-                current.push_str(word);
-                current_width = word_width;
-            } else {
-                // A single long token (a path, a hash) is hard-split rather
-                // than allowed to overflow the panel.
-                let chars: Vec<char> = word.chars().collect();
-                for chunk in chars.chunks(width) {
-                    out.push(chunk.iter().collect());
-                }
-                current = String::new();
-                current_width = 0;
-            }
-            continue;
+fn wrap_text(text: &str, width: usize) -> Vec<String> {
+    let width = width.max(1);
+    let mut lines = Vec::new();
+    let mut current = String::new();
+    for word in text.split_whitespace() {
+        if !current.is_empty() && current.width() + 1 + word.width() > width {
+            lines.push(std::mem::take(&mut current));
         }
-        if current_width + 1 + word_width <= width {
-            current.push(' ');
-            current.push_str(word);
-            current_width += 1 + word_width;
+        if word.width() > width {
+            let mut chunks = hard_wrap(word, width);
+            current = chunks.pop().unwrap_or_default();
+            lines.extend(chunks);
         } else {
-            out.push(std::mem::take(&mut current));
-            if word_width <= width {
-                current.push_str(word);
-                current_width = word_width;
-            } else {
-                let chars: Vec<char> = word.chars().collect();
-                for chunk in chars.chunks(width) {
-                    out.push(chunk.iter().collect());
-                }
-                current_width = 0;
+            if !current.is_empty() {
+                current.push(' ');
             }
+            current.push_str(word);
         }
     }
-    if !current.is_empty() || out.is_empty() {
-        out.push(current);
+    if !current.is_empty() || lines.is_empty() {
+        lines.push(current);
     }
-    out
+    lines
 }
 
 /// A panel block: rounded on capable terminals, plain ASCII otherwise.
@@ -728,6 +845,49 @@ fn render_jobs(frame: &mut Frame, state: &WorkbenchState, area: Rect, theme: &Th
         lines.push(Line::from(""));
     }
 
+    if !state.queued.is_empty() {
+        lines.push(Line::from(""));
+        lines.push(Line::from(Span::styled(
+            format!(" queued ({})", state.queued.len()),
+            theme.warn(),
+        )));
+        lines.push(Line::from(Span::styled(
+            " Up/Down select / Alt+E edit / Alt+X remove",
+            theme.dim(),
+        )));
+        if state.task_state.is_none_or(|s| s.is_terminal()) {
+            lines.push(Line::from(Span::styled(
+                " Alt+R starts selected request",
+                theme.dim(),
+            )));
+        }
+        for (index, request) in state.queued.iter().enumerate() {
+            let short: String = request
+                .prompt
+                .replace('\n', " ")
+                .chars()
+                .take(inner_width.saturating_sub(8))
+                .collect();
+            lines.push(Line::from(Span::styled(
+                format!(
+                    " {} #{} {}",
+                    if index == state.queued_selection {
+                        ">"
+                    } else {
+                        " "
+                    },
+                    request.id,
+                    short
+                ),
+                if index == state.queued_selection {
+                    theme.accent()
+                } else {
+                    theme.dim()
+                },
+            )));
+        }
+    }
+
     // Live cards: running first, then the most recent finished ones.
     let cards = state.cards.cards();
     let active: Vec<&crate::cards::ActionCard> =
@@ -752,21 +912,6 @@ fn render_jobs(frame: &mut Frame, state: &WorkbenchState, area: Rect, theme: &Th
         lines.push(Line::from(Span::styled(" recent", theme.dim())));
         for card in &finished {
             lines.push(job_line(card, state.tick, inner_width, theme));
-        }
-    }
-
-    if !state.queued.is_empty() {
-        lines.push(Line::from(""));
-        lines.push(Line::from(Span::styled(
-            format!(" queued ({})", state.queued.len()),
-            theme.warn(),
-        )));
-        for request in &state.queued {
-            let short: String = request.chars().take(inner_width).collect();
-            lines.push(Line::from(Span::styled(
-                format!("  {} {}", theme.glyphs.bullet(), short),
-                theme.dim(),
-            )));
         }
     }
 
@@ -1085,7 +1230,14 @@ fn render_composer(frame: &mut Frame, state: &WorkbenchState, area: Rect, theme:
         lines.clear();
         lines.push(Line::from(vec![
             sigil,
-            Span::styled("Describe a task, or / for commands", theme.faint()),
+            Span::styled(
+                if inner_width < 34 {
+                    "Type a task"
+                } else {
+                    "Describe a task, or / for commands"
+                },
+                theme.faint(),
+            ),
         ]));
     }
 
@@ -1094,7 +1246,11 @@ fn render_composer(frame: &mut Frame, state: &WorkbenchState, area: Rect, theme:
         composer_cursor_position(composer_lines, cursor_row, cursor_col, inner_width);
     let scroll = display_row.saturating_sub(budget.saturating_sub(1));
     let lines: Vec<_> = lines.into_iter().skip(scroll).take(budget).collect();
-    let title = if state
+    let title = if state.queue_edit.is_some() {
+        " edit queued request: Enter save / Esc cancel "
+    } else if state.steer_draft && state.task_state.is_some_and(|s| !s.is_terminal()) {
+        " steer current task / Alt+S to queue "
+    } else if state
         .pending
         .as_ref()
         .is_some_and(|p| matches!(p.kind, crate::session::WaitKind::Approval { .. }))
@@ -1103,7 +1259,11 @@ fn render_composer(frame: &mut Frame, state: &WorkbenchState, area: Rect, theme:
     } else if state.pending.is_some() {
         " your answer "
     } else if state.task_state.is_some_and(|s| !s.is_terminal()) {
-        " follow up "
+        if state.steer_draft {
+            " steer current task / Alt+S to queue "
+        } else {
+            " queue next task / Alt+S to steer "
+        }
     } else if state.chatgpt_plan {
         " message · Using ChatGPT plan "
     } else {
@@ -1133,24 +1293,60 @@ fn render_composer(frame: &mut Frame, state: &WorkbenchState, area: Rect, theme:
 }
 
 fn render_footer(frame: &mut Frame, state: &WorkbenchState, area: Rect, theme: &Theme) {
-    let hint = if state.usage_limit {
-        " Ctrl+U Manage usage   / account change account"
+    let hints: Vec<(&str, &str)> = if state.usage_limit {
+        vec![("Ctrl+U", "Manage usage"), ("/ account", "change account")]
+    } else if state.queue_edit.is_some() {
+        vec![("Enter", "save edit"), ("Esc", "restore draft")]
     } else if state
         .pending
         .as_ref()
         .is_some_and(|p| matches!(p.kind, crate::session::WaitKind::Approval { .. }))
     {
-        " Alt+A allow   Alt+D deny   draft preserved"
+        vec![
+            ("Alt+A", "allow"),
+            ("Alt+D", "deny"),
+            ("Alt+V", "full action"),
+        ]
+    } else if state.task_state.is_some_and(|s| !s.is_terminal()) && state.pending.is_none() {
+        if state.steer_draft {
+            vec![("Enter", "steer"), ("Alt+S", "queue"), ("Ctrl+C", "stop")]
+        } else {
+            vec![("Enter", "queue"), ("Alt+S", "steer"), ("Ctrl+C", "stop")]
+        }
     } else if !state.follow {
-        " PgUp/PgDn scroll   Esc latest   type to compose"
-    } else if area.width < 70 {
-        " Enter send   F2 settings   / commands"
+        vec![("PgUp/PgDn", "scroll"), ("Esc", "latest")]
+    } else if area.width < 40 {
+        vec![("Enter", "send"), ("F1", "help")]
     } else {
-        " Enter send   Shift+Enter newline   F2 settings   / commands"
+        vec![
+            ("Enter", "send"),
+            ("/", "commands"),
+            ("F1", "help"),
+            ("F2", "settings"),
+            ("Shift+Enter", "newline"),
+        ]
     };
+    let mut line = vec![Span::raw(" ")];
+    let mut used = 1;
+    for (key, label) in hints {
+        let size = key.width() + label.width() + 3;
+        if used + size > area.width as usize {
+            continue;
+        }
+        line.push(Span::styled(key, theme.text()));
+        line.push(Span::styled(format!(" {label}  "), theme.faint()));
+        used += size;
+    }
     let detail = state.status.clone().unwrap_or_else(|| {
-        if state.task_state.is_some_and(|s| !s.is_terminal()) {
-            " Ctrl+C stop task · your next message steers or queues".to_owned()
+        if state.approval_open {
+            " PgUp/PgDn scroll action · Esc conversation · draft kept".to_owned()
+        } else if state.task_state.is_some_and(|s| !s.is_terminal()) {
+            if area.width < 45 {
+                " Ctrl+O jobs · F1 help"
+            } else {
+                " Ctrl+O manage queue · Shift+Enter newline"
+            }
+            .to_owned()
         } else if state.chatgpt_plan {
             format!(
                 " ChatGPT: {} · / account · / usage",
@@ -1159,7 +1355,12 @@ fn render_footer(frame: &mut Frame, state: &WorkbenchState, area: Rect, theme: &
                 )
             )
         } else {
-            " Ctrl+O jobs   Ctrl+B decisions   Ctrl+C quit".to_owned()
+            if area.width < 45 {
+                " / commands · Ctrl+Q save & quit"
+            } else {
+                " Ctrl+R changes   Ctrl+O jobs   Ctrl+Q save & quit"
+            }
+            .to_owned()
         }
     });
     let detail = if theme.glyphs.unicode {
@@ -1169,7 +1370,7 @@ fn render_footer(frame: &mut Frame, state: &WorkbenchState, area: Rect, theme: &
     };
     frame.render_widget(
         Paragraph::new(vec![
-            Line::from(Span::styled(hint, theme.dim())),
+            Line::from(line),
             Line::from(Span::styled(detail, theme.faint())),
         ]),
         area,
@@ -1397,7 +1598,7 @@ fn render_palette(frame: &mut Frame, state: &WorkbenchState, area: Rect, theme: 
     );
 }
 
-fn render_help(frame: &mut Frame, state: &WorkbenchState, area: Rect, theme: &Theme) {
+pub(crate) fn shortcuts(state: &WorkbenchState) -> Vec<&'static str> {
     let mut lines = vec![
         " F2             Settings",
         " Enter          Send message",
@@ -1405,9 +1606,14 @@ fn render_help(frame: &mut Frame, state: &WorkbenchState, area: Rect, theme: &Th
         " Ctrl+P /       Commands",
         " Ctrl+R         Review changes",
         " Ctrl+O / B     Jobs / decisions",
+        " Alt+S          Switch queue / steer",
         " PgUp / PgDn    Scroll",
         " Ctrl+Z / Y     Undo / redo",
+        " Alt+B / F      Move by word",
+        " Ctrl+W         Delete previous word",
+        " /motion        Toggle animations",
         " Ctrl+C         Stop / clear / quit",
+        " Ctrl+Q         Save draft and quit when idle",
     ];
     if state.review.is_some() {
         lines = vec![
@@ -1422,8 +1628,14 @@ fn render_help(frame: &mut Frame, state: &WorkbenchState, area: Rect, theme: &Th
         .is_some_and(|pending| matches!(pending.kind, crate::session::WaitKind::Approval { .. }))
     {
         lines.insert(0, " Alt+A / D      Allow / deny approval");
+        lines.insert(1, " Alt+V          Full action preview");
     }
     lines.push(" ? / F1 / Esc   Close shortcuts");
+    lines
+}
+
+fn render_help(frame: &mut Frame, state: &WorkbenchState, area: Rect, theme: &Theme) {
+    let lines = shortcuts(state);
     let width = area.width.min(48);
     let height = area.height.min(lines.len() as u16 + 2);
     let popup = Rect::new(
@@ -1432,11 +1644,23 @@ fn render_help(frame: &mut Frame, state: &WorkbenchState, area: Rect, theme: &Th
         width,
         height,
     );
+    frame.render_widget(Block::default().style(theme.faint()), area);
     frame.render_widget(Clear, popup);
     frame.render_widget(
-        Paragraph::new(lines.into_iter().map(Line::from).collect::<Vec<_>>())
-            .style(theme.text().patch(theme.bg(theme.palette.bg)))
-            .block(panel(" Keyboard shortcuts ", theme.border_focused(), theme)),
+        Paragraph::new(
+            lines
+                .into_iter()
+                .skip(state.help_scroll)
+                .map(Line::from)
+                .collect::<Vec<_>>(),
+        )
+        .wrap(Wrap { trim: false })
+        .style(theme.text().patch(theme.bg(theme.palette.bg)))
+        .block(panel(
+            " shortcuts / Esc close ",
+            theme.border_focused(),
+            theme,
+        )),
         popup,
     );
 }
@@ -1527,6 +1751,22 @@ mod tests {
     }
 
     #[test]
+    fn narrow_help_can_reveal_later_shortcuts_and_keeps_an_exit_hint() {
+        let mut state = WorkbenchState::new("/workspace");
+        state.help = true;
+        state.help_scroll = 8;
+        let text = snapshot(&state, 30, 12, Tab::Timeline);
+        assert!(text.contains("Alt+B / F"));
+        assert!(text.contains("Esc close"));
+        assert!(
+            wrap_text("日本語 e\u{301} 👩‍💻 words", 8)
+                .iter()
+                .all(|line| line.width() <= 8)
+        );
+        assert!(compact_path("/workspace/日本語のコード/e\u{301}👩‍💻", 13).width() <= 13);
+    }
+
+    #[test]
     fn renders_at_eighty_by_twenty_four() {
         let state = populated_state();
         let text = snapshot(&state, 80, 24, Tab::Timeline);
@@ -1534,7 +1774,7 @@ mod tests {
         assert!(text.contains("running"));
         assert!(text.contains("conversation"));
         // The composer and footer are present.
-        assert!(text.contains("Enter send"));
+        assert!(text.contains("Enter queue"));
     }
 
     #[test]
@@ -1650,7 +1890,7 @@ mod tests {
         });
         let text = snapshot(&state, 70, 30, Tab::Tasks);
         assert!(text.contains("needs you"));
-        assert!(text.contains("approve"));
+        assert!(text.contains("allow"));
         assert!(text.contains("deny"));
 
         let timeline = snapshot(&state, 70, 30, Tab::Timeline);
@@ -1664,7 +1904,7 @@ mod tests {
         for (width, height) in [(80, 24), (40, 12), (120, 44)] {
             let text = snapshot(&state, width, height, Tab::Timeline);
             assert!(
-                text.contains("Keyboard shortcuts"),
+                text.contains("shortcuts"),
                 "help missing at {width}x{height}"
             );
         }
@@ -1824,7 +2064,10 @@ mod tests {
             elapsed_ms: 900,
         });
         state.apply(&SessionEvent::RequestQueued {
-            text: "then update the docs".to_owned(),
+            request: crate::session::QueuedRequest {
+                id: 1,
+                prompt: "then update the docs".to_owned(),
+            },
         });
 
         let text = snapshot(&state, 160, 44, Tab::Tasks);
@@ -1931,7 +2174,9 @@ mod tests {
             "ascii chrome produced non-ascii pixels:\n{text}"
         );
 
-        // The state words and structure survive without any glyphs.
+        state.approval_open = false;
+        let text = snapshot_themed(&state, 110, 34, Tab::Timeline, &theme);
+        assert!(text.is_ascii());
         assert!(text.contains("failed"));
         assert!(text.contains("waiting"));
         assert!(text.contains("+--"));
@@ -2143,5 +2388,46 @@ mod tests {
         assert!(ascii.contains("Using ChatGPT plan"));
         assert!(ascii.contains("fixture@example.invalid"));
         assert!(ascii.is_ascii());
+    }
+
+    #[test]
+    fn a_long_unicode_workspace_name_never_slices_a_character() {
+        for width in [30, 60, 80, 140] {
+            let state = WorkbenchState::new(format!("/workspace/{}", "界🚀é".repeat(30)));
+            assert!(!snapshot(&state, width, 18, Tab::Timeline).is_empty());
+        }
+    }
+
+    #[test]
+    fn exact_approval_is_scrollable_past_the_transcript_limit_at_every_size() {
+        let mut state = WorkbenchState::new("/workspace");
+        let args = serde_json::json!({"path":"src/lib.rs", "expect_hash":"fresh-revision", "changes": serde_json::json!([
+            {"old":"before", "new":format!("{}END_OF_EXACT_PATCH", "new line\n".repeat(800))}
+        ]).to_string()});
+        state.apply(&SessionEvent::ToolCallProposed {
+            task: TaskId(1),
+            turn: TurnId(1),
+            call_id: "fingerprint".into(),
+            name: "files/edit".into(),
+            arguments: args.clone(),
+        });
+        state.apply(&SessionEvent::WaitingForUser {
+            task: TaskId(1),
+            turn: TurnId(1),
+            wait: crate::WaitKind::Approval {
+                approval_key: "fingerprint".into(),
+            },
+            message: "Allow exact edit?".into(),
+        });
+        for (width, height) in [(60, 18), (80, 24), (140, 40)] {
+            state.approval_scroll = 0;
+            let first = snapshot(&state, width, height, Tab::Timeline);
+            assert!(first.contains("src/lib.rs"));
+            assert!(first.contains("Alt+A"));
+            state.approval_scroll = usize::MAX;
+            let last = snapshot(&state, width, height, Tab::Timeline);
+            assert!(last.contains("END_OF_EXACT_PATCH"), "{last}");
+        }
+        assert_eq!(state.proposed_action.as_ref().unwrap().2, args);
     }
 }

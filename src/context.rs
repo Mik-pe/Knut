@@ -75,6 +75,52 @@ impl SourceExcerpt {
     }
 }
 
+pub(crate) fn named_source_paths(workspace: &Workspace, prompt: &str) -> Vec<String> {
+    let mut paths = Vec::new();
+    for token in prompt.split_whitespace() {
+        let path = token
+            .trim_matches(['`', '\'', '"', '(', ')', ',', ';'])
+            .trim_end_matches(['.', ':', '!', '?']);
+        if !(path.contains('/') || path.contains('.')) {
+            continue;
+        }
+        let Ok(safe) = workspace.resolve(path) else {
+            continue;
+        };
+        if !workspace.is_denied(safe.relative())
+            && safe.absolute().is_file()
+            && !paths.iter().any(|path| path == safe.relative())
+        {
+            paths.push(safe.relative().to_owned());
+            if paths.len() == 3 {
+                break;
+            }
+        }
+    }
+    paths
+}
+
+pub(crate) fn source_from_read(output: &serde_json::Value) -> Option<SourceExcerpt> {
+    let lines = output.get("lines")?.as_array()?;
+    let text = lines
+        .iter()
+        .map(|line| line.get("text").and_then(serde_json::Value::as_str))
+        .collect::<Option<Vec<_>>>()?
+        .join("\n");
+    Some(SourceExcerpt {
+        path: output.get("path")?.as_str()?.to_owned(),
+        start_line: output.get("start_line")?.as_u64()? as usize,
+        end_line: output.get("end_line")?.as_u64()? as usize,
+        content_hash: output.get("content_hash")?.as_str()?.to_owned(),
+        truncated: output
+            .get("truncated")
+            .and_then(serde_json::Value::as_bool)
+            .unwrap_or(true)
+            || text.chars().count() > 4000,
+        text: text.chars().take(4000).collect(),
+    })
+}
+
 /// A diagnostic reference: a pointer, not a copy.
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub struct DiagnosticRef {

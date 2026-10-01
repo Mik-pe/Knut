@@ -261,19 +261,65 @@ pub fn sanitize_for_display(text: &str) -> String {
 
 /// One-line summary of a structured tool result.
 pub fn summarize_value(value: &Value) -> String {
-    if value.is_null() {
-        return String::new();
-    }
-    match value {
-        Value::String(text) => {
-            let first_line = text.lines().next().unwrap_or_default();
-            first_line.chars().take(120).collect()
+    let text = if value.is_null() {
+        String::new()
+    } else if let Some(reason) = value.get("reason").and_then(Value::as_str) {
+        let mut summary = reason.to_owned();
+        if let Some(counts) = value.get("test_counts") {
+            for key in ["passed", "failed", "ignored"] {
+                if let Some(count) = counts[key].as_u64() {
+                    summary.push_str(&format!(" / {count} {key}"));
+                }
+            }
         }
-        other => {
-            let text = other.to_string();
-            text.chars().take(120).collect()
+        summary
+    } else if let Some(path) = value.get("path").and_then(Value::as_str) {
+        if let (Some(start), Some(end)) = (value.get("start_line"), value.get("end_line")) {
+            format!(
+                "{path} / lines {start}-{end}{}",
+                if value["truncated"] == true {
+                    " / excerpt"
+                } else {
+                    ""
+                }
+            )
+        } else if let Some(bytes) = value.get("bytes").and_then(Value::as_u64) {
+            format!("{path} / {bytes} bytes written")
+        } else {
+            path.to_owned()
         }
-    }
+    } else if let Some(matches) = value.get("matches").and_then(Value::as_array) {
+        format!(
+            "{} search matches{}",
+            matches.len(),
+            if value["truncated"] == true {
+                " / truncated"
+            } else {
+                ""
+            }
+        )
+    } else if let Some(error) = value.get("error").and_then(Value::as_str) {
+        error.to_owned()
+    } else if let Some(text) = value.as_str() {
+        match serde_json::from_str::<Vec<Value>>(text) {
+            Ok(changes)
+                if !changes.is_empty()
+                    && changes.iter().all(|change| {
+                        change.get("old").is_some() && change.get("new").is_some()
+                    }) =>
+            {
+                format!("Prepared {} exact replacement(s)", changes.len())
+            }
+            _ => text.lines().next().unwrap_or_default().to_owned(),
+        }
+    } else {
+        value.to_string()
+    };
+    sanitize_for_display(&text)
+        .replace(['\n', '\r'], " ")
+        .chars()
+        .take(120)
+        .collect()
 }
 
 #[cfg(test)]
@@ -408,6 +454,22 @@ mod tests {
         assert_eq!(
             CardState::from_node_status(NodeStatus::Succeeded),
             CardState::Succeeded
+        );
+    }
+    #[test]
+    fn tool_and_check_summaries_show_results_instead_of_protocol_json() {
+        let read = summarize_value(
+            &json!({"path":"src/lib.rs", "start_line":10, "end_line":20, "content_hash":"hidden", "lines":[]}),
+        );
+        assert_eq!(read, "src/lib.rs / lines 10-20");
+        let check = summarize_value(
+            &json!({"reason":"exit 101", "test_counts":{"passed":4,"failed":1,"ignored":0}}),
+        );
+        assert!(check.contains("1 failed"));
+        assert!(!check.contains('{'));
+        assert_eq!(
+            summarize_value(&json!("[{\"old\":\"x\",\"new\":\"y\"}]")),
+            "Prepared 1 exact replacement(s)"
         );
     }
 }

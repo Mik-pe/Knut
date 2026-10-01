@@ -100,6 +100,131 @@ passed 607 library tests, 2 CLI tests, and 4 hidden regressions.
 The verified Knut-generated composer patch is now
 applied to this working tree.
 
-The end-to-end repository milestone is complete. Queue/steer semantics, richer
-project setup, eliminating path-only model calls, complete usage accounting,
-and held-out multi-repository evaluation remain follow-up work.
+That pass completed the end-to-end repository milestone. The next pass below
+addresses queue/steer semantics and source grounding; richer project setup,
+complete usage accounting and held-out evaluation remain open.
+
+## Harness and interaction pass
+
+Planning now receives bounded source excerpts for up to three explicitly named
+files, obtained through the execution gate. Literal tool arguments and typed
+references are checked before execution. A rejected plan gets one repair with
+the actual rejected output and precise errors. Generated nodes receive the
+original task, repository instructions and latest repair evidence directly.
+
+Recovery retains diagnostic locations, causes and tails instead of only log
+prefixes. Jev receives actual failure evidence and batches classification with
+diagnostic prioritization. Priority is advisory: all failures remain available,
+and code still enforces permissions, retry budgets and fresh passing checks.
+The default model is pinned to `jev-1.13.0`; recovery's confidence floor remains
+an uncalibrated abstention heuristic.
+
+The opt-in live recovery smoke also passed against `jev-1.13.0`: one request
+classified the compiler/test failures as verification failures and prioritized
+the compiler diagnostic over the downstream test failure. Both answers validated
+against the submitted question pack. This establishes API compatibility for one
+example, not calibration. Output: `/var/tmp/knut-jev-recovery-live.log`.
+
+Session/JSONL protocol version 2 removes implicit steer-or-queue classification.
+The runtime owns queued requests, editing, removal and dispatch. Completion
+advances the queue; cancellation and failure hold it. Steering preserves the
+original goal and interrupts a stalled provider. TUI queue editing preserves
+the previous draft through acknowledgement. Approval previews retain complete
+arguments, show replacement text before the identity and support scrolling.
+File/check summaries and Unicode header truncation were corrected.
+
+Validation: 625 library tests and 2 CLI tests, formatting, clippy with warnings
+denied, and build pass. Tests use `--test-threads=2`: the initial unrestricted
+run hit the existing synthetic latency assertion on the busy host; the assertion
+was not relaxed. `scripts/smoke-harness.mjs` passed through JSONL with deliberate
+invalid arguments, a failing first patch, real repair/checks, two exact approvals,
+queue editing/removal and two completed tasks. Independent tests preserved the
+original assertion. Evidence: `/var/tmp/knut-harness-smoke-whNmxQ`.
+
+Direct tuistory terminal sessions passed at 60x18, 80x24 and 140x40: submit,
+scroll/resize exact approvals, repair, complete and exit while preserving the
+unfinished draft. Snapshots: `/var/tmp/knut-ui-review-J2UnP7`; workspace:
+`/var/tmp/knut-harness-smoke-qOnUL0`.
+
+### Retained live development trials
+
+All three used GLM-5.3 Flash at low effort, a 45-second provider request timeout,
+pinned Jev, and an isolated tiny Rust workspace. The task was to make `value()`
+return seven while preserving the existing test and public API. Writes were
+pre-approved in these disposable fixtures. Every attempt is retained.
+
+| Attempt | Outcome | Evidence |
+| --- | --- | --- |
+| Before named-source reads | Failed: guessed replacement text did not match; subsequent planning/repair omitted required fields. No edit; independent test failed. | `/var/tmp/knut-live-harness-tf0jklmv` |
+| With named-source reads, flawed trial logging | Correct edit and passing checks, but no verified completion. The trial wrote its live log inside the checked workspace, changing the revision during verification. Excluded from quality comparisons. | `/var/tmp/knut-live-harness-_wldkivp` |
+| With logs outside the workspace | Verified completion; exact expected edit, unchanged test and independent test passed. One generator call, 1,653 input / 334 output tokens; 12.035 seconds for the run. | `/var/tmp/knut-live-review-x7rrs7cb` |
+
+These are iterative development probes of one inspected task, not a paired or
+held-out benchmark. The census excludes Jev usage, cached-token breakdown and
+cost. Neither a success-rate improvement nor Jev's contribution is established.
+
+Next validation should compare matched engine policies over held-out tasks.
+Full log inspection, file attachments, durable draft/session resume and
+richer completion summaries remain UX work. Queue acknowledgements now
+preempt a quiet, abandon-safe tick; completion summaries carry check
+evidence for the exact revision. See
+[CLI_UX.md](CLI_UX.md) and the local `TASKS.md` for the updated backlog.
+
+## Knot identity and editor polish
+
+The unused static knot module was replaced with a bounded, depth-shaded trefoil
+renderer, shared by the welcome and header. Its travelling highlight has a
+2.4-second opening sequence and follows active work. Waiting, pause and terminal
+states are static; reduced motion is available from `/motion` or
+`KNUT_TUI_MOTION=off`. Animation follows elapsed time rather than input frequency,
+and settled idle screens no longer redraw continuously. Explicit color overrides
+now reach Crossterm even when `NO_COLOR` is inherited.
+
+The composer now keeps a multiline paste as one undoable operation, preserves
+graphemes at the size boundary, normalizes CRLF, and reports truncation. History
+browsing restores the unfinished draft and cursor. Word navigation/deletion,
+scrollable help and narrow-screen hints are connected to the live shell.
+
+Final validation passed 621 library tests and 2 CLI tests, formatting, clippy
+with warnings denied, and build. Obsolete static-art fixtures were removed with
+the old renderer. `scripts/smoke-tui.mjs --screenshots` passed 30 terminal
+observations with a local provider, including 30x12 through 140x40, truecolor
+with inherited `NO_COLOR`, ASCII/reduced motion, word editing, help scrolling,
+two approvals, a failed first patch, repair and draft-preserving completion.
+Evidence: `/tmp/knut-tui-smoke-jYWom3`.
+
+The screenshot and animated opening capture in `assets/knut-terminal.*` come
+from the actual rebuilt terminal UI. The capture contains 25 distinct rendered
+frames. The preview GIF loops; the live welcome settles after its introduction.
+
+## Workspace input memory
+
+The TUI now restores drafts, grapheme cursor positions and bounded prompt
+history per canonical workspace. The existing SQLite store migrates to schema 2;
+background saves coalesce every 400 ms and normal exit flushes the latest input.
+Ctrl+Q keeps the draft when leaving an idle session. History browsing and queue
+editing preserve the underlying draft. Conflicting terminal writes and unreadable
+storage report errors. This does not resume tasks, queue edits or approvals.
+
+Validation passed: 632 library tests, 2 CLI tests, formatting, clippy with warnings
+denied and build. Regressions cover Unicode cursors, bounded history, workspace
+isolation and aliases, conflicting saves, corrupt input, schema migration and
+flushing the latest edit. The terminal smoke passed 35 observations, including
+restart, restored-cursor insertion and prompt-history recall. Evidence:
+`/tmp/knut-tui-smoke-Zm9z44`. The smoke uses a local provider fixture.
+
+## Integrated connection and interaction changes
+
+Resolved the autostash conflicts against the connection-settings work. Settings,
+ChatGPT plan labels and model-change guards remain available alongside explicit
+queue/steer commands, recovery evidence, exact approvals and workspace input
+memory. Queue requests made before a provider stalls now receive acknowledgements
+after the quiet-period deadline without requiring another keystroke. The
+regression sends the request immediately after the first streamed fragment.
+
+Validation passed: formatting, clippy with warnings denied, 665 library tests,
+2 CLI tests, 2 provider-settings integration tests and build. The JSONL smoke
+passed two exact approvals and two completed tasks with independent checks.
+The terminal smoke passed 38 observations, including F2 settings with draft
+preservation, restart recovery and repair. Both smoke scripts isolate saved
+connection settings so they always use their local fixture provider.

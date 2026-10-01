@@ -19,6 +19,7 @@
 //!   failure, rather than passing a scripted demo off as live work.
 
 use std::sync::Arc;
+use std::sync::atomic::{AtomicBool, Ordering};
 
 use tokio::sync::mpsc::{UnboundedReceiver, UnboundedSender};
 
@@ -396,16 +397,22 @@ pub struct Engine {
     /// The workspace, retained so on-demand checks run against the real
     /// tree rather than a copy.
     workspace: Option<Workspace>,
+    /// Whether the in-flight tick may be dropped to acknowledge a queue
+    /// command. Set by the runtime at tick phase boundaries; read when a
+    /// queue command arrives mid-tick.
+    tick_abandon_safe: Arc<AtomicBool>,
 }
 
 impl Engine {
     fn new(runtime: SessionRuntime<LiveRouter>, workspace: Option<Workspace>) -> Self {
+        let tick_abandon_safe = runtime.tick_abandon_safe();
         let (sender, live_events) = tokio::sync::mpsc::unbounded_channel();
         Self {
             runtime: runtime.with_event_sink(sender),
             workspace,
             cursor: 0,
             live_events,
+            tick_abandon_safe,
         }
     }
 
@@ -513,6 +520,14 @@ impl Engine {
     }
 }
 
+/// How long a tick may go without emitting an event before a queue
+/// command preempts it. Below this a tick is observably alive
+/// (streaming deltas keep flowing, so the ack follows at the next
+/// boundary without disturbing the turn); beyond it the tick is
+/// observably stuck and the acknowledgement must not wait it out.
+/// Longer than normal streaming gaps, shorter than a stuck UI.
+const QUEUE_PREEMPT_GRACE: std::time::Duration = std::time::Duration::from_secs(2);
+
 /// The driver loop: owns the engine, drains commands and pumps events
 /// until the shell drops its receiver.
 pub async fn run_engine(
@@ -537,6 +552,15 @@ pub async fn run_engine_with_connections(
     let mut live = std::mem::replace(&mut engine.live_events, replacement);
     let mut pending = std::collections::VecDeque::new();
     let mut drive = false;
+    // When the shell last saw progress: queue commands preempt a quiet,
+    // abandon-safe tick (stuck provider) but never one that is visibly
+    // working or holding supervised work. last_preempt keeps the window
+    // open for interaction bursts (queue, then immediately edit it):
+    // the restarted tick has no progress worth protecting yet, and the
+    // re-emitted first fragment must not re-arm the silence clock
+    // against the rest of the burst.
+    let mut last_progress = std::time::Instant::now();
+    let mut last_preempt: Option<std::time::Instant> = None;
     loop {
         if let Some(command) = pending.pop_front() {
             let description = describe(&command);
@@ -560,9 +584,16 @@ pub async fn run_engine_with_connections(
                             disconnected = true;
                             break;
                         }
+                        last_progress = std::time::Instant::now();
                     }
                     state = &mut tick => {
                         drive = matches!(state, Some(TaskState::Running | TaskState::Queued));
+                        break;
+                    }
+                    _ = tokio::time::sleep(QUEUE_PREEMPT_GRACE.saturating_sub(last_progress.elapsed())),
+                        if pending.iter().any(is_queue_command)
+                            && engine.tick_abandon_safe.load(Ordering::SeqCst) => {
+                        last_preempt = Some(std::time::Instant::now());
                         break;
                     }
                     request = connections.recv(), if !connections.is_closed() => {
@@ -573,6 +604,36 @@ pub async fn run_engine_with_connections(
                     command = commands.recv() => {
                         match command {
                             Some(SessionCommand::Cancel) => { cancelled = true; break; }
+                            Some(command @ SessionCommand::Steer { .. }) => {
+                                if matches!(&command, SessionCommand::Steer { prompt } if !prompt.trim().is_empty()) {
+                                    pending.push_front(command);
+                                    break;
+                                }
+                                pending.push_back(command);
+                            }
+                            Some(
+                                command @ (SessionCommand::Queue { .. }
+                                | SessionCommand::UpdateQueued { .. }
+                                | SessionCommand::RemoveQueued { .. }
+                                | SessionCommand::RunQueued { .. }),
+                            ) => {
+                                pending.push_back(command);
+                                // The ack must not wait out a stuck tick,
+                                // but preempting costs a turn and restarts
+                                // the provider call: only a quiet tick that
+                                // holds no supervised work is preempted, or
+                                // a tick restarted for the same burst.
+                                let quiet =
+                                    last_progress.elapsed() >= QUEUE_PREEMPT_GRACE;
+                                let bursting = last_preempt
+                                    .is_some_and(|at| at.elapsed() < QUEUE_PREEMPT_GRACE);
+                                if engine.tick_abandon_safe.load(Ordering::SeqCst)
+                                    && (quiet || bursting)
+                                {
+                                    last_preempt = Some(std::time::Instant::now());
+                                    break;
+                                }
+                            }
                             Some(command) => pending.push_back(command),
                             None => { disconnected = true; break; }
                         }
@@ -610,6 +671,7 @@ pub async fn run_engine_with_connections(
                 }
                 event = live.recv() => {
                     if let Some(event) = event && events.send(event).is_err() { disconnected = true; }
+                    last_progress = std::time::Instant::now();
                 }
                 command = commands.recv() => {
                     match command {
@@ -638,11 +700,24 @@ pub async fn run_engine_with_connections(
 }
 
 /// A short label for a command, used when reporting a refusal.
+fn is_queue_command(command: &SessionCommand) -> bool {
+    matches!(
+        command,
+        SessionCommand::Queue { .. }
+            | SessionCommand::UpdateQueued { .. }
+            | SessionCommand::RemoveQueued { .. }
+            | SessionCommand::RunQueued { .. }
+    )
+}
+
 fn describe(command: &SessionCommand) -> &'static str {
     match command {
         SessionCommand::Submit { .. } => "submit",
         SessionCommand::Steer { .. } => "steer",
-        SessionCommand::SteerOrQueue { .. } => "steer",
+        SessionCommand::Queue { .. } => "queue",
+        SessionCommand::UpdateQueued { .. } => "update queue",
+        SessionCommand::RemoveQueued { .. } => "remove queued request",
+        SessionCommand::RunQueued { .. } => "run queued request",
         SessionCommand::Answer { .. } => "answer",
         SessionCommand::Approve { .. } => "approve",
         SessionCommand::Deny { .. } => "deny",
@@ -1075,26 +1150,102 @@ mod tests {
         }
     }
 
+    struct GenerateRule;
+    impl crate::SystemZeroRule for GenerateRule {
+        fn name(&self) -> &str {
+            "test-generation"
+        }
+        fn evaluate(&self, _: &crate::DecisionInput) -> crate::RuleVerdict {
+            crate::RuleVerdict::Decide(Decision {
+                route: Route::Generate,
+                confidence: 1.0,
+                retrieval: None,
+                capability: None,
+                model_tier: ModelTier::Reasoner,
+                risk: Risk::Low,
+                parallelizable: false,
+            })
+        }
+    }
+    #[tokio::test]
+    async fn queue_acknowledgements_do_not_wait_for_the_active_tick() {
+        // The bug this guards: queue edits that only arrived after the
+        // running task's next tick left the jobs view stuck on "Saving
+        // queued request..." for the whole provider call. Acks are
+        // emitted synchronously by the runtime and must reach the shell
+        // while the provider is still stalled.
+        let cascade = Arc::new(ComputeCascade::empty().with_reasoner(StalledStream));
+        let router = Knut::new(LiveRouter::new(None))
+            .with_system_zero(SystemZero::empty().with_rule(GenerateRule));
+        let runtime = SessionRuntime::new(
+            Arc::new(router),
+            Planner::new(cascade.clone()),
+            Arc::new(ToolRegistry::default()),
+            Arc::new(ExecutionGate::new(SideEffectPolicy::new())),
+            cascade,
+            Arc::new(crate::AcceptAllVerifier),
+        );
+        let engine = Engine::new(runtime, None);
+        let (commands, command_rx) = tokio::sync::mpsc::unbounded_channel();
+        let (events, mut event_rx) = tokio::sync::mpsc::unbounded_channel();
+        let driver = tokio::spawn(run_engine(engine, command_rx, events));
+        commands
+            .send(SessionCommand::Submit {
+                prompt: "hello".to_owned(),
+            })
+            .unwrap();
+        // The first fragment proves the task is Running with a stalled
+        // provider tick in flight.
+        tokio::time::timeout(std::time::Duration::from_secs(5), async {
+            loop {
+                if matches!(event_rx.recv().await.unwrap(), SessionEvent::TextDelta { text, .. } if text == "first fragment") { break; }
+            }
+        }).await.expect("fragment was buffered behind stalled provider");
+        // Queue before the grace period expires: the stalled provider must
+        // still be preempted without needing another keystroke.
+        commands
+            .send(SessionCommand::Queue {
+                prompt: "second task".to_owned(),
+            })
+            .unwrap();
+        tokio::time::timeout(std::time::Duration::from_secs(5), async {
+            loop {
+                if matches!(
+                    event_rx.recv().await.unwrap(),
+                    SessionEvent::RequestQueued { .. }
+                ) {
+                    break;
+                }
+            }
+        })
+        .await
+        .expect("queue ack waited for the stalled provider tick");
+        commands
+            .send(SessionCommand::UpdateQueued {
+                id: 1,
+                prompt: "second task edited".to_owned(),
+            })
+            .unwrap();
+        tokio::time::timeout(std::time::Duration::from_secs(5), async {
+            loop {
+                if matches!(
+                    event_rx.recv().await.unwrap(),
+                    SessionEvent::RequestUpdated { .. }
+                ) {
+                    break;
+                }
+            }
+        })
+        .await
+        .expect("queue-edit ack waited for the stalled provider tick");
+        commands.send(SessionCommand::Cancel).unwrap();
+        drop(commands);
+        driver.await.unwrap();
+    }
+
     #[tokio::test]
     async fn live_stream_reaches_client_and_cancel_interrupts_stalled_provider() {
         let cascade = Arc::new(ComputeCascade::empty().with_reasoner(StalledStream));
-        struct GenerateRule;
-        impl crate::SystemZeroRule for GenerateRule {
-            fn name(&self) -> &str {
-                "test-generation"
-            }
-            fn evaluate(&self, _: &crate::DecisionInput) -> crate::RuleVerdict {
-                crate::RuleVerdict::Decide(Decision {
-                    route: Route::Generate,
-                    confidence: 1.0,
-                    retrieval: None,
-                    capability: None,
-                    model_tier: ModelTier::Reasoner,
-                    risk: Risk::Low,
-                    parallelizable: false,
-                })
-            }
-        }
         let router = Knut::new(LiveRouter::new(None))
             .with_system_zero(SystemZero::empty().with_rule(GenerateRule));
         let runtime = SessionRuntime::new(
@@ -1139,6 +1290,31 @@ mod tests {
                 .unwrap()
                 .is_err()
         );
+        commands
+            .send(SessionCommand::Steer {
+                prompt: "keep the original goal and inspect Unicode".to_owned(),
+            })
+            .unwrap();
+        tokio::time::timeout(std::time::Duration::from_secs(5), async {
+            loop {
+                if matches!(
+                    event_rx.recv().await.unwrap(),
+                    SessionEvent::TaskSteered { .. }
+                ) {
+                    break;
+                }
+            }
+            loop {
+                if matches!(
+                    event_rx.recv().await.unwrap(),
+                    SessionEvent::TextDelta { .. }
+                ) {
+                    break;
+                }
+            }
+        })
+        .await
+        .expect("steering waited for the stalled provider");
         commands.send(SessionCommand::Cancel).unwrap();
         tokio::time::timeout(std::time::Duration::from_secs(5), async {
             loop {

@@ -91,7 +91,7 @@ pub struct ArtifactRefSpec {
     pub pointer: Option<String>,
 }
 
-fn ref_spec(input: &Value) -> Result<Option<ArtifactRefSpec>, PlanError> {
+pub(crate) fn ref_spec(input: &Value) -> Result<Option<ArtifactRefSpec>, PlanError> {
     let Some(map) = input.as_object().filter(|map| map.contains_key("$ref")) else {
         return Ok(None);
     };
@@ -378,6 +378,9 @@ pub enum PlanError {
     #[error("malformed artifact reference in {node:?}: {reason}")]
     InvalidRef { node: String, reason: String },
 
+    #[error("invalid arguments for node {id:?}: {reason}")]
+    InvalidArguments { id: String, reason: String },
+
     #[error("AskUser node {id:?} has an empty question")]
     EmptyQuestion { id: String },
 }
@@ -518,13 +521,20 @@ fn validate_node(
             tool_id,
             input,
         } => {
-            if registry.find_exact(capability, tool_id).is_err() {
-                return Err(PlanError::UnknownTool {
-                    capability: capability.clone(),
-                    tool_id: tool_id.clone(),
-                });
-            }
+            let metadata =
+                registry
+                    .find_exact(capability, tool_id)
+                    .map_err(|_| PlanError::UnknownTool {
+                        capability: capability.clone(),
+                        tool_id: tool_id.clone(),
+                    })?;
             validate_refs(id, input, known_ids, produced)?;
+            crate::tool::validate_planned_arguments(&metadata.input_schema, input).map_err(
+                |error| PlanError::InvalidArguments {
+                    id: id.clone(),
+                    reason: error.to_string(),
+                },
+            )?;
             Ok(())
         }
         PlanNode::Generate {
@@ -945,7 +955,23 @@ impl TreeExecutor {
                     }
                     (None, _) => false,
                 };
-                let _ = id;
+                if !verified {
+                    let detail = match outputs.get(target) {
+                        Some(Value::String(text)) => format!(
+                            "{}\nRejected artifact: {}",
+                            serde_json::from_str::<Value>(text)
+                                .err()
+                                .map(|error| error.to_string())
+                                .unwrap_or_else(|| "empty artifact".to_owned()),
+                            crate::recovery::bounded_tail(text, 2000)
+                        ),
+                        _ => "missing or empty artifact".to_owned(),
+                    };
+                    errors.insert(
+                        id.clone(),
+                        format!("Expected {artifact:?} from node {target}: {detail}"),
+                    );
+                }
                 if verified {
                     NodeStatus::Succeeded
                 } else {

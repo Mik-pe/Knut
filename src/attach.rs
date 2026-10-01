@@ -216,6 +216,12 @@ pub fn command_catalog() -> Vec<PaletteCommand> {
             availability: CommandAvailability::Available,
         },
         PaletteCommand {
+            id: "queue",
+            title: "Queue next task",
+            description: "Keep this draft as a separate task after the active one",
+            availability: CommandAvailability::Available,
+        },
+        PaletteCommand {
             id: "pause",
             title: "Pause task",
             description: "Stop dispatching new work",
@@ -269,6 +275,12 @@ pub fn command_catalog() -> Vec<PaletteCommand> {
             id: "doctor",
             title: "Diagnose setup",
             description: "Report configured providers without calling them",
+            availability: CommandAvailability::Available,
+        },
+        PaletteCommand {
+            id: "motion",
+            title: "Toggle animations",
+            description: "Switch between the animated knot and reduced motion",
             availability: CommandAvailability::Available,
         },
         PaletteCommand {

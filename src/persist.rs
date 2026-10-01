@@ -31,8 +31,23 @@ use serde::{Deserialize, Serialize};
 use crate::KnutError;
 use crate::session::SessionEvent;
 
+mod editor;
+pub(crate) use editor::EditorMemory;
+
 /// Current schema version. Migrations are applied forward only.
-pub const SCHEMA_VERSION: i64 = 1;
+pub const SCHEMA_VERSION: i64 = 2;
+
+pub fn session_store_path() -> PathBuf {
+    if let Some(path) = std::env::var_os("KNUT_SESSION_STORE").filter(|path| !path.is_empty()) {
+        return PathBuf::from(path);
+    }
+    let base = std::env::var_os("XDG_DATA_HOME")
+        .filter(|path| Path::new(path).is_absolute())
+        .map(PathBuf::from)
+        .or_else(|| std::env::var_os("HOME").map(|home| PathBuf::from(home).join(".local/share")))
+        .unwrap_or_default();
+    base.join("knut").join("sessions.db")
+}
 
 /// Whether an operation ever finished, and how.
 ///
@@ -290,9 +305,21 @@ impl SessionStore {
                     "#,
                 )
                 .map_err(|err| KnutError::Tool(format!("creating schema: {err}")))?;
+        }
+
+        if version < 2 {
             self.connection
-                .execute_batch(&format!("PRAGMA user_version = {SCHEMA_VERSION}"))
-                .map_err(|err| KnutError::Tool(format!("setting schema version: {err}")))?;
+                .execute_batch(
+                    "BEGIN IMMEDIATE;
+                     CREATE TABLE IF NOT EXISTS editor_memory (
+                         workspace BLOB PRIMARY KEY,
+                         revision INTEGER NOT NULL,
+                         payload TEXT NOT NULL
+                     );
+                     PRAGMA user_version = 2;
+                     COMMIT;",
+                )
+                .map_err(|err| KnutError::Tool(format!("upgrading editor storage: {err}")))?;
         }
 
         Ok(())

@@ -28,6 +28,7 @@ mod persist;
 mod planner;
 mod policy;
 mod provider;
+mod recovery;
 mod review;
 mod runtime;
 mod sandbox;
@@ -113,7 +114,7 @@ pub use judgment::{
     Complexity, Handler, IngressJudgments, Judgment, JudgmentRouter, JudgmentSystemOne,
     RetrievalJudgment, StaticJudgments, TierJudgment, YesNo,
 };
-pub use knot::{Art, KNOT_LARGE, KNOT_MEDIUM, KNOT_SMALL, TAGLINE, WORDMARK, art_for, logo_lines};
+pub use knot::logo_lines;
 pub use lsp::{
     Degradation, Diagnostic, DiagnosticSeverity, DiagnosticsState, DocumentVersions,
     LSP_PROTOCOL_VERSION, LanguageServerManager, Location, LspFeature, MAX_NAVIGATION_RESULTS,
@@ -145,7 +146,7 @@ pub use patch::{
 };
 pub use persist::{
     OperationRecord, PersistedOutcome, ResumeBlocker, ResumePlan, SCHEMA_VERSION, SessionExport,
-    SessionStore, SessionSummary, redact_path, replay_state,
+    SessionStore, SessionSummary, redact_path, replay_state, session_store_path,
 };
 pub use planner::{MAX_DEPTH, MAX_NODES, PlanRejection, Planner, PlanningContext, ValidatedPlan};
 pub use policy::{
@@ -169,9 +170,9 @@ pub use sandbox::{
     register_command_tools, sanitize_terminal,
 };
 pub use session::{
-    EVENT_LOG_CAPACITY, MAX_REPLANS_PER_TASK, MAX_TURNS_PER_TASK, SESSION_PROTOCOL_VERSION,
-    SessionCommand, SessionEvent, SessionRuntime, TaskId, TaskRevision, TaskState, TurnId,
-    WaitKind, drive_until_stable,
+    EVENT_LOG_CAPACITY, MAX_REPLANS_PER_TASK, MAX_TURNS_PER_TASK, QueuedRequest,
+    SESSION_PROTOCOL_VERSION, SessionCommand, SessionEvent, SessionRuntime, TaskId, TaskRevision,
+    TaskState, TurnId, WaitKind, drive_until_stable,
 };
 pub use system_one::{StaticSystemOne, SystemOne};
 pub use system_zero::{

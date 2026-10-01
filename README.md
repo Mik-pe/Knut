@@ -163,6 +163,7 @@ Z.ai is the default when no saved ChatGPT model or explicit provider is selected
 | `KNUT_PROVIDER_REASONING_EFFORT` | explicit effort; GLM-5.3 uses `low`, `high`, `max`; GPT-6.1 Sol accepts `low`, `medium`, `high`, `xhigh`, `max` |
 | `KNUT_PROVIDER_TIMEOUT_SECONDS` | positive request timeout; default 120 seconds |
 | `TYPESAFE_API_KEY` | optional Jev credential; without it, the reasoner plans directly |
+| `TYPESAFE_MODEL` | Jev model override; default pinned to `jev-1.13.0` |
 | `KNUT_MODE` | `quality` (default) or `adaptive` |
 
 A decision model is optional. With only the reasoner configured, System Zero
@@ -217,13 +218,26 @@ edits happen only in the temporary copies. Compiler caches remain writable.
 
 ## Interactive CLI
 
+![Knut's woven knot and terminal workspace](assets/knut-terminal.png)
+
+The trefoil knot has a moving highlight on opening and during active work.
+It settles after the introduction and stays still while waiting for approval.
+[Watch the opening animation](assets/knut-terminal.gif).
+
 Run `knut` in a terminal (or `knut tui`) to open a coding session. The main
 screen is one conversation, a compact status line, and an input that grows with
 your draft. Jobs, routing details, and changes open only when requested.
 
-Type a task and press Enter. During a task, the next message goes through the
-runtime's steering/queue handling. Approvals are shown above the input; sending
-a message while an approval is pending preserves the draft.
+Type a task and press Enter. During work, Enter queues a separate task. Alt+S
+switches the current draft to steering, which adds a correction to the active
+goal. Successful completion starts the next queued task; failure or cancellation
+holds the queue. Open jobs to edit, remove or explicitly start held requests.
+Queue acknowledgements arrive at the next runtime boundary.
+
+Approvals open a scrollable preview of the exact action, replacements, read hash
+and complete arguments. Alt+V toggles the preview; PgUp/PgDn scrolls it. Enter
+while approval is pending preserves the draft unless steering was explicitly
+selected.
 
 | Key | Action |
 | --- | --- |
@@ -236,23 +250,44 @@ a message while an approval is pending preserves the draft.
 | Up / Down, Enter in commands | Select and run a command |
 | Ctrl+R | Open/close recorded changes and checks |
 | Ctrl+O | Open/close jobs and queued requests |
+| Alt+S | Switch the current draft between queue and steer during work |
+| Up / Down in jobs | Select a queued request |
+| Alt+E / Alt+X in jobs | Edit / remove the selected queued request |
+| Alt+R in jobs | Start the selected queued request when idle |
 | Ctrl+B | Open/close decision details |
 | PgUp / PgDn | Scroll the conversation or current detail view |
 | Tab / Shift+Tab | Switch input and conversation navigation |
 | Esc | Close a detail view or return to the latest output |
 | Alt+A / Alt+D | Allow / deny the exact pending approval |
+| Alt+V | Open/close the full pending-action preview |
+| Ctrl+Left / Right or Alt+B / F | Move by word |
+| Ctrl+W or Alt+Backspace | Delete the previous word |
 | Ctrl+C | Close an overlay; otherwise stop work, clear an idle draft, or exit |
 | Ctrl+D | Exit when idle with an empty draft |
+| Ctrl+Q | Save the draft and exit when idle |
 | ? / F1 | Quick shortcut modal (`?` with empty input; F1 anytime) |
 
 In changes, Left/Right selects a file, Up/Down selects a hunk, and PgUp/PgDn
 scrolls it. The review is read-only; it does not pretend to revert applied edits.
 Use the command menu for pause, resume, cancel, setup diagnostics, and checks.
 
-The theme uses warm text, muted teal accents, and explicit state labels. It
+The theme uses warm text, teal accents, and explicit state labels. It
 adapts to truecolor, 256 colors, 16 colors, and `NO_COLOR`; configure
-`KNUT_TUI_COLORS=truecolor|256|16|none` to override detection. Bracketed paste
-does not submit text, and the terminal is restored on exit.
+`KNUT_TUI_COLORS=truecolor|256|16|none` to override detection, including
+`NO_COLOR`. Use `/motion` to toggle animation, or `KNUT_TUI_MOTION=off` to
+start with reduced motion. `TERM=dumb` uses a static ASCII mark.
+Bracketed paste is one undoable edit, normalizes Windows newlines, and reports
+truncation. Browsing prompt history preserves the unfinished draft and cursor.
+The terminal is restored on exit.
+
+Drafts, cursor positions and recent prompt history survive restarts in the same
+workspace. Input is saved locally in the background every 400 ms and flushed on
+normal exit; Ctrl+Q keeps the draft for next time. Up/Down recalls saved history.
+Storage uses `$XDG_DATA_HOME/knut/sessions.db` (normally
+`~/.local/share/knut/sessions.db`), or `KNUT_SESSION_STORE`, with owner-only file
+permissions. History keeps up to 100 prompts within a one-million-character budget.
+Storage errors and conflicting saves from another terminal are reported.
+This restores input only; running tasks, queue edits and approvals are not resumed.
 
 See [CLI_UX.md](CLI_UX.md) for the design and remaining usability work.
 
@@ -274,6 +309,28 @@ $ knut route|repl|demo-tree|eval         offline playground (mock, demo-only)
 The playground commands are explicitly demo-only: they use a deterministic
 mock router and canned tools, and their numbers are not measurements of
 coding quality. `run`, `verify`, `bench` and `tui` use the real engine.
+
+Session and JSONL protocol version 2 replaces implicit steer-or-queue routing
+with `queue`, `steer`, `update_queued`, `remove_queued` and `run_queued` commands.
+Queue events carry stable request IDs. JSONL clients must consume version 2.
+
+For a local process regression using a deliberately fallible provider:
+
+```sh
+cargo build
+node scripts/smoke-harness.mjs
+```
+
+It uses an isolated Rust fixture, makes no paid provider calls, and verifies
+plan repair, failed-check recovery, exact approvals and queued task execution.
+This is not evidence of improved live-model success rates.
+
+For terminal regression checks, install the optional `tuistory` package where
+Node can resolve it, then run `node scripts/smoke-tui.mjs --screenshots`.
+For an existing installation, set `KNUT_TUISTORY_MODULE` to its absolute
+`dist/index.js` path. This uses the local fixture provider, exercises four
+terminal sizes, editing, help, approvals and repair, and saves snapshots in a
+temporary directory. It also checks truecolor overrides and ASCII/reduced motion.
 
 ## Architecture
 

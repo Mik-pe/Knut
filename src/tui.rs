@@ -102,12 +102,20 @@ pub fn handle_key(state: &mut WorkbenchState, key: KeyEvent, tab: &mut Tab) -> S
         return ShellAction::PaletteCommand("usage");
     }
     if ctrl && key.code == KeyCode::Char('c') {
-        if state.help || state.palette_open() || state.review.is_some() || *tab != Tab::Timeline {
+        if state.help
+            || state.palette_open()
+            || state.review.is_some()
+            || state.approval_open
+            || *tab != Tab::Timeline
+        {
             state.help = false;
+            state.approval_open = false;
             state.close_palette();
             state.review = None;
             *tab = Tab::Timeline;
             state.focus = Focus::Composer;
+        } else if state.queue_edit.is_some() {
+            state.restore_draft();
         } else if state.task_state.is_some_and(|s| !s.is_terminal()) {
             return ShellAction::Command(SessionCommand::Cancel);
         } else if !state.composer.is_empty() {
@@ -119,8 +127,16 @@ pub fn handle_key(state: &mut WorkbenchState, key: KeyEvent, tab: &mut Tab) -> S
         return ShellAction::Continue;
     }
     if state.help {
-        if matches!(key.code, KeyCode::Esc | KeyCode::F(1) | KeyCode::Char('?')) {
-            state.help = false;
+        match key.code {
+            KeyCode::Esc | KeyCode::F(1) | KeyCode::Char('?') => state.help = false,
+            KeyCode::Up => state.help_scroll = state.help_scroll.saturating_sub(1),
+            KeyCode::PageUp => state.help_scroll = state.help_scroll.saturating_sub(4),
+            KeyCode::Down | KeyCode::PageDown => {
+                let step = if key.code == KeyCode::PageDown { 4 } else { 1 };
+                state.help_scroll = (state.help_scroll + step)
+                    .min(crate::tui_render::shortcuts(state).len().saturating_sub(1));
+            }
+            _ => {}
         }
         return ShellAction::Continue;
     }
@@ -179,16 +195,30 @@ pub fn handle_key(state: &mut WorkbenchState, key: KeyEvent, tab: &mut Tab) -> S
             && (state.composer.text().is_empty() || state.review.is_some()))
     {
         state.help = true;
+        state.help_scroll = 0;
         return ShellAction::Continue;
     }
     if ctrl {
         return match key.code {
+            KeyCode::Left if state.review.is_none() => {
+                state.composer.word_left();
+                ShellAction::Continue
+            }
+            KeyCode::Right if state.review.is_none() => {
+                state.composer.word_right();
+                ShellAction::Continue
+            }
+            KeyCode::Char('w') | KeyCode::Backspace if state.review.is_none() => {
+                state.composer.delete_word_left();
+                ShellAction::Continue
+            }
             KeyCode::Char('p') | KeyCode::Char('k') => {
                 state.open_palette();
                 ShellAction::Continue
             }
             KeyCode::Char('r') => ShellAction::Review,
             KeyCode::Char('o') => {
+                state.approval_open = false;
                 state.detail_scroll = 0;
                 *tab = if *tab == Tab::Tasks {
                     Tab::Timeline
@@ -199,6 +229,7 @@ pub fn handle_key(state: &mut WorkbenchState, key: KeyEvent, tab: &mut Tab) -> S
                 ShellAction::Continue
             }
             KeyCode::Char('b') => {
+                state.approval_open = false;
                 state.detail_scroll = 0;
                 *tab = if *tab == Tab::Inspector {
                     Tab::Timeline
@@ -213,6 +244,18 @@ pub fn handle_key(state: &mut WorkbenchState, key: KeyEvent, tab: &mut Tab) -> S
                     && !state.task_state.is_some_and(|s| !s.is_terminal()) =>
             {
                 ShellAction::Quit
+            }
+            KeyCode::Char('q') => {
+                if state.queue_edit.is_some() {
+                    state.status =
+                        Some("Enter saves the queue edit; Esc restores your draft".to_owned());
+                    ShellAction::Continue
+                } else if state.task_state.is_some_and(|task| !task.is_terminal()) {
+                    state.status = Some("Ctrl+C stops the active task before closing".to_owned());
+                    ShellAction::Continue
+                } else {
+                    ShellAction::Quit
+                }
             }
             KeyCode::Char('a') if state.review.is_none() => {
                 state.composer.home();
@@ -242,10 +285,64 @@ pub fn handle_key(state: &mut WorkbenchState, key: KeyEvent, tab: &mut Tab) -> S
         };
     }
     if alt {
+        if state.review.is_none() {
+            match key.code {
+                KeyCode::Char('b') | KeyCode::Left => {
+                    state.composer.word_left();
+                    return ShellAction::Continue;
+                }
+                KeyCode::Char('f') | KeyCode::Right => {
+                    state.composer.word_right();
+                    return ShellAction::Continue;
+                }
+                KeyCode::Backspace => {
+                    state.composer.delete_word_left();
+                    return ShellAction::Continue;
+                }
+                _ => {}
+            }
+        }
+        if key.code == KeyCode::Char('s')
+            && state.queue_edit.is_none()
+            && state.task_state.is_some_and(|state| !state.is_terminal())
+        {
+            state.steer_draft = !state.steer_draft;
+            state.approval_open = false;
+            state.status = Some(
+                if state.steer_draft {
+                    "Steer current task · Alt+S switches to queue"
+                } else {
+                    "Queue next task · Alt+S switches to steer"
+                }
+                .to_owned(),
+            );
+            return ShellAction::Continue;
+        }
+        if *tab == Tab::Tasks
+            && let Some(request) = state.queued.get(state.queued_selection)
+        {
+            match key.code {
+                KeyCode::Char('e') => {
+                    state.edit_queued();
+                    return ShellAction::Continue;
+                }
+                KeyCode::Char('x') => {
+                    return ShellAction::Command(SessionCommand::RemoveQueued { id: request.id });
+                }
+                KeyCode::Char('r') => {
+                    return ShellAction::Command(SessionCommand::RunQueued { id: request.id });
+                }
+                _ => {}
+            }
+        }
         if let Some(pending) = &state.pending
             && let crate::session::WaitKind::Approval { approval_key } = &pending.kind
         {
             return match key.code {
+                KeyCode::Char('v') => {
+                    state.approval_open = !state.approval_open;
+                    ShellAction::Continue
+                }
                 KeyCode::Char('a') => ShellAction::Command(SessionCommand::Approve {
                     approval_key: approval_key.clone(),
                 }),
@@ -258,6 +355,8 @@ pub fn handle_key(state: &mut WorkbenchState, key: KeyEvent, tab: &mut Tab) -> S
         return ShellAction::Continue;
     }
     if key.code == KeyCode::Esc {
+        state.approval_open = false;
+        state.restore_draft();
         state.review = None;
         *tab = Tab::Timeline;
         state.focus = Focus::Composer;
@@ -277,6 +376,12 @@ pub fn handle_key(state: &mut WorkbenchState, key: KeyEvent, tab: &mut Tab) -> S
         return ShellAction::Continue;
     }
     match key.code {
+        KeyCode::PageUp if state.approval_open => {
+            state.approval_scroll = state.approval_scroll.saturating_sub(10);
+        }
+        KeyCode::PageDown if state.approval_open => {
+            state.approval_scroll = state.approval_scroll.saturating_add(10);
+        }
         KeyCode::PageUp if *tab != Tab::Timeline => {
             state.detail_scroll = state.detail_scroll.saturating_sub(10);
         }
@@ -300,6 +405,15 @@ pub fn handle_key(state: &mut WorkbenchState, key: KeyEvent, tab: &mut Tab) -> S
                 Focus::Composer
             };
             *tab = Tab::Timeline;
+        }
+        KeyCode::Up if *tab == Tab::Tasks && state.queue_edit.is_none() => {
+            state.queued_selection = state.queued_selection.saturating_sub(1);
+            state.detail_scroll = state.queued_selection.saturating_sub(3) as u16;
+        }
+        KeyCode::Down if *tab == Tab::Tasks && state.queue_edit.is_none() => {
+            state.queued_selection =
+                (state.queued_selection + 1).min(state.queued.len().saturating_sub(1));
+            state.detail_scroll = state.queued_selection.saturating_sub(3) as u16;
         }
         KeyCode::Up if state.focus != Focus::Composer => {
             state.follow = false;
@@ -337,10 +451,27 @@ pub fn handle_key(state: &mut WorkbenchState, key: KeyEvent, tab: &mut Tab) -> S
 }
 
 fn submit_composer(state: &mut WorkbenchState) -> ShellAction {
+    if let Some((id, _)) = &state.queue_edit {
+        let id = *id;
+        if !state.queued.iter().any(|request| request.id == id) {
+            state.status = Some(
+                "This request is no longer queued. Copy your edit or Esc to restore your draft."
+                    .to_owned(),
+            );
+            return ShellAction::Continue;
+        }
+        let prompt = state.composer.text();
+        if prompt.trim().is_empty() {
+            return ShellAction::Continue;
+        }
+        state.status = Some("Saving queued request...".to_owned());
+        return ShellAction::Command(SessionCommand::UpdateQueued { id, prompt });
+    }
     if state
         .pending
         .as_ref()
         .is_some_and(|p| matches!(p.kind, crate::session::WaitKind::Approval { .. }))
+        && !state.steer_draft
     {
         state.status = Some("Approval needed: Alt+A allow · Alt+D deny. Draft kept.".to_owned());
         return ShellAction::Continue;
@@ -349,10 +480,14 @@ fn submit_composer(state: &mut WorkbenchState) -> ShellAction {
         return ShellAction::Continue;
     };
     state.resume_follow();
-    if state.pending.is_some() {
+    if state.pending.is_some() && !state.steer_draft {
         ShellAction::Command(SessionCommand::Answer { value: text })
     } else if state.task_state.is_some_and(|s| !s.is_terminal()) {
-        ShellAction::Command(SessionCommand::SteerOrQueue { text })
+        if std::mem::take(&mut state.steer_draft) {
+            ShellAction::Command(SessionCommand::Steer { prompt: text })
+        } else {
+            ShellAction::Command(SessionCommand::Queue { prompt: text })
+        }
     } else {
         ShellAction::Command(SessionCommand::Submit { prompt: text })
     }
@@ -360,7 +495,32 @@ fn submit_composer(state: &mut WorkbenchState) -> ShellAction {
 
 fn palette_action(state: &mut WorkbenchState, tab: &mut Tab, id: &'static str) -> ShellAction {
     match id {
-        "submit" | "steer" => {
+        "motion" => {
+            state.theme.reduced_motion = !state.theme.reduced_motion;
+            state.status = Some(if state.theme.reduced_motion {
+                "Reduced motion on".to_owned()
+            } else {
+                "Animations on".to_owned()
+            });
+            ShellAction::Continue
+        }
+        "steer" | "queue" => {
+            state.steer_draft =
+                id == "steer" && state.task_state.is_some_and(|state| !state.is_terminal());
+            state.approval_open = false;
+            state.focus = Focus::Composer;
+            *tab = Tab::Timeline;
+            state.status = Some(
+                if state.steer_draft {
+                    "Enter steers the current task"
+                } else {
+                    "Enter queues a new task"
+                }
+                .to_owned(),
+            );
+            ShellAction::Continue
+        }
+        "submit" => {
             *tab = Tab::Timeline;
             state.focus = Focus::Composer;
             submit_composer(state)
@@ -377,6 +537,7 @@ fn palette_action(state: &mut WorkbenchState, tab: &mut Tab, id: &'static str) -
         }
         "help" => {
             state.help = true;
+            state.help_scroll = 0;
             ShellAction::Continue
         }
         _ => ShellAction::PaletteCommand(id),
@@ -578,17 +739,22 @@ async fn run_checks_blocking() -> CheckOutcome {
         let workspace =
             crate::Workspace::open(".").map_err(|err| format!("no workspace to check: {err}"))?;
         let supervisor = Arc::new(crate::Supervisor::new(workspace.clone()));
-        let runner = crate::CheckRunner::new(workspace, supervisor, crate::CheckProfile::rust());
+        let profile = crate::CheckProfile::for_workspace(&workspace)
+            .map_err(|err| format!("checks unavailable: {err}"))?;
+        let runner = crate::CheckRunner::new(workspace, supervisor, profile);
         let revision = runner
             .current_revision("workspace")
             .map_err(|err| format!("cannot identify the current revision: {err}"))?;
         let evidence = runtime.block_on(runner.run_all(&revision));
+        let current = runner
+            .current_revision("workspace")
+            .map_err(|err| format!("cannot identify the checked revision: {err}"))?;
         Ok::<_, String>((
             evidence
                 .iter()
-                .map(|check| crate::review::CheckRow::from_evidence(check, &revision.revision))
+                .map(|check| crate::review::CheckRow::from_evidence(check, &current.revision))
                 .collect::<Vec<_>>(),
-            revision.revision,
+            current.revision,
         ))
     })
     .await;
@@ -616,7 +782,57 @@ pub async fn run_shell(
     clear_shutdown();
     install_signal_handler(Arc::new(AtomicBool::new(false)))?;
 
+    let mut memory = match crate::persist::EditorMemory::open(
+        &crate::persist::session_store_path(),
+        std::path::Path::new(&state.workspace),
+    ) {
+        Ok((memory, composer)) => {
+            if !composer.text().is_empty() {
+                state.status = Some("Draft restored - Up/Down recalls prompt history".to_owned());
+            }
+            state.composer = composer;
+            Some(memory)
+        }
+        Err(err) => {
+            state.status = Some(format!("Draft saving unavailable: {err}"));
+            None
+        }
+    };
+
     let mut guard = TerminalGuard::enter()?;
+    // Crossterm also reads NO_COLOR; use the theme's already-resolved explicit override.
+    crossterm::style::force_color_output(state.theme.level.is_color());
+    let outcome = run_loop(
+        &mut state,
+        &mut events,
+        commands,
+        connections,
+        &mut guard,
+        memory.as_mut(),
+    )
+    .await;
+    guard.restore();
+    if let Some(mut memory) = memory {
+        let composer = state
+            .queue_edit
+            .as_ref()
+            .map_or(&state.composer, |(_, draft)| draft);
+        memory.checkpoint(composer, true);
+        if let Some(error) = memory.finish().await {
+            eprintln!("Draft saving stopped: {error}");
+        }
+    }
+    outcome
+}
+
+async fn run_loop(
+    state: &mut WorkbenchState,
+    events: &mut tokio::sync::mpsc::UnboundedReceiver<SessionEvent>,
+    commands: tokio::sync::mpsc::UnboundedSender<SessionCommand>,
+    connections: tokio::sync::mpsc::UnboundedSender<crate::ConnectionRequest>,
+    guard: &mut TerminalGuard,
+    mut memory: Option<&mut crate::persist::EditorMemory>,
+) -> std::io::Result<()> {
     let mut tab = Tab::Timeline;
     if state.chatgpt_plan && crate::openai_auth::needs_plan_notice().unwrap_or(false) {
         let mut panel = ConnectionPanel::open();
@@ -630,22 +846,28 @@ pub async fn run_shell(
     // stays responsive, and a finished run arrives as a message.
     let (check_tx, mut check_rx) = tokio::sync::mpsc::unbounded_channel::<CheckOutcome>();
     let mut checks = CheckGate::idle();
+    let animation_start = std::time::Instant::now();
+    let mut redraw = true;
+    let mut last_elapsed = 0;
 
     loop {
         // Drain every event already published, then draw once: coalescing
         // high-frequency updates instead of painting per event.
         while let Ok(event) = events.try_recv() {
             state.apply(&event);
+            redraw = true;
         }
         while let Ok(outcome) = check_rx.try_recv() {
             checks.finish();
             state.apply_check_outcome(outcome);
+            redraw = true;
         }
 
         if let Some(job) = &mut connection_job {
             while let Ok(status) = job.progress.try_recv() {
                 if let Some(panel) = &mut state.connection {
                     panel.status = status.to_owned();
+                    redraw = true;
                 }
             }
         }
@@ -660,17 +882,35 @@ pub async fn run_shell(
                     "Connection task interrupted; retry".to_owned(),
                 ))
             });
-            finish_connection(&mut state, outcome);
+            finish_connection(state, outcome);
+            redraw = true;
         }
 
-        // The tick drives the spinner and the header clock; state stays
-        // pure, so a frame is still a function of (state, tick).
-        state.advance();
-        guard
-            .terminal()
-            .draw(|frame| crate::tui_render::render_themed(frame, &state, tab, &state.theme))?;
+        if let Some(memory) = memory.as_mut() {
+            let composer = state
+                .queue_edit
+                .as_ref()
+                .map_or(&state.composer, |(_, draft)| draft);
+            memory.checkpoint(composer, false);
+            if let Some(error) = memory.error() {
+                state.status = Some(format!("Draft saving stopped: {error}"));
+                redraw = true;
+            }
+        }
+
+        // Input can wake the loop early; animation speed must not depend on typing speed.
+        state.tick = (animation_start.elapsed().as_millis() / 50) as u64;
+        let elapsed = state.elapsed_secs();
+        if redraw || state.animating() || elapsed != last_elapsed {
+            guard
+                .terminal()
+                .draw(|frame| crate::tui_render::render_themed(frame, state, tab, &state.theme))?;
+            redraw = false;
+            last_elapsed = elapsed;
+        }
 
         if crossterm::event::poll(Duration::from_millis(50))? {
+            redraw = true;
             match crossterm::event::read()? {
                 Event::Key(key) => {
                     // In raw mode the terminal does not translate Ctrl+C
@@ -680,7 +920,7 @@ pub async fn run_shell(
                     if shutdown_requested() {
                         break;
                     }
-                    match handle_key(&mut state, key, &mut tab) {
+                    match handle_key(state, key, &mut tab) {
                         ShellAction::Quit => break,
                         ShellAction::Command(command) => {
                             let _ = commands.send(command);
@@ -706,14 +946,14 @@ pub async fn run_shell(
                         ShellAction::PaletteCommand("usage") => {
                             state.connection = Some(ConnectionPanel::open());
                             start_connection(
-                                &mut state,
+                                state,
                                 ConnectionAction::ManageUsage,
                                 &connections,
                                 &mut connection_job,
                             );
                         }
                         ShellAction::Connection(action) => {
-                            start_connection(&mut state, action, &connections, &mut connection_job);
+                            start_connection(state, action, &connections, &mut connection_job);
                         }
                         ShellAction::CancelConnection => {
                             connection_job = None;
@@ -793,6 +1033,11 @@ pub async fn run_shell(
                         && state.connection.is_none()
                     {
                         state.composer.paste(&text);
+                        if state.composer.last_paste_truncated {
+                            state.status = Some(
+                                "Paste shortened · Ctrl+Z undo · review before sending".to_owned(),
+                            );
+                        }
                         state.focus = Focus::Composer;
                         tab = Tab::Timeline;
                     }
@@ -812,8 +1057,6 @@ pub async fn run_shell(
             break;
         }
     }
-
-    guard.restore();
     Ok(())
 }
 
@@ -977,6 +1220,33 @@ mod tests {
     }
 
     #[test]
+    fn motion_and_scrolling_help_keep_the_draft_untouched() {
+        let mut state = WorkbenchState::new("/workspace");
+        state.composer.paste("unfinished 👩‍💻 draft");
+        let mut tab = Tab::Timeline;
+        let previous = state.theme.reduced_motion;
+        assert_eq!(
+            palette_action(&mut state, &mut tab, "motion"),
+            ShellAction::Continue
+        );
+        assert_ne!(state.theme.reduced_motion, previous);
+        handle_key(&mut state, key(KeyCode::F(1)), &mut tab);
+        handle_key(&mut state, key(KeyCode::PageDown), &mut tab);
+        assert_eq!(state.help_scroll, 4);
+        for _ in 0..30 {
+            handle_key(&mut state, key(KeyCode::Down), &mut tab);
+        }
+        assert_eq!(
+            state.help_scroll,
+            crate::tui_render::shortcuts(&state).len() - 1
+        );
+        handle_key(&mut state, key(KeyCode::Esc), &mut tab);
+        handle_key(&mut state, key(KeyCode::F(1)), &mut tab);
+        assert_eq!(state.help_scroll, 0);
+        assert_eq!(state.composer.text(), "unfinished 👩‍💻 draft");
+    }
+
+    #[test]
     fn typing_builds_the_composer_and_enter_submits() {
         let mut state = WorkbenchState::new("/tmp/ws");
         state.focus = Focus::Composer;
@@ -1069,6 +1339,26 @@ mod tests {
             handle_key(&mut state, ctrl('c'), &mut tab),
             ShellAction::Quit
         );
+    }
+
+    #[test]
+    fn ctrl_q_preserves_the_draft_and_refuses_to_leave_active_work() {
+        let mut state = WorkbenchState::new("/tmp/ws");
+        let mut tab = Tab::Timeline;
+        state.composer.paste("my next task");
+        state.composer.left();
+        let before = state.composer.clone();
+        assert_eq!(
+            handle_key(&mut state, ctrl('q'), &mut tab),
+            ShellAction::Quit
+        );
+        assert_eq!(state.composer, before);
+        state.task_state = Some(crate::session::TaskState::Running);
+        assert_eq!(
+            handle_key(&mut state, ctrl('q'), &mut tab),
+            ShellAction::Continue
+        );
+        assert_eq!(state.composer, before);
     }
 
     #[test]
@@ -1428,5 +1718,77 @@ mod tests {
         handle_key(&mut state, key(KeyCode::Esc), &mut tab);
         assert!(state.connection.is_none());
         assert_eq!(state.composer_text(), "keep this draft");
+    }
+
+    #[test]
+    fn active_input_explicitly_queues_or_steers_without_changing_the_draft() {
+        let mut state = WorkbenchState::new("/workspace");
+        let mut tab = Tab::Timeline;
+        state.task_state = Some(crate::TaskState::Running);
+        state.composer.insert("short follow-up");
+        assert_eq!(
+            handle_key(&mut state, key(KeyCode::Enter), &mut tab),
+            ShellAction::Command(SessionCommand::Queue {
+                prompt: "short follow-up".into()
+            })
+        );
+        state.composer.insert("preserve APIs\nand add a regression");
+        let draft = state.composer.text();
+        handle_key(
+            &mut state,
+            KeyEvent::new(KeyCode::Char('s'), KeyModifiers::ALT),
+            &mut tab,
+        );
+        assert_eq!(state.composer.text(), draft);
+        assert_eq!(
+            handle_key(&mut state, key(KeyCode::Enter), &mut tab),
+            ShellAction::Command(SessionCommand::Steer { prompt: draft })
+        );
+        assert!(!state.steer_draft);
+    }
+
+    #[test]
+    fn editing_a_queued_request_restores_the_draft_only_after_acknowledgement() {
+        let mut state = WorkbenchState::new("/workspace");
+        let mut tab = Tab::Tasks;
+        state.composer.insert("unfinished draft");
+        state.apply(&SessionEvent::RequestQueued {
+            request: crate::session::QueuedRequest {
+                id: 4,
+                prompt: "queued".into(),
+            },
+        });
+        handle_key(
+            &mut state,
+            KeyEvent::new(KeyCode::Char('e'), KeyModifiers::ALT),
+            &mut tab,
+        );
+        assert_eq!(state.composer.text(), "queued");
+        state.composer.insert(" changed");
+        assert_eq!(
+            handle_key(&mut state, key(KeyCode::Enter), &mut tab),
+            ShellAction::Command(SessionCommand::UpdateQueued {
+                id: 4,
+                prompt: "queued changed".into()
+            })
+        );
+        assert_eq!(state.composer.text(), "queued changed");
+        state.apply(&SessionEvent::RequestUpdated {
+            request: crate::session::QueuedRequest {
+                id: 4,
+                prompt: "queued changed".into(),
+            },
+        });
+        assert_eq!(state.composer.text(), "unfinished draft");
+        assert!(state.queue_edit.is_none());
+        state.edit_queued();
+        state.apply(&SessionEvent::RequestRemoved { id: 4 });
+        assert_eq!(
+            handle_key(&mut state, key(KeyCode::Enter), &mut tab),
+            ShellAction::Continue
+        );
+        assert_eq!(state.composer.text(), "queued changed");
+        handle_key(&mut state, key(KeyCode::Esc), &mut tab);
+        assert_eq!(state.composer.text(), "unfinished draft");
     }
 }

@@ -107,16 +107,16 @@ pub struct Palette {
 impl Default for Palette {
     fn default() -> Self {
         Self {
-            bg: (0x17, 0x19, 0x1C),
-            bg_panel: (0x17, 0x19, 0x1C),
-            bg_raise: (0x20, 0x23, 0x27),
+            bg: (0x12, 0x17, 0x1B),
+            bg_panel: (0x12, 0x17, 0x1B),
+            bg_raise: (0x1B, 0x24, 0x29),
             bg_sel: (0x2B, 0x38, 0x38),
             border: (0x3C, 0x42, 0x46),
-            border_focus: (0x8B, 0xC5, 0xB5),
+            border_focus: (0x79, 0xCF, 0xBB),
             text: (0xE5, 0xE2, 0xDC),
             dim: (0xAA, 0xAF, 0xAD),
             faint: (0x80, 0x88, 0x89),
-            cyan: (0x8B, 0xC5, 0xB5),
+            cyan: (0x79, 0xCF, 0xBB),
             sky: (0x93, 0xB7, 0xD0),
             violet: (0xB5, 0xA6, 0xCF),
             magenta: (0xC5, 0xA1, 0xB5),
@@ -137,12 +137,6 @@ pub struct Glyphs {
 }
 
 impl Glyphs {
-    /// The brand mark: a woven knot. Falls back to a plain wordmark on
-    /// terminals without the glyphs.
-    pub fn knot(&self) -> &'static str {
-        if self.unicode { "⟠" } else { "#" }
-    }
-
     /// A filled block, used for the streaming cursor and bars.
     pub fn bar(&self) -> &'static str {
         if self.unicode { "▌" } else { "|" }
@@ -221,6 +215,7 @@ pub struct Theme {
     pub glyphs: Glyphs,
     /// Whether panels paint their own background.
     pub paint_background: bool,
+    pub reduced_motion: bool,
 }
 
 impl Default for Theme {
@@ -232,7 +227,22 @@ impl Default for Theme {
 impl Theme {
     /// Detect the theme for this process.
     pub fn detect() -> Self {
-        Self::for_level(ColorLevel::detect())
+        Self::from_env(|key| std::env::var(key).ok())
+    }
+
+    pub fn from_env(get: impl Fn(&str) -> Option<String>) -> Self {
+        let mut theme = Self::for_level(ColorLevel::from_env(&get));
+        theme.reduced_motion = get("KNUT_TUI_MOTION").is_some_and(|value| {
+            matches!(
+                value.to_ascii_lowercase().as_str(),
+                "off" | "none" | "reduced" | "0"
+            )
+        });
+        if get("TERM").as_deref() == Some("dumb") {
+            theme.glyphs.unicode = false;
+            theme.reduced_motion = true;
+        }
+        theme
     }
 
     /// The plain theme: no colour, background left to the terminal. Used
@@ -243,6 +253,7 @@ impl Theme {
             palette: Palette::default(),
             glyphs: Glyphs { unicode: true },
             paint_background: false,
+            reduced_motion: false,
         }
     }
 
@@ -253,6 +264,7 @@ impl Theme {
             palette: Palette::default(),
             glyphs: Glyphs { unicode: true },
             paint_background: level.is_color(),
+            reduced_motion: false,
         }
     }
 
@@ -355,6 +367,9 @@ impl Theme {
 
     /// A spinner frame for the given tick. Braille where available.
     pub fn spinner(&self, tick: u64) -> &'static str {
+        if self.reduced_motion {
+            return self.glyphs.running();
+        }
         const BRAILLE: [&str; 10] = ["⠋", "⠙", "⠹", "⠸", "⠼", "⠴", "⠦", "⠧", "⠇", "⠏"];
         const ASCII: [&str; 4] = ["|", "/", "-", "\\"];
         if self.glyphs.unicode {
@@ -475,6 +490,24 @@ mod tests {
             .map(|(k, v)| (k.to_string(), v.to_string()))
             .collect();
         move |key: &str| owned.iter().find(|(k, _)| k == key).map(|(_, v)| v.clone())
+    }
+
+    #[test]
+    fn motion_preferences_and_explicit_color_override_are_resolved_together() {
+        let theme = Theme::from_env(env(&[
+            ("NO_COLOR", "1"),
+            ("KNUT_TUI_COLORS", "truecolor"),
+            ("KNUT_TUI_MOTION", "off"),
+        ]));
+        assert_eq!(theme.level, ColorLevel::TrueColor);
+        assert!(theme.reduced_motion);
+        assert_eq!(theme.spinner(0), theme.spinner(7));
+        let plain = Theme::from_env(env(&[("NO_COLOR", "1")]));
+        assert_eq!(plain.level, ColorLevel::Mono);
+        assert!(!plain.paint_background);
+        let dumb = Theme::from_env(env(&[("TERM", "dumb")]));
+        assert!(!dumb.glyphs.unicode);
+        assert!(dumb.reduced_motion);
     }
 
     #[test]
@@ -633,7 +666,6 @@ mod tests {
             ascii.spinner(0).is_ascii(),
             "ascii fallback must not emit braille"
         );
-        assert!(ascii.glyphs.knot().is_ascii());
         assert!(ascii.glyphs.prompt().is_ascii());
     }
 

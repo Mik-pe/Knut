@@ -1012,7 +1012,7 @@ async fn release_artifacts() -> Result<(), KnutError> {
 /// Every subcommand here is read-only unless it explicitly writes a new
 /// session: none of them dispatches a tool or a provider call.
 async fn sessions(args: &[String], as_json: bool) -> Result<(), KnutError> {
-    let store_path = session_store_path();
+    let store_path = knut::session_store_path();
     let mut store = knut::SessionStore::open(&store_path)?;
     let subcommand = args.first().map(String::as_str).unwrap_or("list");
 
@@ -1111,21 +1111,6 @@ async fn sessions(args: &[String], as_json: bool) -> Result<(), KnutError> {
             "unknown sessions subcommand {other:?}; expected list, show, export or plan"
         ))),
     }
-}
-
-/// Where stored sessions live: alongside the user's local state, never in
-/// the repository.
-fn session_store_path() -> std::path::PathBuf {
-    if let Ok(path) = std::env::var("KNUT_SESSION_STORE") {
-        return std::path::PathBuf::from(path);
-    }
-    let base = std::env::var("XDG_DATA_HOME")
-        .map(std::path::PathBuf::from)
-        .or_else(|_| {
-            std::env::var("HOME").map(|home| std::path::PathBuf::from(home).join(".local/share"))
-        })
-        .unwrap_or_else(|_| std::path::PathBuf::from("."));
-    base.join("knut").join("sessions.db")
 }
 
 /// `verify`: run the workspace's real checks and report revision-bound

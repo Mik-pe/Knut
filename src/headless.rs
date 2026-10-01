@@ -31,7 +31,7 @@ use crate::KnutError;
 use crate::session::{SessionCommand, SessionEvent, TaskState, WaitKind};
 
 /// The JSONL protocol version for the headless adapter.
-pub const JSONL_PROTOCOL_VERSION: u32 = 1;
+pub const JSONL_PROTOCOL_VERSION: u32 = 2;
 
 /// The ACP protocol version this adapter implements.
 pub const ACP_PROTOCOL_VERSION: u32 = 1;
@@ -56,6 +56,16 @@ pub enum HeadlessCommand {
     /// Queue a request for the next task.
     Queue {
         prompt: String,
+    },
+    UpdateQueued {
+        id: u64,
+        prompt: String,
+    },
+    RemoveQueued {
+        id: u64,
+    },
+    RunQueued {
+        id: u64,
     },
     Pause,
     Resume,
@@ -88,12 +98,6 @@ impl HeadlessCommand {
         })
     }
 
-    /// Translate into the engine's own command.
-    ///
-    /// `Queue` has no engine equivalent: queuing is a runtime decision
-    /// (`SteerOrQueue`), so a client's explicit queue request is expressed
-    /// as a multi-line prompt, which the runtime classifies as new work
-    /// rather than steering. This is stated rather than hidden.
     pub fn to_session_command(&self) -> Option<SessionCommand> {
         match self {
             HeadlessCommand::Submit { prompt } => Some(SessionCommand::Submit {
@@ -102,10 +106,15 @@ impl HeadlessCommand {
             HeadlessCommand::Steer { prompt } => Some(SessionCommand::Steer {
                 prompt: prompt.clone(),
             }),
-            HeadlessCommand::Queue { prompt } => Some(SessionCommand::SteerOrQueue {
-                // The newline makes the runtime class it as queued work.
-                text: format!("{prompt}\n"),
+            HeadlessCommand::Queue { prompt } => Some(SessionCommand::Queue {
+                prompt: prompt.clone(),
             }),
+            HeadlessCommand::UpdateQueued { id, prompt } => Some(SessionCommand::UpdateQueued {
+                id: *id,
+                prompt: prompt.clone(),
+            }),
+            HeadlessCommand::RemoveQueued { id } => Some(SessionCommand::RemoveQueued { id: *id }),
+            HeadlessCommand::RunQueued { id } => Some(SessionCommand::RunQueued { id: *id }),
             HeadlessCommand::Pause => Some(SessionCommand::Pause),
             HeadlessCommand::Resume => Some(SessionCommand::Resume),
             HeadlessCommand::Answer { value } => Some(SessionCommand::Answer {
@@ -1517,13 +1526,13 @@ mod tests {
             protocol_version: JSONL_PROTOCOL_VERSION,
             session: "s1".to_owned(),
         };
-        assert!(to_jsonl(&ready).unwrap().contains("\"protocol_version\":1"));
+        assert!(to_jsonl(&ready).unwrap().contains("\"protocol_version\":2"));
 
         let translated = adapter.translate(&completed());
         assert!(
             to_jsonl(&translated)
                 .unwrap()
-                .contains("\"protocol_version\":1")
+                .contains("\"protocol_version\":2")
         );
     }
 
@@ -1544,5 +1553,24 @@ mod tests {
         .unwrap();
         assert_eq!(result["loaded"], json!(true));
         assert_eq!(adapter.session_id, "stored-session");
+    }
+    #[test]
+    fn explicit_headless_queue_preserves_short_and_multiline_prompts() {
+        for prompt in ["short", "first\nsecond"] {
+            let command = HeadlessCommand::Queue {
+                prompt: prompt.into(),
+            }
+            .to_session_command();
+            assert_eq!(
+                command,
+                Some(SessionCommand::Queue {
+                    prompt: prompt.into()
+                })
+            );
+        }
+        assert_eq!(
+            HeadlessCommand::RemoveQueued { id: 3 }.to_session_command(),
+            Some(SessionCommand::RemoveQueued { id: 3 })
+        );
     }
 }

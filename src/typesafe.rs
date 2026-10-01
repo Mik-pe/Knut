@@ -28,7 +28,7 @@ use crate::{
 };
 
 pub const DEFAULT_BASE_URL: &str = "https://api.typesafe.ai";
-pub const DEFAULT_MODEL: &str = "jev-latest";
+pub const DEFAULT_MODEL: &str = "jev-1.13.0";
 /// Bounded timeout: one routing call must never hang the runtime.
 pub const DEFAULT_TIMEOUT: Duration = Duration::from_secs(10);
 /// Bounded request bodies (questions + state) so a runaway frame cannot
@@ -709,7 +709,7 @@ pub struct TypeSafeConfig {
     pub api_key: String,
     /// Defaults to `https://api.typesafe.ai` (no trailing slash).
     pub base_url: String,
-    /// Defaults to `jev-latest`. A pinned versioned ID (for example
+    /// Defaults to `jev-1.13.0`. A pinned versioned ID (for example
     /// `jev-1.13.0`) is accepted even though `GET /v1/models` lists only
     /// aliases; the response's resolved `model` records what answered.
     pub model: String,
@@ -1313,12 +1313,26 @@ mod tests {
     /// decision (not just ingress) round-trips on the wire.
     #[tokio::test]
     async fn frame_question_pack_round_trips_on_the_wire() {
-        if std::env::var("TYPESAFE_API_KEY").is_err() {
-            eprintln!("skipping: TYPESAFE_API_KEY not set");
+        if std::env::var("TYPESAFE_LIVE_SMOKE").ok().as_deref() != Some("1") {
             return;
         }
 
         let system_one = JevSystemOne::new(TypeSafeConfig::from_env().unwrap()).unwrap();
+        let evidence = crate::recovery::RepairEvidence::new(vec![
+            (
+                "check/build".to_owned(),
+                "Failed".to_owned(),
+                Some(101),
+                "error[E0308]: mismatched types\n --> src/lib.rs:7:5\n expected String, found bool"
+                    .to_owned(),
+            ),
+            (
+                "check/test".to_owned(),
+                "Failed".to_owned(),
+                Some(101),
+                "error: could not compile library; tests did not run".to_owned(),
+            ),
+        ]);
         let frame = crate::DecisionFrame::new(
             crate::FrameKind::Recovery,
             1,
@@ -1327,11 +1341,8 @@ mod tests {
         )
         .with_unit("check")
         .with_capabilities(["files", "shell"])
-        .with_candidates([
-            crate::Candidate::new("read", "Read the file under test"),
-            crate::Candidate::new("run_tests", "Run the test suite"),
-        ])
-        .with_observation(serde_json::json!({ "check": "cargo test", "exit_code": 101 }));
+        .with_candidates(evidence.candidates())
+        .with_observation(evidence.observation());
 
         let response = crate::FrameRouter::ask(&system_one, &frame)
             .await
@@ -1342,8 +1353,10 @@ mod tests {
             .expect("answers validate against the submitted pack");
         let (choice, distribution, confidence) =
             answer_choice(&response, "failure_class").expect("choice answer");
+        let (diagnostic, _, diagnostic_confidence) =
+            answer_choice(&response, "diagnostic").expect("diagnostic answer");
         eprintln!(
-            "live recovery frame ok: model={} choice={choice} confidence={confidence} options={}",
+            "live recovery frame ok: model={} choice={choice} confidence={confidence} options={} diagnostic={diagnostic} diagnostic_confidence={diagnostic_confidence}",
             response.resolved_model,
             distribution.len()
         );
@@ -1464,7 +1477,7 @@ mod tests {
         // Present key picks up documented defaults.
         let config = TypeSafeConfig::from_parts("k".to_owned(), None, None).unwrap();
         assert_eq!(config.base_url, "https://api.typesafe.ai");
-        assert_eq!(config.model, "jev-latest");
+        assert_eq!(config.model, "jev-1.13.0");
         assert_eq!(config.timeout, DEFAULT_TIMEOUT);
 
         // Overrides win, including pinned versioned model IDs.

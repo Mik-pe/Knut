@@ -951,6 +951,36 @@ impl ReviewView {
     }
 }
 
+pub(crate) fn approval_text(name: &str, arguments: &serde_json::Value) -> String {
+    let mut text = format!("Action: {name}\n");
+    for key in ["path", "expect_hash"] {
+        if let Some(value) = arguments.get(key).and_then(serde_json::Value::as_str) {
+            text.push_str(&format!("{key}: {value}\n"));
+        }
+    }
+    if let Some(changes) = arguments
+        .get("changes")
+        .and_then(serde_json::Value::as_str)
+        .and_then(|changes| serde_json::from_str::<Vec<serde_json::Value>>(changes).ok())
+    {
+        for (index, change) in changes.iter().enumerate() {
+            text.push_str(&format!("\nReplacement {}\n", index + 1));
+            for (key, marker) in [("old", '-'), ("new", '+')] {
+                if let Some(content) = change.get(key).and_then(serde_json::Value::as_str) {
+                    for line in content.split('\n') {
+                        text.push_str(&format!("{marker}{line}\n"));
+                    }
+                }
+            }
+        }
+    }
+    text.push_str("\nExact arguments:\n");
+    text.push_str(
+        &serde_json::to_string_pretty(arguments).unwrap_or_else(|_| arguments.to_string()),
+    );
+    text
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;

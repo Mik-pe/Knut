@@ -584,8 +584,10 @@ impl CheckRunner {
             exit_code,
             signal,
             duration_ms: outcome.duration_ms,
-            output: combined.chars().take(20_000).collect(),
-            output_truncated: outcome.stdout.truncated || outcome.stderr.truncated,
+            output: crate::recovery::diagnostic_excerpt(&combined, 20_000),
+            output_truncated: outcome.stdout.truncated
+                || outcome.stderr.truncated
+                || combined.len() > 20_000,
             test_counts: counts,
             reason,
         }
