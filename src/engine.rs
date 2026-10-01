@@ -159,7 +159,7 @@ pub fn build_with_write_approval(
     // that produce no usable client must not be reported as ready.
     let model_ready = provider_config
         .as_ref()
-        .is_some_and(|config| crate::OpenAiCompatibleModel::new(config.clone()).is_ok());
+        .is_some_and(|config| crate::ProviderModel::new(config.clone()).is_ok());
 
     let mut report = EngineReport {
         model: None,
@@ -199,7 +199,7 @@ pub fn build_with_write_approval(
         }
         _ => {
             report.unavailable = Some(format!(
-                "reasoner unavailable: {}. Set KNUT_PROVIDER_API_KEY or ZAI_API_KEY and valid provider settings, then restart",
+                "reasoner unavailable: {}. Choose KNUT_PROVIDER and configure its API key or run `knut login openai-codex`, then restart",
                 provider_error.unwrap_or_else(|| "adapter could not be built".to_owned())
             ));
         }
@@ -212,7 +212,7 @@ pub fn build_with_write_approval(
     // way; only the request's effort differs. Each cascade needs its own
     // instance, so the adapter is rebuilt from its (cheap) configuration.
     let build_cascade = |config: &crate::ProviderConfig| {
-        let model = |config: crate::ProviderConfig| crate::OpenAiCompatibleModel::new(config).ok();
+        let model = |config: crate::ProviderConfig| crate::ProviderModel::new(config).ok();
         let mut cascade = ComputeCascade::empty();
         if let Some(model) = model(config.clone()) {
             cascade = cascade.with_fast(model);

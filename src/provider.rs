@@ -1,19 +1,7 @@
-//! A real BYOK reasoner adapter over the OpenAI-compatible Chat
-//! Completions transport (issue #21).
+//! Provider configuration and authenticated Chat Completions / Responses transport.
 //!
-//! The initial conformance target is Z.ai GLM, using its documented
-//! streaming/tool/thinking contract. Compatibility is *tested*, not
-//! assumed: an endpoint that merely accepts a base-URL substitution may
-//! differ in reasoning fields, tool-call framing, usage reporting or
-//! error shapes, so this module validates what actually arrives.
-//!
-//! Boundaries:
-//! - credentials are never serialized, logged or forwarded to another
-//!   origin;
-//! - outbound context goes only to the configured origin;
-//! - missing usage is reported as unknown, never as zero;
-//! - unsupported controls are reported through `ModelCapabilities`
-//!   rather than silently ignored.
+//! Redirects are refused so credentials cannot cross origins. Missing usage
+//! stays unknown; interrupted or incomplete inference never becomes an artifact.
 
 use std::time::{Duration, Instant};
 
@@ -27,6 +15,16 @@ use crate::{
     ToolCall, Usage,
 };
 
+mod responses;
+
+/// Wire protocol selected independently from model identity.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum ProviderTransport {
+    ChatCompletions,
+    Responses,
+}
+
 /// Default endpoint for OpenAI-compatible chat completions.
 pub const DEFAULT_CHAT_PATH: &str = "/chat/completions";
 
@@ -39,6 +37,7 @@ pub enum ReasoningEffort {
     Low,
     Medium,
     High,
+    XHigh,
     Max,
 }
 
@@ -48,6 +47,7 @@ impl ReasoningEffort {
             ReasoningEffort::Low => "low",
             ReasoningEffort::Medium => "medium",
             ReasoningEffort::High => "high",
+            ReasoningEffort::XHigh => "xhigh",
             ReasoningEffort::Max => "max",
         }
     }
@@ -65,7 +65,7 @@ pub enum BillingPath {
     Unknown,
 }
 
-/// Configuration for one OpenAI-compatible provider.
+/// Configuration for one provider and its wire protocol.
 ///
 /// `Debug` never reveals the key.
 #[derive(Clone)]
@@ -87,6 +87,8 @@ pub struct ProviderConfig {
     reasoning_effort: Option<ReasoningEffort>,
     /// Whether this provider accepts `stream_options.include_usage`.
     supports_usage_in_stream: bool,
+    transport: ProviderTransport,
+    chatgpt: bool,
 }
 
 impl std::fmt::Debug for ProviderConfig {
@@ -98,6 +100,8 @@ impl std::fmt::Debug for ProviderConfig {
             .field("tier", &self.tier)
             .field("timeout", &self.timeout)
             .field("billing", &self.billing)
+            .field("transport", &self.transport)
+            .field("chatgpt", &self.chatgpt)
             .finish()
     }
 }
@@ -130,6 +134,8 @@ impl ProviderConfig {
             supports_reasoning_effort,
             reasoning_effort: supports_reasoning_effort.then_some(ReasoningEffort::Max),
             supports_usage_in_stream: true,
+            transport: ProviderTransport::ChatCompletions,
+            chatgpt: false,
         }
     }
 
@@ -155,6 +161,25 @@ impl ProviderConfig {
     /// Ollama Cloud, which speaks the OpenAI-compatible transport.
     pub fn ollama_cloud(api_key: impl Into<String>, model: impl Into<String>) -> Self {
         Self::new(api_key, "https://ollama.com/v1", model).with_billing(BillingPath::Metered)
+    }
+
+    /// OpenAI Responses API, including Codex reasoning models.
+    pub fn openai(api_key: impl Into<String>, model: impl Into<String>) -> Self {
+        Self::new(api_key, "https://api.openai.com/v1", model)
+            .with_transport(ProviderTransport::Responses)
+            .with_billing(BillingPath::Metered)
+    }
+
+    pub fn with_transport(mut self, transport: ProviderTransport) -> Self {
+        self.transport = transport;
+        if transport == ProviderTransport::Responses {
+            self.supports_reasoning_effort = self.model.starts_with("gpt-5")
+                || self.model.starts_with("gpt-6")
+                || self.model.starts_with("o3")
+                || self.model.starts_with("o4");
+            self.reasoning_effort = None;
+        }
+        self
     }
 
     pub fn with_tier(mut self, tier: ModelTier) -> Self {
@@ -196,19 +221,83 @@ impl ProviderConfig {
 
     /// Build from the environment.
     ///
-    /// `KNUT_PROVIDER_API_KEY` is required; `KNUT_PROVIDER_BASE_URL`,
-    /// `KNUT_PROVIDER_MODEL` and `KNUT_PROVIDER_TIER` are optional.
-    /// Keys are read from the environment, never from the repository.
+    /// `KNUT_PROVIDER` selects the credential source and transport. OpenAI
+    /// API credentials come from `OPENAI_API_KEY` or `KNUT_PROVIDER_API_KEY`;
+    /// `openai-codex` uses the selected protected ChatGPT registration.
     pub fn from_env() -> Result<Self, KnutError> {
-        let api_key = std::env::var("KNUT_PROVIDER_API_KEY")
-            .or_else(|_| std::env::var("ZAI_API_KEY"))
-            .map_err(|_| KnutError::Model("KNUT_PROVIDER_API_KEY is not set".to_owned()))?;
-        let base_url = std::env::var("KNUT_PROVIDER_BASE_URL")
-            .unwrap_or_else(|_| "https://api.z.ai/api/coding/paas/v4".to_owned());
-        let model =
-            std::env::var("KNUT_PROVIDER_MODEL").unwrap_or_else(|_| "glm-5.3-flash".to_owned());
+        Self::from_settings(|key| std::env::var(key).ok())
+    }
+
+    fn from_settings(get: impl Fn(&str) -> Option<String>) -> Result<Self, KnutError> {
+        let provider = get("KNUT_PROVIDER").unwrap_or_else(|| "zai".to_owned());
+        if !matches!(
+            provider.as_str(),
+            "zai" | "openai" | "openai-codex" | "chat-completions"
+        ) {
+            return Err(KnutError::Model(
+                "KNUT_PROVIDER must be zai/openai/openai-codex/chat-completions".to_owned(),
+            ));
+        }
+        let openai = matches!(provider.as_str(), "openai" | "openai-codex");
+        let chatgpt = provider == "openai-codex";
+        let api_key = if chatgpt {
+            crate::openai_auth::ensure_signed_in()?;
+            String::new()
+        } else {
+            get("KNUT_PROVIDER_API_KEY")
+                .filter(|key| !key.trim().is_empty())
+                .or_else(|| {
+                    get(if openai {
+                        "OPENAI_API_KEY"
+                    } else {
+                        "ZAI_API_KEY"
+                    })
+                    .filter(|key| !key.trim().is_empty())
+                })
+                .ok_or_else(|| {
+                    KnutError::Model(format!(
+                        "Set KNUT_PROVIDER_API_KEY or {}",
+                        if openai {
+                            "OPENAI_API_KEY"
+                        } else {
+                            "ZAI_API_KEY"
+                        }
+                    ))
+                })?
+        };
+        let base_url = get("KNUT_PROVIDER_BASE_URL").unwrap_or_else(|| {
+            if openai {
+                "https://api.openai.com/v1"
+            } else {
+                "https://api.z.ai/api/coding/paas/v4"
+            }
+            .to_owned()
+        });
+        if chatgpt && base_url.trim_end_matches('/') != "https://api.openai.com/v1" {
+            return Err(KnutError::ModelAuth(
+                "ChatGPT plan usage requires https://api.openai.com/v1".to_owned(),
+            ));
+        }
+        let model = get("KNUT_PROVIDER_MODEL").unwrap_or_else(|| {
+            if openai {
+                "gpt-6.1-sol"
+            } else {
+                "glm-5.3-flash"
+            }
+            .to_owned()
+        });
         let mut config = Self::new(api_key, base_url, model);
-        if let Ok(seconds) = std::env::var("KNUT_PROVIDER_TIMEOUT_SECONDS") {
+        if openai {
+            config = config
+                .with_transport(ProviderTransport::Responses)
+                .with_billing(if chatgpt {
+                    BillingPath::Plan
+                } else {
+                    BillingPath::Metered
+                });
+            config.chatgpt = chatgpt;
+        }
+        if let Some(seconds) = get("KNUT_PROVIDER_TIMEOUT_SECONDS") {
             let seconds = seconds
                 .parse::<u64>()
                 .ok()
@@ -220,21 +309,22 @@ impl ProviderConfig {
                 })?;
             config.timeout = Duration::from_secs(seconds);
         }
-        if let Ok(effort) = std::env::var("KNUT_PROVIDER_REASONING_EFFORT") {
+        if let Some(effort) = get("KNUT_PROVIDER_REASONING_EFFORT") {
             config.reasoning_effort = Some(match effort.as_str() {
                 "low" => ReasoningEffort::Low,
                 "medium" => ReasoningEffort::Medium,
                 "high" => ReasoningEffort::High,
+                "xhigh" => ReasoningEffort::XHigh,
                 "max" => ReasoningEffort::Max,
                 _ => {
                     return Err(KnutError::Model(
-                        "reasoning effort must be low/medium/high/max".to_owned(),
+                        "reasoning effort must be low/medium/high/xhigh/max".to_owned(),
                     ));
                 }
             });
         }
         config.validate_reasoning()?;
-        if let Ok(tier) = std::env::var("KNUT_PROVIDER_TIER") {
+        if let Some(tier) = get("KNUT_PROVIDER_TIER") {
             config.tier = match tier.to_ascii_lowercase().as_str() {
                 "fast" => ModelTier::Fast,
                 "standard" => ModelTier::Standard,
@@ -256,12 +346,27 @@ impl ProviderConfig {
             ));
         }
         if self.model.starts_with("glm-5.3")
-            && self.reasoning_effort == Some(ReasoningEffort::Medium)
+            && matches!(
+                self.reasoning_effort,
+                Some(ReasoningEffort::Medium | ReasoningEffort::XHigh)
+            )
         {
             return Err(KnutError::Model(
                 "GLM-5.3 reasoning effort must be low/high/max; choose an explicit native level"
                     .to_owned(),
             ));
+        }
+        if self.transport == ProviderTransport::Responses {
+            let unsupported = match self.reasoning_effort {
+                Some(ReasoningEffort::Max) => !self.model.starts_with("gpt-6"),
+                Some(ReasoningEffort::XHigh) => {
+                    matches!(self.model.as_str(), "gpt-5" | "gpt-5-codex" | "gpt-5.1")
+                }
+                _ => false,
+            };
+            if unsupported {
+                return Err(KnutError::Model("requested reasoning effort is not supported by this model; choose a documented native level".to_owned()));
+            }
         }
         Ok(())
     }
@@ -278,7 +383,12 @@ impl ProviderConfig {
             tier: self.tier,
             billing: self.billing,
             timeout: self.timeout,
-            api_key_source: "environment",
+            api_key_source: if self.chatgpt {
+                "ChatGPT sign-in"
+            } else {
+                "environment"
+            },
+            transport: self.transport,
         }
     }
 
@@ -304,25 +414,48 @@ pub struct ProviderSummary {
     pub billing: BillingPath,
     pub timeout: Duration,
     pub api_key_source: &'static str,
+    pub transport: ProviderTransport,
 }
 
-/// An authenticated OpenAI-compatible Chat Completions adapter.
-pub struct OpenAiCompatibleModel {
+/// One model adapter for Chat Completions or native Responses.
+pub struct ProviderModel {
     config: ProviderConfig,
     http: reqwest::Client,
 }
 
-impl std::fmt::Debug for OpenAiCompatibleModel {
+impl std::fmt::Debug for ProviderModel {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
-        f.debug_struct("OpenAiCompatibleModel")
+        f.debug_struct("ProviderModel")
             .field("config", &self.config)
             .finish()
     }
 }
 
-impl OpenAiCompatibleModel {
+impl ProviderModel {
     pub fn new(config: ProviderConfig) -> Result<Self, KnutError> {
         config.validate_reasoning()?;
+        let url = reqwest::Url::parse(&config.base_url)
+            .map_err(|_| KnutError::Model("invalid provider base URL".to_owned()))?;
+        if !url.username().is_empty()
+            || url.password().is_some()
+            || url.query().is_some()
+            || url.fragment().is_some()
+            || !(url.scheme() == "https"
+                || url.scheme() == "http"
+                    && matches!(url.host_str(), Some("127.0.0.1" | "localhost" | "[::1]")))
+        {
+            return Err(KnutError::Model("provider URL requires HTTPS (or loopback HTTP), without credentials/query/fragment".to_owned()));
+        }
+        if config.model.trim().is_empty() || !config.chatgpt && config.api_key.trim().is_empty() {
+            return Err(KnutError::Model(
+                "provider model and credential must be nonempty".to_owned(),
+            ));
+        }
+        if config.chatgpt && config.base_url != "https://api.openai.com/v1" {
+            return Err(KnutError::ModelAuth(
+                "ChatGPT tokens can only be sent to https://api.openai.com/v1".to_owned(),
+            ));
+        }
         // No redirects: a redirect is exactly how credentials would cross
         // origins.
         let http = reqwest::Client::builder()
@@ -335,6 +468,57 @@ impl OpenAiCompatibleModel {
 
     pub fn config(&self) -> &ProviderConfig {
         &self.config
+    }
+
+    /// List account-visible models using the same credential as inference.
+    pub async fn list_models(&self) -> Result<Vec<(String, String)>, KnutError> {
+        let token = if self.config.chatgpt {
+            crate::openai_auth::access_token().await?
+        } else {
+            self.config.api_key.clone()
+        };
+        let response = self
+            .http
+            .get(format!("{}/models", self.config.base_url))
+            .bearer_auth(token)
+            .send()
+            .await
+            .map_err(|_| {
+                KnutError::ModelUnavailable("model catalog transport failed".to_owned())
+            })?;
+        let status = response.status();
+        let body = response
+            .text()
+            .await
+            .map_err(|_| KnutError::Model("cannot read model catalog".to_owned()))?;
+        if !status.is_success() {
+            return Err(provider_error(Some(status), &body));
+        }
+        let body: Value = serde_json::from_str(&body)
+            .map_err(|_| KnutError::Model("invalid model catalog".to_owned()))?;
+        let key = if self.config.chatgpt {
+            "models"
+        } else {
+            "data"
+        };
+        let models = body[key]
+            .as_array()
+            .ok_or_else(|| KnutError::Model("model catalog has no model array".to_owned()))?;
+        let mut result = Vec::new();
+        for entry in models {
+            if self.config.chatgpt && entry["visibility"] != "list" {
+                continue;
+            }
+            let id = entry[if self.config.chatgpt { "slug" } else { "id" }]
+                .as_str()
+                .filter(|s| !s.is_empty())
+                .ok_or_else(|| KnutError::Model("model catalog entry has no ID".to_owned()))?;
+            result.push((
+                id.to_owned(),
+                entry["display_name"].as_str().unwrap_or(id).to_owned(),
+            ));
+        }
+        Ok(result)
     }
 
     /// Capability report for this configured endpoint.
@@ -412,27 +596,45 @@ impl OpenAiCompatibleModel {
         let _ = ExpectedArtifact::Json; // shape contract stays with the caller
         body
     }
+}
 
-    /// Classify a non-success response into a typed error.
-    async fn error_for(&self, status: reqwest::StatusCode, body: String) -> KnutError {
-        // Bound what we echo: provider error bodies can be large.
-        let detail: String = body.chars().take(400).collect();
-        let message = format!("provider returned {status}: {detail}");
-        if status.as_u16() == 401 || status.as_u16() == 403 {
-            return KnutError::ModelAuth(message);
-        }
-        if status.as_u16() == 429 {
-            return KnutError::ModelRateLimit(message);
-        }
-        if status.is_server_error() {
-            return KnutError::ModelUnavailable(message);
-        }
-        KnutError::Model(message)
+fn provider_error(status: Option<reqwest::StatusCode>, body: &str) -> KnutError {
+    let error: Value = serde_json::from_str(body).unwrap_or_default();
+    let code = error["error"]["code"]
+        .as_str()
+        .or_else(|| error["code"].as_str())
+        .unwrap_or("unknown_error");
+    let code: String = code
+        .chars()
+        .filter(|c| c.is_ascii_alphanumeric() || *c == '_')
+        .take(100)
+        .collect();
+    let detail = format!(
+        "provider error {code}{}",
+        status
+            .map(|s| format!(" (HTTP {})", s.as_u16()))
+            .unwrap_or_default()
+    );
+    if status.is_some_and(|s| s.as_u16() == 401 || s.as_u16() == 403) {
+        KnutError::ModelAuth(detail)
+    } else if status.is_some_and(|s| s.as_u16() == 429)
+        || matches!(
+            code.as_str(),
+            "rate_limit_exceeded"
+                | "subscription_sharing_usage_limit_exceeded"
+                | "subscription_sharing_usage_unavailable"
+        )
+    {
+        KnutError::ModelRateLimit(detail)
+    } else if status.is_some_and(|s| s.is_server_error()) || code == "server_error" {
+        KnutError::ModelUnavailable(detail)
+    } else {
+        KnutError::Model(detail)
     }
 }
 
 #[async_trait]
-impl Model for OpenAiCompatibleModel {
+impl Model for ProviderModel {
     fn identity(&self) -> ModelIdentity {
         ModelIdentity {
             provider: self
@@ -451,7 +653,7 @@ impl Model for OpenAiCompatibleModel {
     }
 
     fn capabilities(&self) -> ModelCapabilities {
-        OpenAiCompatibleModel::capabilities(self)
+        ProviderModel::capabilities(self)
     }
 
     /// Continue a turn, echoing the provider's continuation state back
@@ -462,6 +664,11 @@ impl Model for OpenAiCompatibleModel {
         continuation: Option<&Continuation>,
         request: &ModelRequest,
     ) -> Result<ModelResponse, KnutError> {
+        if self.config.transport == ProviderTransport::Responses {
+            return self
+                .responses_turn(request, continuation, &mut crate::BufferedSink::new())
+                .await;
+        }
         let started = Instant::now();
         let response = self
             .http
@@ -479,7 +686,7 @@ impl Model for OpenAiCompatibleModel {
             .map_err(|err| KnutError::Model(format!("reading response: {err}")))?;
 
         if !status.is_success() {
-            return Err(self.error_for(status, text).await);
+            return Err(provider_error(Some(status), &text));
         }
 
         let parsed: ChatCompletion = serde_json::from_str(&text)
@@ -493,6 +700,11 @@ impl Model for OpenAiCompatibleModel {
     }
 
     async fn complete(&self, request: &ModelRequest) -> Result<ModelResponse, KnutError> {
+        if self.config.transport == ProviderTransport::Responses {
+            return self
+                .responses_turn(request, None, &mut crate::BufferedSink::new())
+                .await;
+        }
         let started = Instant::now();
         let response = self
             .http
@@ -510,7 +722,7 @@ impl Model for OpenAiCompatibleModel {
             .map_err(|err| KnutError::Model(format!("reading response: {err}")))?;
 
         if !status.is_success() {
-            return Err(self.error_for(status, text).await);
+            return Err(provider_error(Some(status), &text));
         }
 
         let parsed: ChatCompletion = serde_json::from_str(&text).map_err(|err| {
@@ -528,6 +740,9 @@ impl Model for OpenAiCompatibleModel {
         request: &ModelRequest,
         sink: &mut (dyn ModelStreamSink + Send),
     ) -> Result<ModelResponse, KnutError> {
+        if self.config.transport == ProviderTransport::Responses {
+            return self.responses_turn(request, None, sink).await;
+        }
         let started = Instant::now();
         let response = self
             .http
@@ -541,7 +756,7 @@ impl Model for OpenAiCompatibleModel {
         let status = response.status();
         if !status.is_success() {
             let text = response.text().await.unwrap_or_default();
-            return Err(self.error_for(status, text).await);
+            return Err(provider_error(Some(status), &text));
         }
 
         let mut stream = response.bytes_stream();
@@ -611,9 +826,10 @@ impl Model for OpenAiCompatibleModel {
 
         if let Some(message) = raw_error {
             // An error frame after a 200 is a failed call.
-            return Err(self
-                .error_for(reqwest::StatusCode::BAD_GATEWAY, message)
-                .await);
+            return Err(provider_error(
+                Some(reqwest::StatusCode::BAD_GATEWAY),
+                &message,
+            ));
         }
 
         if !accumulator.done && accumulator.finish_reason.is_none() {
@@ -1000,14 +1216,22 @@ mod tests {
     /// CI stays fully offline: the adapter is exercised against a real
     /// socket speaking the documented wire format, not against a mock
     /// object that could disagree with it.
-    struct FixtureServer {
+    pub(super) struct FixtureServer {
         addr: std::net::SocketAddr,
         seen: std::sync::Arc<std::sync::Mutex<Vec<Value>>>,
+        heads: std::sync::Arc<std::sync::Mutex<Vec<String>>>,
     }
 
     impl FixtureServer {
-        async fn start(
+        pub(super) async fn start(
             responses: Vec<(u16, String)>,
+        ) -> (Self, std::sync::Arc<std::sync::Mutex<Vec<Value>>>) {
+            Self::start_chunked(responses, usize::MAX).await
+        }
+
+        pub(super) async fn start_chunked(
+            responses: Vec<(u16, String)>,
+            chunk_size: usize,
         ) -> (Self, std::sync::Arc<std::sync::Mutex<Vec<Value>>>) {
             use tokio::io::{AsyncReadExt, AsyncWriteExt};
 
@@ -1017,6 +1241,8 @@ mod tests {
             let addr = listener.local_addr().expect("addr");
             let seen = std::sync::Arc::new(std::sync::Mutex::new(Vec::new()));
             let seen_for_task = std::sync::Arc::clone(&seen);
+            let heads = std::sync::Arc::new(std::sync::Mutex::new(Vec::new()));
+            let heads_for_task = std::sync::Arc::clone(&heads);
             let responses = std::sync::Arc::new(std::sync::Mutex::new(responses));
 
             tokio::spawn(async move {
@@ -1025,6 +1251,7 @@ mod tests {
                         return;
                     };
                     let seen = std::sync::Arc::clone(&seen_for_task);
+                    let heads = std::sync::Arc::clone(&heads_for_task);
                     let responses = std::sync::Arc::clone(&responses);
                     tokio::spawn(async move {
                         let mut buffer = vec![0u8; 65536];
@@ -1054,6 +1281,7 @@ mod tests {
                                     .unwrap_or(0);
                                 let body = &text[split + 4..];
                                 if body.len() >= content_length {
+                                    heads.lock().unwrap().push(head.to_owned());
                                     if let Ok(parsed) = serde_json::from_str::<Value>(body) {
                                         seen.lock().unwrap().push(parsed);
                                     }
@@ -1062,7 +1290,12 @@ mod tests {
                                         "HTTP/1.1 {status} X\r\nContent-Type: application/json\r\nContent-Length: {}\r\nConnection: close\r\n\r\n{payload}",
                                         payload.len()
                                     );
-                                    let _ = socket.write_all(response.as_bytes()).await;
+                                    for chunk in response.as_bytes().chunks(chunk_size) {
+                                        if socket.write_all(chunk).await.is_err() {
+                                            return;
+                                        }
+                                        tokio::task::yield_now().await;
+                                    }
                                     let _ = socket.flush().await;
                                     return;
                                 }
@@ -1076,22 +1309,27 @@ mod tests {
                 Self {
                     addr,
                     seen: std::sync::Arc::clone(&seen),
+                    heads,
                 },
                 seen,
             )
         }
 
-        fn base_url(&self) -> String {
+        pub(super) fn base_url(&self) -> String {
             format!("http://{}", self.addr)
         }
 
-        fn requests(&self) -> Vec<Value> {
+        pub(super) fn requests(&self) -> Vec<Value> {
             self.seen.lock().unwrap().clone()
+        }
+
+        pub(super) fn headers(&self) -> Vec<String> {
+            self.heads.lock().unwrap().clone()
         }
     }
 
     /// One SSE frame.
-    fn sse(payload: &str) -> String {
+    pub(super) fn sse(payload: &str) -> String {
         format!("data: {payload}\n\n")
     }
 
@@ -1128,7 +1366,7 @@ mod tests {
             FixtureServer::start(vec![(200, reasoning_tool_then_artifact_stream())]).await;
 
         let config = ProviderConfig::new("test-key", server.base_url(), "glm-5.3-flash");
-        let model = OpenAiCompatibleModel::new(config).unwrap();
+        let model = ProviderModel::new(config).unwrap();
 
         let mut sink = crate::BufferedSink::new();
         let response = model
@@ -1179,12 +1417,9 @@ mod tests {
         ])
         .await;
 
-        let model = OpenAiCompatibleModel::new(ProviderConfig::new(
-            "k",
-            server.base_url(),
-            "glm-5.3-flash",
-        ))
-        .unwrap();
+        let model =
+            ProviderModel::new(ProviderConfig::new("k", server.base_url(), "glm-5.3-flash"))
+                .unwrap();
 
         let mut sink = crate::BufferedSink::new();
         let first = model
@@ -1224,12 +1459,9 @@ mod tests {
         // A single-frame-per-read server with a slow write is covered by
         // the accumulator tests; here assert the same payload through the
         // real socket path is stable.
-        let model = OpenAiCompatibleModel::new(ProviderConfig::new(
-            "k",
-            server.base_url(),
-            "glm-5.3-flash",
-        ))
-        .unwrap();
+        let model =
+            ProviderModel::new(ProviderConfig::new("k", server.base_url(), "glm-5.3-flash"))
+                .unwrap();
         let mut sink = crate::BufferedSink::new();
         let response = model
             .stream(&ModelRequest::new("x", ExpectedArtifact::Text), &mut sink)
@@ -1250,12 +1482,9 @@ mod tests {
         ])
         .await;
 
-        let model = OpenAiCompatibleModel::new(ProviderConfig::new(
-            "k",
-            server.base_url(),
-            "glm-5.3-flash",
-        ))
-        .unwrap();
+        let model =
+            ProviderModel::new(ProviderConfig::new("k", server.base_url(), "glm-5.3-flash"))
+                .unwrap();
 
         let err = model
             .complete(&ModelRequest::new("x", ExpectedArtifact::Text))
@@ -1281,12 +1510,9 @@ mod tests {
         let (server, _) =
             FixtureServer::start(vec![(200, r#"{"not":"a completion"}"#.to_owned())]).await;
 
-        let model = OpenAiCompatibleModel::new(ProviderConfig::new(
-            "k",
-            server.base_url(),
-            "glm-5.3-flash",
-        ))
-        .unwrap();
+        let model =
+            ProviderModel::new(ProviderConfig::new("k", server.base_url(), "glm-5.3-flash"))
+                .unwrap();
 
         let err = model
             .complete(&ModelRequest::new("x", ExpectedArtifact::Text))
@@ -1303,12 +1529,9 @@ mod tests {
         )])
         .await;
 
-        let model = OpenAiCompatibleModel::new(ProviderConfig::new(
-            "k",
-            server.base_url(),
-            "glm-5.3-flash",
-        ))
-        .unwrap();
+        let model =
+            ProviderModel::new(ProviderConfig::new("k", server.base_url(), "glm-5.3-flash"))
+                .unwrap();
 
         let err = model
             .complete(&ModelRequest::new("x", ExpectedArtifact::Text))
@@ -1325,12 +1548,9 @@ mod tests {
         )])
         .await;
 
-        let model = OpenAiCompatibleModel::new(ProviderConfig::new(
-            "k",
-            server.base_url(),
-            "glm-5.3-flash",
-        ))
-        .unwrap();
+        let model =
+            ProviderModel::new(ProviderConfig::new("k", server.base_url(), "glm-5.3-flash"))
+                .unwrap();
 
         let mut sink = crate::BufferedSink::new();
         let err = model
@@ -1350,12 +1570,9 @@ mod tests {
     async fn malformed_frame_stops_the_turn_instead_of_guessing() {
         let (server, _) = FixtureServer::start(vec![(200, sse("{not json"))]).await;
 
-        let model = OpenAiCompatibleModel::new(ProviderConfig::new(
-            "k",
-            server.base_url(),
-            "glm-5.3-flash",
-        ))
-        .unwrap();
+        let model =
+            ProviderModel::new(ProviderConfig::new("k", server.base_url(), "glm-5.3-flash"))
+                .unwrap();
 
         let mut sink = crate::BufferedSink::new();
         let err = model
@@ -1378,7 +1595,7 @@ mod tests {
             return;
         }
 
-        let model = OpenAiCompatibleModel::new(ProviderConfig::glm_coding(api_key)).unwrap();
+        let model = ProviderModel::new(ProviderConfig::glm_coding(api_key)).unwrap();
         assert!(model.capabilities().streaming);
 
         let mut sink = crate::BufferedSink::new();
@@ -1416,6 +1633,72 @@ mod tests {
             model: "glm-5.3-flash".to_owned(),
             tier: ModelTier::Reasoner,
         }
+    }
+
+    #[test]
+    fn explicit_provider_selection_never_borrows_another_providers_key() {
+        let settings = |values: &[(&str, &str)]| -> Result<ProviderConfig, KnutError> {
+            ProviderConfig::from_settings(|key| {
+                values
+                    .iter()
+                    .find(|(k, _)| *k == key)
+                    .map(|(_, v)| v.to_string())
+            })
+        };
+        let config = settings(&[
+            ("KNUT_PROVIDER", "openai"),
+            ("OPENAI_API_KEY", "openai-secret"),
+            ("ZAI_API_KEY", "zai-secret"),
+        ])
+        .unwrap();
+        assert_eq!(config.api_key, "openai-secret");
+        assert_eq!(config.transport, ProviderTransport::Responses);
+        assert_eq!(config.base_url, "https://api.openai.com/v1");
+        assert_eq!(config.billing, BillingPath::Metered);
+        assert!(settings(&[("KNUT_PROVIDER", "openai"), ("ZAI_API_KEY", "zai-secret")]).is_err());
+        let zai = settings(&[
+            ("ZAI_API_KEY", "zai-secret"),
+            ("OPENAI_API_KEY", "openai-secret"),
+        ])
+        .unwrap();
+        assert_eq!(zai.api_key, "zai-secret");
+        assert_eq!(zai.transport, ProviderTransport::ChatCompletions);
+        assert!(
+            settings(&[
+                ("KNUT_PROVIDER", "unknown"),
+                ("KNUT_PROVIDER_API_KEY", "secret")
+            ])
+            .is_err()
+        );
+        assert!(
+            ProviderModel::new(ProviderConfig::new(
+                "key",
+                "https://user:secret@example.com/v1",
+                "model"
+            ))
+            .is_err()
+        );
+        assert!(
+            ProviderModel::new(ProviderConfig::new(
+                "key",
+                "http://remote.invalid/v1",
+                "model"
+            ))
+            .is_err()
+        );
+    }
+
+    #[test]
+    fn provider_errors_do_not_echo_credentials_or_prompt_text() {
+        let error = provider_error(
+            Some(reqwest::StatusCode::UNAUTHORIZED),
+            r#"{"error":{"code":"invalid_api_key","message":"Incorrect API key: secret-key; prompt: private"}}"#,
+        );
+        let message = error.to_string();
+        assert!(message.contains("invalid_api_key"));
+        assert!(!message.contains("secret-key"));
+        assert!(!message.contains("private"));
+        assert!(matches!(error, KnutError::ModelAuth(_)));
     }
 
     #[test]
@@ -1542,7 +1825,7 @@ mod tests {
     #[test]
     fn continuation_round_trips_into_the_next_request() {
         let config = ProviderConfig::glm_coding("k");
-        let model = OpenAiCompatibleModel::new(config).unwrap();
+        let model = ProviderModel::new(config).unwrap();
 
         let continuation = Continuation {
             parts: vec![
@@ -1572,13 +1855,12 @@ mod tests {
 
     #[test]
     fn stream_requests_ask_for_usage_when_supported() {
-        let model = OpenAiCompatibleModel::new(ProviderConfig::glm_coding("k")).unwrap();
+        let model = ProviderModel::new(ProviderConfig::glm_coding("k")).unwrap();
         let body = model.body(&ModelRequest::new("hi", ExpectedArtifact::Text), true, None);
         assert_eq!(body["stream_options"]["include_usage"], true);
 
-        let model =
-            OpenAiCompatibleModel::new(ProviderConfig::glm_coding("k").with_usage_in_stream(false))
-                .unwrap();
+        let model = ProviderModel::new(ProviderConfig::glm_coding("k").with_usage_in_stream(false))
+            .unwrap();
         let body = model.body(&ModelRequest::new("hi", ExpectedArtifact::Text), true, None);
         // Never ask for a control the endpoint does not document.
         assert!(body.get("stream_options").is_none());
@@ -1591,22 +1873,21 @@ mod tests {
             ReasoningEffort::High,
             ReasoningEffort::Max,
         ] {
-            let model = OpenAiCompatibleModel::new(
-                ProviderConfig::glm_coding("k").with_reasoning_effort(effort),
-            )
-            .unwrap();
+            let model =
+                ProviderModel::new(ProviderConfig::glm_coding("k").with_reasoning_effort(effort))
+                    .unwrap();
             let body = model.body(&ModelRequest::new("x", ExpectedArtifact::Text), false, None);
             assert_eq!(body["reasoning_effort"], effort.as_str());
             assert_eq!(body["thinking"]["type"], "enabled");
         }
         assert!(
-            OpenAiCompatibleModel::new(
+            ProviderModel::new(
                 ProviderConfig::glm_coding("k").with_reasoning_effort(ReasoningEffort::Medium)
             )
             .is_err()
         );
         assert!(
-            OpenAiCompatibleModel::new(
+            ProviderModel::new(
                 ProviderConfig::new("k", "http://localhost:1234", "unknown")
                     .with_reasoning_effort(ReasoningEffort::High)
             )
@@ -1616,7 +1897,7 @@ mod tests {
 
     #[test]
     fn capability_report_is_honest_about_reasoning_controls() {
-        let model = OpenAiCompatibleModel::new(ProviderConfig::glm_coding("k")).unwrap();
+        let model = ProviderModel::new(ProviderConfig::glm_coding("k")).unwrap();
         let caps = model.capabilities();
         assert!(caps.streaming);
         assert!(caps.tools);
@@ -1627,7 +1908,7 @@ mod tests {
 
     #[test]
     fn structured_input_is_serialized_into_the_user_message() {
-        let model = OpenAiCompatibleModel::new(ProviderConfig::glm_coding("k")).unwrap();
+        let model = ProviderModel::new(ProviderConfig::glm_coding("k")).unwrap();
         let body = model.body(
             &ModelRequest::new("summarize", ExpectedArtifact::Json)
                 .with_input(json!({ "note": { "content": "alpha" } })),

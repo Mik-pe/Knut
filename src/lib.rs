@@ -21,6 +21,7 @@ mod lsp;
 mod matrix;
 mod mcp;
 mod model;
+pub mod openai_auth;
 mod patch;
 mod persist;
 mod planner;
@@ -121,7 +122,7 @@ pub use matrix::{
     ApprovedSwitch, CAPABILITIES, CapabilityRow, PricingRecord, PricingTable, ProfileConfig,
     ProviderMatrix, ProviderProfile, ReasoningField, SHARED_CONFORMANCE_FIXTURES, SupportLevel,
     SwitchRefusal, TurnState, adapter_for, all_matrices, all_profiles, can_switch, deepseek_matrix,
-    glm_matrix, render_matrix, switch_provider,
+    glm_matrix, openai_matrix, render_matrix, switch_provider,
 };
 pub use mcp::{
     ACCEPTED_REVISIONS, ConfigSource, DeclaredSideEffect, DiscoveredTool, ImportRejection,
@@ -151,8 +152,8 @@ pub use policy::{
     ProposedExecution, SideEffectPolicy,
 };
 pub use provider::{
-    BillingPath, DEFAULT_CHAT_PATH, OpenAiCompatibleModel, ProviderConfig, ProviderSummary,
-    ReasoningEffort,
+    BillingPath, DEFAULT_CHAT_PATH, ProviderConfig, ProviderModel, ProviderSummary,
+    ProviderTransport, ReasoningEffort,
 };
 pub use review::{
     ApprovalChoice, ApprovalError, ApprovalState, ApprovalView, ChangeKind, ChangeSet, CheckRow,

@@ -180,6 +180,14 @@ async fn run(args: Vec<String>) -> Result<(), KnutError> {
         "demo-tree" => demo_tree(verbose).await,
         "eval" => eval().await,
         "doctor" => doctor(live_from_flags(&positionals)).await,
+        "login" | "logout" | "accounts" => openai_account_command(&command, &positionals).await,
+        "models" => {
+            let model = knut::ProviderModel::new(knut::ProviderConfig::from_env()?)?;
+            for (id, name) in model.list_models().await? {
+                println!("{id}  {name}");
+            }
+            Ok(())
+        }
         "verify" => verify_workspace(verbose, as_json).await,
         "tui" | "workbench" => tui().await,
         "sessions" => sessions(&positionals, as_json).await,
@@ -216,6 +224,10 @@ USAGE:
                            --census <new.json> records generator calls, including failures
   knut tui                 open the interactive coding session explicitly
   knut doctor [--live]      diagnose setup (--live calls configured providers)
+  knut login openai-codex [--new]  sign in with ChatGPT (or add an account)
+  knut logout openai-codex  sign out of the selected ChatGPT account
+  knut accounts [<client-id>]  list or select a saved ChatGPT account
+  knut models              list models available to the configured provider
   knut verify [--json]      run build, test and lint checks
   knut bench               run the pilot benchmark and write an inspectable report
   knut lsp                 report language-server availability and negotiated features
@@ -238,9 +250,10 @@ Playground backends (--backend):
                      optional TYPESAFE_BASE_URL / TYPESAFE_MODEL
 
 Reasoner provider (knut doctor, and KNUT_PROVIDER_* env):
-  KNUT_PROVIDER_API_KEY   required for live reasoner calls (never logged)
+  KNUT_PROVIDER           zai (default) | openai | openai-codex | chat-completions
+  KNUT_PROVIDER_API_KEY   API credential; OPENAI_API_KEY / ZAI_API_KEY also accepted
   KNUT_PROVIDER_BASE_URL  default https://api.z.ai/api/coding/paas/v4
-  KNUT_PROVIDER_MODEL     default glm-5.3-flash
+  KNUT_PROVIDER_MODEL     default glm-5.3-flash (Z.ai), gpt-6.1-sol (OpenAI)
   KNUT_PROVIDER_TIER      fast | standard | reasoner"
         .to_owned()
 }
@@ -1200,37 +1213,23 @@ async fn doctor(live: bool) -> Result<(), KnutError> {
         _ => println!("  system one:  optional, not configured; reasoner plans directly"),
     }
 
-    // Reasoner (BYOK provider) configuration. The Z.ai coding key is
-    // accepted as a fallback, exactly as `knut run` and the shell accept
-    // it: doctor must not report "not configured" for a setup that works.
-    let reasoner_key = std::env::var("KNUT_PROVIDER_API_KEY")
-        .ok()
-        .filter(|key| !key.trim().is_empty())
-        .or_else(|| {
-            std::env::var("ZAI_API_KEY")
-                .ok()
-                .filter(|key| !key.trim().is_empty())
-        });
-    match reasoner_key {
-        Some(_) => {
-            let config = knut::ProviderConfig::from_env()?;
-            let summary = config.summary();
+    match knut::ProviderConfig::from_env() {
+        Ok(config) => {
+            let model = knut::ProviderModel::new(config)?;
+            let summary = model.config().summary();
             println!(
-                "  reasoner:    configured (model {}, tier {:?}, billing {:?})",
-                summary.model, summary.tier, summary.billing
+                "  reasoner:    configured (model {}, tier {:?}, billing {:?}, {:?})",
+                summary.model, summary.tier, summary.billing, summary.transport
             );
             println!(
-                "               endpoint {} (timeout {:?})",
-                summary.base_url, summary.timeout
+                "               endpoint {} (timeout {:?}, credential {})",
+                summary.base_url, summary.timeout, summary.api_key_source
             );
-
-            let model = knut::OpenAiCompatibleModel::new(config)?;
             let caps = knut::Model::capabilities(&model);
             println!(
                 "               capabilities: streaming={} tools={} reasoning={} continuation={} usage={}",
                 caps.streaming, caps.tools, caps.reasoning, caps.continuation, caps.usage
             );
-
             if live {
                 let request = knut::ModelRequest::new(
                     "Reply with exactly the word pong.",
@@ -1245,16 +1244,20 @@ async fn doctor(live: bool) -> Result<(), KnutError> {
                                 _ => "unknown".to_owned(),
                             };
                         println!(
-                            "    live:      ok (model {}, usage {usage}, reasoning parts {})",
-                            response.identity.model,
-                            response.continuation.parts.len()
+                            "    live:      ok (model {}, usage {usage})",
+                            response.identity.model
                         );
                     }
-                    Err(err) => println!("    live:      FAILED ({err})"),
+                    Err(err) => return Err(err),
                 }
             }
         }
-        _ => println!("  reasoner:    not configured (set KNUT_PROVIDER_API_KEY or ZAI_API_KEY)"),
+        Err(error) => {
+            println!("  reasoner:    unavailable ({error})");
+            if live {
+                return Err(error);
+            }
+        }
     }
 
     // The offline playground always works.
@@ -1434,6 +1437,41 @@ fn print_metrics(label: &str, metrics: &Metrics) {
         metrics.estimated_cost,
         metrics.reasoner_turns
     );
+}
+
+async fn openai_account_command(command: &str, args: &[String]) -> Result<(), KnutError> {
+    match command {
+        "accounts" if args.is_empty() => {
+            for label in knut::openai_auth::accounts()? {
+                println!("{label}");
+            }
+        }
+        "accounts" if args.len() == 1 => knut::openai_auth::select_account(&args[0]).await?,
+        "login"
+            if args.first().map(String::as_str) == Some("openai-codex")
+                && (args.len() == 1 || args.len() == 2 && args[1] == "--new") =>
+        {
+            let account = knut::openai_auth::login(args.len() == 2).await?;
+            println!(
+                "Signed in: {account}\nUse KNUT_PROVIDER=openai-codex to run with your ChatGPT plan."
+            );
+        }
+        "logout" if args.len() == 1 && args[0] == "openai-codex" => {
+            let revoked = knut::openai_auth::logout().await?;
+            println!("Signed out locally.");
+            if !revoked {
+                println!(
+                    "Remote revocation was not confirmed. Disconnect Knut in ChatGPT Settings."
+                );
+            }
+        }
+        _ => {
+            return Err(KnutError::Model(
+                "Use login/logout openai-codex, or accounts [client-id]".to_owned(),
+            ));
+        }
+    }
+    Ok(())
 }
 
 #[cfg(test)]

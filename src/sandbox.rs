@@ -1302,6 +1302,8 @@ mod tests {
                 ])
                 .env("KNUT_SANDBOX_ENV_FIXTURE", "1")
                 .env("ZAI_API_KEY", "super-secret-provider-key")
+                .env("OPENAI_API_KEY", "super-secret-openai-key")
+                .env("KNUT_PROVIDER_API_KEY", "super-secret-knut-key")
                 .env("TYPESAFE_API_KEY", "super-secret-jev-key")
                 .output()
                 .unwrap();
@@ -1319,6 +1321,8 @@ mod tests {
 
         assert!(!outcome.stdout.text.contains("super-secret"));
         assert!(!outcome.stdout.text.contains("ZAI_API_KEY"));
+        assert!(!outcome.stdout.text.contains("OPENAI_API_KEY"));
+        assert!(!outcome.stdout.text.contains("KNUT_PROVIDER_API_KEY"));
         assert!(!outcome.stdout.text.contains("TYPESAFE_API_KEY"));
     }
 

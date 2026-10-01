@@ -23,7 +23,7 @@
 use serde::{Deserialize, Serialize};
 
 use crate::KnutError;
-use crate::provider::ProviderConfig;
+use crate::provider::{ProviderConfig, ProviderTransport};
 
 /// How well a capability is supported, and on what evidence.
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
@@ -372,9 +372,88 @@ pub fn deepseek_matrix() -> ProviderMatrix {
     }
 }
 
+/// OpenAI's native Responses transport; conformance is fixture-tested only.
+pub fn openai_matrix() -> ProviderMatrix {
+    let fixtures = [
+        (
+            "text streaming",
+            "provider::responses::tests::responses_streams_and_replays_full_encrypted_context",
+        ),
+        (
+            "tool call streaming",
+            "provider::responses::tests::multiple_function_calls_are_complete_before_publication",
+        ),
+        (
+            "multi-call turns",
+            "provider::responses::tests::multiple_function_calls_are_complete_before_publication",
+        ),
+        (
+            "reasoning controls",
+            "provider::responses::tests::response_configuration_does_not_send_chat_fields_or_foreign_continuations",
+        ),
+        (
+            "reasoning continuation",
+            "provider::responses::tests::responses_streams_and_replays_full_encrypted_context",
+        ),
+        (
+            "usage accounting",
+            "provider::responses::tests::responses_streams_and_replays_full_encrypted_context",
+        ),
+        (
+            "cancellation",
+            "provider::responses::tests::eof_incomplete_and_malformed_tool_calls_are_refused",
+        ),
+        (
+            "session resumption",
+            "persist::tests::replaying_a_session_dispatches_nothing",
+        ),
+        (
+            "native protocol",
+            "provider::responses::tests::response_configuration_does_not_send_chat_fields_or_foreign_continuations",
+        ),
+    ];
+    let mut rows = fixtures
+        .into_iter()
+        .map(|(capability, fixture)| CapabilityRow {
+            capability: capability.to_owned(),
+            level: SupportLevel::FixtureTested {
+                fixture: fixture.to_owned(),
+            },
+            provider_detail: None,
+        })
+        .collect::<Vec<_>>();
+    rows.push(CapabilityRow {
+        capability: "context budgeting".to_owned(),
+        level: SupportLevel::Unsupported {
+            reason: "account-specific limits are not resolved by the adapter".to_owned(),
+        },
+        provider_detail: None,
+    });
+    rows.push(CapabilityRow {
+        capability: "structured output".to_owned(),
+        level: SupportLevel::Unsupported {
+            reason:
+                "the runtime validates JSON plans; provider-enforced schemas are not configured"
+                    .to_owned(),
+        },
+        provider_detail: None,
+    });
+    ProviderMatrix {
+        provider: "OpenAI".to_owned(),
+        endpoint: "https://api.openai.com/v1 (API or ChatGPT plan)".to_owned(),
+        model: "gpt-6.1-sol".to_owned(),
+        protocol: "native Responses API".to_owned(),
+        credentials: vec![
+            "OPENAI_API_KEY (environment variable)".to_owned(),
+            "ChatGPT sign-in (`knut login openai-codex`)".to_owned(),
+        ],
+        rows,
+    }
+}
+
 /// Every provider the matrix covers.
 pub fn all_matrices() -> Vec<ProviderMatrix> {
-    vec![glm_matrix(), deepseek_matrix()]
+    vec![glm_matrix(), deepseek_matrix(), openai_matrix()]
 }
 
 /// Render the whole matrix as a document.
@@ -408,6 +487,8 @@ pub enum ReasoningField {
     ReasoningContent,
     /// DeepSeek's field on this endpoint.
     Reasoning,
+    /// Opaque reasoning items returned by stateless Responses requests.
+    EncryptedContent,
 }
 
 impl ReasoningField {
@@ -415,6 +496,7 @@ impl ReasoningField {
         match self {
             ReasoningField::ReasoningContent => "reasoning_content",
             ReasoningField::Reasoning => "reasoning",
+            ReasoningField::EncryptedContent => "reasoning.encrypted_content",
         }
     }
 }
@@ -435,6 +517,7 @@ pub struct ProviderProfile {
 /// The configuration parts, serializable without the secret.
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub struct ProfileConfig {
+    pub transport: ProviderTransport,
     pub base_url: String,
     pub model: String,
 }
@@ -445,6 +528,7 @@ impl ProviderProfile {
         Self {
             id: "glm".to_owned(),
             config: ProfileConfig {
+                transport: ProviderTransport::ChatCompletions,
                 base_url: "https://api.z.ai/api/coding/paas/v4".to_owned(),
                 model: "glm-5.3-flash".to_owned(),
             },
@@ -459,12 +543,28 @@ impl ProviderProfile {
         Self {
             id: "deepseek".to_owned(),
             config: ProfileConfig {
+                transport: ProviderTransport::ChatCompletions,
                 base_url: "https://ollama.com/v1".to_owned(),
                 model: "deepseek-v4.1-flash".to_owned(),
             },
             reasoning_field: ReasoningField::Reasoning,
             requires_continuation: true,
             reports_cached_tokens: true,
+        }
+    }
+
+    /// OpenAI API-key profile; ChatGPT credentials are selected separately at runtime.
+    pub fn openai() -> Self {
+        Self {
+            id: "openai".to_owned(),
+            config: ProfileConfig {
+                transport: ProviderTransport::Responses,
+                base_url: "https://api.openai.com/v1".to_owned(),
+                model: "gpt-6.1-sol".to_owned(),
+            },
+            reasoning_field: ReasoningField::EncryptedContent,
+            requires_continuation: true,
+            reports_cached_tokens: false,
         }
     }
 
@@ -475,6 +575,7 @@ impl ProviderProfile {
             self.config.base_url.clone(),
             self.config.model.clone(),
         )
+        .with_transport(self.config.transport)
         .with_reasoning_field(self.reasoning_field.as_str())
     }
 
@@ -488,7 +589,11 @@ impl ProviderProfile {
 
 /// Every profile this build ships.
 pub fn all_profiles() -> Vec<ProviderProfile> {
-    vec![ProviderProfile::glm(), ProviderProfile::deepseek()]
+    vec![
+        ProviderProfile::glm(),
+        ProviderProfile::deepseek(),
+        ProviderProfile::openai(),
+    ]
 }
 
 /// Why a provider switch cannot happen mid-turn.
@@ -707,6 +812,10 @@ impl PricingTable {
 ///
 /// Named so a matrix row can point at the exact test that backs it.
 pub const SHARED_CONFORMANCE_FIXTURES: &[&str] = &[
+    "provider::responses::tests::responses_streams_and_replays_full_encrypted_context",
+    "provider::responses::tests::multiple_function_calls_are_complete_before_publication",
+    "provider::responses::tests::response_configuration_does_not_send_chat_fields_or_foreign_continuations",
+    "provider::responses::tests::eof_incomplete_and_malformed_tool_calls_are_refused",
     "provider::tests::glm_native_reasoning_levels_are_sent_and_unsupported_levels_refused",
     "provider::tests::live_http_fixture_completes_reasoning_tool_call_and_artifact",
     "provider::tests::fragmented_frames_across_tcp_chunks_reassemble",
@@ -727,8 +836,8 @@ pub const SHARED_CONFORMANCE_FIXTURES: &[&str] = &[
 pub fn adapter_for(
     profile: &ProviderProfile,
     api_key: impl Into<String>,
-) -> Result<crate::provider::OpenAiCompatibleModel, KnutError> {
-    crate::provider::OpenAiCompatibleModel::new(profile.to_provider_config(api_key))
+) -> Result<crate::provider::ProviderModel, KnutError> {
+    crate::provider::ProviderModel::new(profile.to_provider_config(api_key))
 }
 
 #[cfg(test)]
@@ -736,9 +845,9 @@ mod tests {
     use super::*;
 
     #[test]
-    fn both_providers_are_covered_row_for_row() {
+    fn providers_are_covered_row_for_row() {
         let matrices = all_matrices();
-        assert_eq!(matrices.len(), 2);
+        assert_eq!(matrices.len(), 3);
         for matrix in &matrices {
             for capability in CAPABILITIES {
                 assert!(
@@ -869,7 +978,7 @@ mod tests {
             assert!(capabilities.streaming);
             assert!(capabilities.tools);
             assert!(capabilities.continuation);
-            assert_eq!(capabilities.reasoning, profile.id == "glm");
+            assert_eq!(capabilities.reasoning, profile.id != "deepseek");
         }
     }
 
@@ -952,9 +1061,14 @@ mod tests {
     #[test]
     fn a_compatibility_endpoint_is_not_advertised_as_a_native_protocol() {
         for matrix in all_matrices() {
-            assert!(!matrix.supports("native protocol"));
-            // And the protocol field says what is actually spoken.
-            assert!(matrix.protocol.contains("OpenAI-compatible"));
+            if matrix.provider == "OpenAI" {
+                assert!(matrix.supports("native protocol"));
+                assert_eq!(matrix.protocol, "native Responses API");
+                assert!(matrix.rows.iter().all(|row| !row.level.is_live()));
+            } else {
+                assert!(!matrix.supports("native protocol"));
+                assert!(matrix.protocol.contains("OpenAI-compatible"));
+            }
         }
     }
 
@@ -963,7 +1077,10 @@ mod tests {
         for matrix in all_matrices() {
             for credential in &matrix.credentials {
                 // The matrix names the env var; it never embeds a key.
-                assert!(credential.contains("environment variable"));
+                assert!(
+                    credential.contains("environment variable")
+                        || credential.contains("ChatGPT sign-in")
+                );
                 assert!(!credential.contains("sk-"));
                 assert!(!credential.contains("apikey"));
             }

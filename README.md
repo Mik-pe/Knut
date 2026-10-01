@@ -88,15 +88,62 @@ $ ./target/release/knut tui             # the workbench shell
 $ ./target/release/knut run "fix the failing test"   # one real coding task
 ```
 
-Configuration is environment-based and nothing is written to the
-repository:
+Choose a reasoner provider independently from the optional decision model.
+
+For OpenAI API models, including Codex models:
+
+```sh
+export KNUT_PROVIDER=openai
+export OPENAI_API_KEY="your-api-key"
+export KNUT_PROVIDER_MODEL=gpt-6.1-sol
+./target/release/knut models
+./target/release/knut doctor --live
+./target/release/knut tui
+```
+
+For your ChatGPT plan, sign in through the system browser:
+
+```sh
+./target/release/knut login openai-codex
+export KNUT_PROVIDER=openai-codex
+./target/release/knut models
+export KNUT_PROVIDER_MODEL=gpt-6.1-sol # choose an ID from the account's catalog
+./target/release/knut tui
+```
+
+The OpenAI profiles use the native Responses API with `store: false` and
+streaming. They preserve encrypted reasoning items and full input history,
+validate completed responses, and report interrupted streams or usage-limit
+failures. `gpt-5-codex` and other account-available Responses models can also be
+selected with `KNUT_PROVIDER_MODEL`. Access depends on your API account or the
+ChatGPT account's returned catalog.
+
+ChatGPT sign-in uses OpenAI's documented public-client OAuth flow with PKCE,
+state, nonce and signed ID-token validation. Knut stores separate registrations
+under `~/.config/knut/` (`XDG_CONFIG_HOME` or `KNUT_CONFIG_DIR` can override the
+location), with owner-only permissions and atomic token rotation. Refreshes
+are serialized across processes. `knut accounts` lists saved registrations;
+`knut accounts <client-id>` selects one; `knut login openai-codex --new` adds an
+account. `knut logout openai-codex` revokes the selected session and clears its
+local tokens. If remote revocation fails, it reports that explicitly. Sign-in
+does not read Codex's credentials or grant access to ChatGPT conversation history.
+Review or disconnect Knut under [ChatGPT Settings → Usage](https://chatgpt.com/settings/usage).
+
+See OpenAI's [models and inference](https://developers.openai.com/siwc/token-sharing-open-source/models-and-inference)
+and [sign-in contract](https://developers.openai.com/siwc/token-sharing-open-source/sign-in).
+API-key usage is metered; ChatGPT plan usage stays on the selected plan route.
+Knut never falls back from plan usage to API billing.
+
+Z.ai remains the default. Other Chat Completions providers can use
+`KNUT_PROVIDER=chat-completions` with an explicit base URL and model.
 
 | variable | purpose |
 | --- | --- |
-| `KNUT_PROVIDER_API_KEY` | reasoner credential (required for `run`) |
-| `KNUT_PROVIDER_BASE_URL` | endpoint; defaults to the Z.ai coding endpoint |
-| `KNUT_PROVIDER_MODEL` | model id; defaults to `glm-5.3-flash` |
-| `KNUT_PROVIDER_REASONING_EFFORT` | explicit effort; GLM-5.3 supports `low`, `high`, `max` (default) |
+| `KNUT_PROVIDER` | `zai` (default), `openai`, `openai-codex`, or `chat-completions` |
+| `KNUT_PROVIDER_API_KEY` | explicit API credential; otherwise `OPENAI_API_KEY` for OpenAI or `ZAI_API_KEY` for Z.ai/compatible endpoints |
+| `KNUT_PROVIDER_BASE_URL` | endpoint prefix; defaults to Z.ai coding or `https://api.openai.com/v1` for OpenAI; ChatGPT tokens are restricted to the OpenAI origin |
+| `KNUT_PROVIDER_MODEL` | model ID; defaults to `glm-5.3-flash` or `gpt-6.1-sol` for OpenAI |
+| `KNUT_PROVIDER_REASONING_EFFORT` | explicit effort; GLM-5.3 uses `low`, `high`, `max`; GPT-6.1 Sol accepts `low`, `medium`, `high`, `xhigh`, `max` |
 | `KNUT_PROVIDER_TIMEOUT_SECONDS` | positive request timeout; default 120 seconds |
 | `TYPESAFE_API_KEY` | optional Jev credential; without it, the reasoner plans directly |
 | `KNUT_MODE` | `quality` (default) or `adaptive` |
