@@ -29,7 +29,19 @@ jobs:
       # The sandbox and process suites need the OS backend; without it the
       # code must refuse rather than run unsandboxed, which these assert.
       - name: Install sandbox backend
-        run: sudo apt-get update && sudo apt-get install -y bubblewrap
+        run: |
+          sudo apt-get update
+          sudo apt-get install -y bubblewrap apparmor
+          # Ubuntu restricts user namespaces unless the executable has a profile.
+          sudo tee /etc/apparmor.d/bwrap-userns-restrict >/dev/null <<'PROFILE'
+          abi <abi/4.0>,
+          include <tunables/global>
+          profile bwrap /usr/bin/bwrap flags=(unconfined) {
+            userns,
+          }
+          PROFILE
+          sudo apparmor_parser -r /etc/apparmor.d/bwrap-userns-restrict
+          bwrap --unshare-all --ro-bind / / -- /bin/true
 
       # Offline fixtures only: no provider keys, no network. The suites
       # cover protocol fixtures, policy/patch state, fake-session
@@ -86,4 +98,3 @@ jobs:
           path: |
             knut-*.tar.gz
             knut-*.tar.gz.sha256
-
