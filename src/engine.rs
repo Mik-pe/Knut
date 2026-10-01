@@ -48,6 +48,8 @@ pub struct EngineReport {
     pub unavailable: Option<String>,
     /// A configuration problem with the optional decision model.
     pub routing_warning: Option<String>,
+    pub chatgpt_plan: bool,
+    pub account: Option<String>,
 }
 impl EngineReport {
     /// A one-line label for the header.
@@ -87,6 +89,8 @@ pub fn build_here() -> (Engine, EngineReport) {
                 checks: Vec::new(),
                 unavailable: Some(format!("workspace unavailable: {err}")),
                 routing_warning: None,
+                chatgpt_plan: false,
+                account: None,
             },
         ),
     }
@@ -169,6 +173,8 @@ pub fn build_with_write_approval(
         checks: Vec::new(),
         unavailable: None,
         routing_warning: None,
+        chatgpt_plan: false,
+        account: None,
     };
 
     // Tools are the real bounded read/search/write set for this workspace.
@@ -195,6 +201,10 @@ pub fn build_with_write_approval(
     match (&provider_config, model_ready) {
         (Some(config), true) => {
             report.model = Some(config.model().to_owned());
+            report.chatgpt_plan = config.uses_chatgpt_plan();
+            report.account = config
+                .chatgpt_client()
+                .and_then(crate::connection::account_label);
             report.base_url = Some(config.base_url().to_owned());
         }
         _ => {
@@ -211,27 +221,17 @@ pub fn build_with_write_approval(
     // even though a reasoner is present — the endpoint is the same either
     // way; only the request's effort differs. Each cascade needs its own
     // instance, so the adapter is rebuilt from its (cheap) configuration.
-    let build_cascade = |config: &crate::ProviderConfig| {
-        let model = |config: crate::ProviderConfig| crate::ProviderModel::new(config).ok();
-        let mut cascade = ComputeCascade::empty();
-        if let Some(model) = model(config.clone()) {
-            cascade = cascade.with_fast(model);
-        }
-        if let Some(model) = model(config.clone()) {
-            cascade = cascade.with_standard(model);
-        }
-        if let Some(model) = model(config.clone()) {
-            cascade = cascade.with_reasoner(model);
-        }
-        cascade
-    };
 
     let cascade = match &provider_config {
-        Some(config) if report.model.is_some() => build_cascade(config),
+        Some(config) if report.model.is_some() => {
+            provider_cascade(config).unwrap_or_else(|_| ComputeCascade::empty())
+        }
         _ => ComputeCascade::empty(),
     };
     let planning_cascade = match &provider_config {
-        Some(config) if report.model.is_some() => build_cascade(config),
+        Some(config) if report.model.is_some() => {
+            provider_cascade(config).unwrap_or_else(|_| ComputeCascade::empty())
+        }
         _ => ComputeCascade::empty(),
     };
 
@@ -368,6 +368,23 @@ impl crate::SystemZeroRule for ReasonerPlanRule {
     }
 }
 
+fn provider_cascade(config: &crate::ProviderConfig) -> Result<ComputeCascade, KnutError> {
+    Ok(ComputeCascade::empty()
+        .with_fast(crate::ProviderModel::new(config.clone())?)
+        .with_standard(crate::ProviderModel::new(config.clone())?)
+        .with_reasoner(crate::ProviderModel::new(config.clone())?))
+}
+
+pub enum ConnectionChange {
+    CheckIdle,
+    Use(Option<crate::ProviderConfig>),
+}
+
+pub struct ConnectionRequest {
+    pub change: ConnectionChange,
+    pub reply: tokio::sync::oneshot::Sender<Result<(), KnutError>>,
+}
+
 /// The driver's handle on the runtime, plus the bookkeeping needed to
 /// stream new events exactly once.
 pub struct Engine {
@@ -498,9 +515,19 @@ impl Engine {
 /// The driver loop: owns the engine, drains commands and pumps events
 /// until the shell drops its receiver.
 pub async fn run_engine(
+    engine: Engine,
+    commands: UnboundedReceiver<SessionCommand>,
+    events: UnboundedSender<SessionEvent>,
+) {
+    let (_, connections) = tokio::sync::mpsc::unbounded_channel();
+    run_engine_with_connections(engine, commands, events, connections).await;
+}
+
+pub async fn run_engine_with_connections(
     mut engine: Engine,
     mut commands: UnboundedReceiver<SessionCommand>,
     events: UnboundedSender<SessionEvent>,
+    mut connections: UnboundedReceiver<ConnectionRequest>,
 ) {
     let _ = events.send(SessionEvent::SessionStarted {
         protocol_version: crate::SESSION_PROTOCOL_VERSION,
@@ -537,6 +564,11 @@ pub async fn run_engine(
                         drive = matches!(state, Some(TaskState::Running | TaskState::Queued));
                         break;
                     }
+                    request = connections.recv(), if !connections.is_closed() => {
+                        if let Some(request) = request {
+                            let _ = request.reply.send(Err(KnutError::Model("Finish or cancel the current task before changing the connection".to_owned())));
+                        }
+                    }
                     command = commands.recv() => {
                         match command {
                             Some(SessionCommand::Cancel) => { cancelled = true; break; }
@@ -549,6 +581,26 @@ pub async fn run_engine(
             }
         } else if pending.is_empty() {
             tokio::select! {
+                request = connections.recv(), if !connections.is_closed() => {
+                    if let Some(request) = request {
+                        let result = async {
+                            if !commands.is_empty() || engine.task_state().is_some_and(|state| !state.is_terminal()) {
+                                return Err(KnutError::Model("Finish or cancel the current task before changing the connection".to_owned()));
+                            }
+                            let ConnectionChange::Use(config) = &request.change else { return Ok(()); };
+                            let cascade = Arc::new(match config {
+                                Some(config) => provider_cascade(config)?,
+                                None => ComputeCascade::empty(),
+                            });
+                            let planner = Planner::new(cascade.clone());
+                            if let Some(config) = config && let Some(client_id) = config.chatgpt_client() {
+                                crate::openai_auth::save_model(config.model(), client_id).await?;
+                            }
+                            engine.runtime.replace_models(planner, cascade)
+                        }.await;
+                        let _ = request.reply.send(result);
+                    }
+                }
                 event = live.recv() => {
                     if let Some(event) = event && events.send(event).is_err() { disconnected = true; }
                 }
@@ -1049,7 +1101,13 @@ mod tests {
         let engine = Engine::new(runtime, None);
         let (commands, command_rx) = tokio::sync::mpsc::unbounded_channel();
         let (events, mut event_rx) = tokio::sync::mpsc::unbounded_channel();
-        let driver = tokio::spawn(run_engine(engine, command_rx, events));
+        let (connections, connection_rx) = tokio::sync::mpsc::unbounded_channel();
+        let driver = tokio::spawn(run_engine_with_connections(
+            engine,
+            command_rx,
+            events,
+            connection_rx,
+        ));
         commands
             .send(SessionCommand::Submit {
                 prompt: "hello".to_owned(),
@@ -1060,6 +1118,20 @@ mod tests {
                 if matches!(event_rx.recv().await.unwrap(), SessionEvent::TextDelta { text, .. } if text == "first fragment") { break; }
             }
         }).await.expect("fragment was buffered behind stalled provider");
+        let (reply, result) = tokio::sync::oneshot::channel();
+        connections
+            .send(ConnectionRequest {
+                change: ConnectionChange::CheckIdle,
+                reply,
+            })
+            .unwrap();
+        assert!(
+            tokio::time::timeout(std::time::Duration::from_secs(1), result)
+                .await
+                .unwrap()
+                .unwrap()
+                .is_err()
+        );
         commands.send(SessionCommand::Cancel).unwrap();
         tokio::time::timeout(std::time::Duration::from_secs(5), async {
             loop {
@@ -1083,5 +1155,55 @@ mod tests {
                     | SessionEvent::TaskCancelled { .. }
             ));
         }
+    }
+    #[tokio::test]
+    async fn changing_models_keeps_session_ids_and_refuses_paused_tasks() {
+        let mut engine = minimal_engine(None);
+        engine
+            .runtime
+            .command(SessionCommand::Submit {
+                prompt: "first".into(),
+            })
+            .await
+            .unwrap();
+        engine.runtime.command(SessionCommand::Pause).await.unwrap();
+        let config =
+            crate::ProviderConfig::new("fixture", "http://127.0.0.1:1/v1", "fixture-model");
+        let cascade = Arc::new(provider_cascade(&config).unwrap());
+        assert!(
+            engine
+                .runtime
+                .replace_models(Planner::new(cascade.clone()), cascade.clone())
+                .is_err()
+        );
+        engine
+            .runtime
+            .command(SessionCommand::Cancel)
+            .await
+            .unwrap();
+        engine
+            .runtime
+            .replace_models(Planner::new(cascade.clone()), cascade)
+            .unwrap();
+        for tier in [ModelTier::Fast, ModelTier::Standard, ModelTier::Reasoner] {
+            assert!(engine.cascade().has_model_for(tier));
+        }
+        engine
+            .runtime
+            .command(SessionCommand::Submit {
+                prompt: "second".into(),
+            })
+            .await
+            .unwrap();
+        let tasks: Vec<_> = engine
+            .runtime
+            .events()
+            .events()
+            .filter_map(|event| match event {
+                SessionEvent::TaskStarted { task, .. } => Some(task.0),
+                _ => None,
+            })
+            .collect();
+        assert_eq!(tasks, vec![1, 2]);
     }
 }

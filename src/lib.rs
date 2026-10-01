@@ -6,6 +6,7 @@ mod census;
 mod completion;
 mod composer;
 mod concurrency;
+mod connection;
 mod context;
 mod decision;
 mod edge;
@@ -73,6 +74,7 @@ pub use concurrency::{
     Budget, BudgetSnapshot, ItemOutcome, ItemResult, ItemRunner, PoolCapacity, ResourceClass,
     ScheduleOutcome, Scheduler, SkipReason, WorkItem, items_from_plan,
 };
+pub use connection::ConnectionAction;
 pub use context::{
     AcceptanceRequirement, ArtifactIndex, Constraint, ContextReport, DecisionProjection,
     DiagnosticRef, MAX_FRAME_CANDIDATES, MAX_FRAME_TEXT, ReasonerProjection, SourceExcerpt,
@@ -83,8 +85,8 @@ pub use edge::{
     EdgeChoice, EdgeJudgment, EdgeRouter, EdgeSelector, EdgeState, MAX_STEP_ATTEMPTS, NodeOutcome,
 };
 pub use engine::{
-    Engine, EngineReport, action_label, build_here, build_with_write_approval, run_engine,
-    source_label,
+    ConnectionChange, ConnectionRequest, Engine, EngineReport, action_label, build_here,
+    build_with_write_approval, run_engine, run_engine_with_connections, source_label,
 };
 pub use error::{KnutError, SystemOneFailure, redacted};
 pub use evals::{

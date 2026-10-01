@@ -46,6 +46,10 @@ struct Accounts {
     host_id: String,
     active: Option<String>,
     registrations: Vec<Registration>,
+    #[serde(default)]
+    preferred_model: Option<String>,
+    #[serde(default)]
+    plan_notice_seen: bool,
 }
 
 impl Accounts {
@@ -316,7 +320,7 @@ async fn token_request(
 }
 
 /// Confirm an active account has consented to ChatGPT plan usage, without network requests.
-pub fn ensure_signed_in() -> Result<(), KnutError> {
+pub(crate) fn signed_in_client() -> Result<String, KnutError> {
     let accounts = Store::configured()?.read()?;
     let tokens = accounts
         .selected()?
@@ -328,20 +332,29 @@ pub fn ensure_signed_in() -> Result<(), KnutError> {
             "ChatGPT plan usage is not authorized; run `knut login openai-codex`",
         ));
     }
-    Ok(())
+    Ok(accounts.selected()?.client_id.clone())
 }
 
-pub(crate) async fn access_token() -> Result<String, KnutError> {
+pub(crate) async fn access_token(client_id: &str) -> Result<String, KnutError> {
     let mut store = lock_store().await?;
-    refresh_account(&mut store, &client()?, TOKEN).await
+    refresh_account(&mut store, &client()?, TOKEN, client_id).await
 }
 
 async fn refresh_account(
     store: &mut LockedStore,
     http: &reqwest::Client,
     endpoint: &str,
+    client_id: &str,
 ) -> Result<String, KnutError> {
-    let selected = store.accounts.selected()?.clone();
+    let selected = store
+        .accounts
+        .registrations
+        .iter()
+        .find(|r| r.client_id == client_id)
+        .cloned()
+        .ok_or_else(|| {
+            auth_error("The connected ChatGPT account is no longer registered; reconnect")
+        })?;
     let tokens = selected
         .tokens
         .as_ref()
@@ -600,6 +613,14 @@ async fn wait_callback(
 
 /// Register or reauthorize ChatGPT plan usage in the system browser.
 pub async fn login(new_account: bool) -> Result<String, KnutError> {
+    login_with_output(new_account, true).await
+}
+
+pub(crate) async fn login_in_tui(new_account: bool) -> Result<String, KnutError> {
+    login_with_output(new_account, false).await
+}
+
+async fn login_with_output(new_account: bool, console: bool) -> Result<String, KnutError> {
     let (host, previous) = {
         let mut store = lock_store().await?;
         if store.accounts.host_id.is_empty() {
@@ -628,25 +649,20 @@ pub async fn login(new_account: bool) -> Result<String, KnutError> {
         client_id: previous.as_ref().map(|r| r.client_id.clone()),
     };
     let url = attempt.authorization_url(&host, previous.as_ref())?;
-    let opener = if cfg!(target_os = "macos") {
-        "open"
-    } else {
-        "xdg-open"
-    };
-    let opened = std::process::Command::new(opener)
-        .arg(url.as_str())
-        .stdout(std::process::Stdio::null())
-        .stderr(std::process::Stdio::null())
-        .status()
-        .is_ok_and(|s| s.success());
+    let opened = open_browser(url.as_str()).await.is_ok();
     if !opened {
+        if !console {
+            return Err(auth_error(
+                "Cannot open the browser. Run `knut login openai-codex` in a normal terminal, then retry here.",
+            ));
+        }
         if previous.as_ref().and_then(|r| r.tokens.as_ref()).is_some() {
             return Err(auth_error(
                 "Cannot open sign-in browser; use `knut login openai-codex --new` to register in a browser manually",
             ));
         }
         println!("Open this URL in your browser to sign in:\n{url}");
-    } else {
+    } else if console {
         println!("Continue signing in with ChatGPT in your browser.");
     }
     let (code, client_id) = wait_callback(listener, &attempt).await?;
@@ -705,6 +721,87 @@ pub async fn login(new_account: bool) -> Result<String, KnutError> {
     } else {
         email
     })
+}
+
+pub(crate) async fn open_browser(url: &str) -> Result<(), KnutError> {
+    let opener = if cfg!(target_os = "macos") {
+        "open"
+    } else {
+        "xdg-open"
+    };
+    let status = tokio::process::Command::new(opener)
+        .arg(url)
+        .stdout(std::process::Stdio::null())
+        .stderr(std::process::Stdio::null())
+        .kill_on_drop(true)
+        .status()
+        .await
+        .map_err(|_| auth_error("Cannot open the system browser"))?;
+    if status.success() {
+        Ok(())
+    } else {
+        Err(auth_error("Cannot open the system browser"))
+    }
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub(crate) struct AccountInfo {
+    pub id: String,
+    pub label: String,
+    pub active: bool,
+    pub signed_in: bool,
+}
+
+pub(crate) fn account_list() -> Result<Vec<AccountInfo>, KnutError> {
+    let accounts = Store::configured()?.read()?;
+    Ok(accounts
+        .registrations
+        .iter()
+        .map(|r| AccountInfo {
+            id: r.client_id.clone(),
+            label: if r.email.is_empty() {
+                "ChatGPT account".to_owned()
+            } else {
+                r.email.clone()
+            },
+            active: accounts.active.as_deref() == Some(&r.client_id),
+            signed_in: r.tokens.is_some(),
+        })
+        .collect())
+}
+
+pub(crate) fn saved_model() -> Result<Option<String>, KnutError> {
+    Ok(Store::configured()?.read()?.preferred_model)
+}
+
+pub(crate) fn needs_plan_notice() -> Result<bool, KnutError> {
+    Ok(!Store::configured()?.read()?.plan_notice_seen)
+}
+
+pub(crate) async fn acknowledge_plan_notice() -> Result<(), KnutError> {
+    let mut store = lock_store().await?;
+    store.accounts.plan_notice_seen = true;
+    store.save()
+}
+
+pub(crate) async fn save_model(model: &str, client_id: &str) -> Result<(), KnutError> {
+    let mut store = lock_store().await?;
+    let registration = store
+        .accounts
+        .registrations
+        .iter()
+        .find(|r| r.client_id == client_id)
+        .ok_or_else(|| auth_error("Sign in first"))?;
+    let tokens = registration
+        .tokens
+        .as_ref()
+        .ok_or_else(|| auth_error("Sign in first"))?;
+    if !tokens.scopes.iter().any(|scope| scope == PLAN_SCOPE) {
+        return Err(auth_error("ChatGPT plan usage is not authorized"));
+    }
+    store.accounts.active = Some(client_id.to_owned());
+    store.accounts.preferred_model = Some(model.to_owned());
+    store.save()
 }
 
 /// Saved account labels, with active and signed-in status. Credentials stay private.
@@ -788,6 +885,7 @@ pub async fn logout() -> Result<bool, KnutError> {
         .find(|r| r.client_id == selected.client_id)
         .unwrap()
         .tokens = None;
+    store.accounts.preferred_model = None;
     store.save()?;
     Ok(revoked)
 }
@@ -904,6 +1002,12 @@ mod tests {
                 scopes: vec![PLAN_SCOPE.into()],
             }),
         });
+        let mut other = store.accounts.registrations[0].clone();
+        other.client_id = "other-client".to_owned();
+        other.tokens.as_mut().unwrap().access_token = "other-account-token".to_owned();
+        other.tokens.as_mut().unwrap().expires_at = now() + 3600;
+        store.accounts.registrations.push(other);
+        store.accounts.active = Some("other-client".to_owned());
         store.save().unwrap();
         let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
         let endpoint = format!("http://{}/token", listener.local_addr().unwrap());
@@ -946,18 +1050,21 @@ mod tests {
             socket.write_all(response.as_bytes()).await.unwrap();
         });
         assert_eq!(
-            refresh_account(&mut store, &client().unwrap(), &endpoint)
+            refresh_account(&mut store, &client().unwrap(), &endpoint, "selected-client")
                 .await
                 .unwrap(),
             "fresh"
         );
         server.await.unwrap();
+        assert_eq!(store.accounts.active.as_deref(), Some("other-client"));
         drop(store);
         let mut restarted = Store { dir: dir.clone() }.lock().unwrap();
         assert_eq!(
             restarted
                 .accounts
-                .selected()
+                .registrations
+                .iter()
+                .find(|r| r.client_id == "selected-client")
                 .unwrap()
                 .tokens
                 .as_ref()
@@ -969,7 +1076,8 @@ mod tests {
             refresh_account(
                 &mut restarted,
                 &client().unwrap(),
-                "http://127.0.0.1:1/unreachable"
+                "http://127.0.0.1:1/unreachable",
+                "selected-client"
             )
             .await
             .unwrap(),
@@ -1035,11 +1143,16 @@ mod tests {
         let store = Store { dir: dir.clone() };
         let mut locked = store.lock().unwrap();
         locked.accounts.host_id = host_id().unwrap();
+        locked.accounts.preferred_model = Some("chosen-model".to_owned());
+        locked.accounts.plan_notice_seen = true;
         locked.save().unwrap();
         let host = locked.accounts.host_id.clone();
         drop(locked);
         let store = Store { dir: dir.clone() };
-        assert_eq!(store.read().unwrap().host_id, host);
+        let restarted = store.read().unwrap();
+        assert_eq!(restarted.host_id, host);
+        assert_eq!(restarted.preferred_model.as_deref(), Some("chosen-model"));
+        assert!(restarted.plan_notice_seen);
         let path = dir.join("openai-accounts.json");
         assert_eq!(
             std::fs::metadata(&path).unwrap().permissions().mode() & 0o777,
@@ -1051,5 +1164,15 @@ mod tests {
         std::os::unix::fs::symlink("/etc/passwd", &path).unwrap();
         assert!(store.read().is_err());
         std::fs::remove_dir_all(dir).unwrap();
+    }
+    #[tokio::test]
+    async fn cancelling_browser_sign_in_closes_the_callback_listener() {
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let address = listener.local_addr().unwrap();
+        let handle = tokio::spawn(async move { wait_callback(listener, &attempt(None)).await });
+        tokio::task::yield_now().await;
+        handle.abort();
+        assert!(handle.await.unwrap_err().is_cancelled());
+        assert!(tokio::net::TcpListener::bind(address).await.is_ok());
     }
 }

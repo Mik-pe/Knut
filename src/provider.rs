@@ -88,7 +88,7 @@ pub struct ProviderConfig {
     /// Whether this provider accepts `stream_options.include_usage`.
     supports_usage_in_stream: bool,
     transport: ProviderTransport,
-    chatgpt: bool,
+    chatgpt_client: Option<String>,
 }
 
 impl std::fmt::Debug for ProviderConfig {
@@ -101,7 +101,7 @@ impl std::fmt::Debug for ProviderConfig {
             .field("timeout", &self.timeout)
             .field("billing", &self.billing)
             .field("transport", &self.transport)
-            .field("chatgpt", &self.chatgpt)
+            .field("chatgpt", &self.uses_chatgpt_plan())
             .finish()
     }
 }
@@ -135,7 +135,7 @@ impl ProviderConfig {
             reasoning_effort: supports_reasoning_effort.then_some(ReasoningEffort::Max),
             supports_usage_in_stream: true,
             transport: ProviderTransport::ChatCompletions,
-            chatgpt: false,
+            chatgpt_client: None,
         }
     }
 
@@ -225,7 +225,27 @@ impl ProviderConfig {
     /// API credentials come from `OPENAI_API_KEY` or `KNUT_PROVIDER_API_KEY`;
     /// `openai-codex` uses the selected protected ChatGPT registration.
     pub fn from_env() -> Result<Self, KnutError> {
+        if std::env::var_os("KNUT_PROVIDER").is_none()
+            && let Some(model) = crate::openai_auth::saved_model()?
+        {
+            return Self::chatgpt(model);
+        }
         Self::from_settings(|key| std::env::var(key).ok())
+    }
+
+    pub fn chatgpt(model: impl Into<String>) -> Result<Self, KnutError> {
+        let client_id = crate::openai_auth::signed_in_client()?;
+        let mut config = Self::openai("", model).with_billing(BillingPath::Plan);
+        config.chatgpt_client = Some(client_id);
+        Ok(config)
+    }
+
+    pub fn uses_chatgpt_plan(&self) -> bool {
+        self.chatgpt_client.is_some()
+    }
+
+    pub(crate) fn chatgpt_client(&self) -> Option<&str> {
+        self.chatgpt_client.as_deref()
     }
 
     fn from_settings(get: impl Fn(&str) -> Option<String>) -> Result<Self, KnutError> {
@@ -240,8 +260,12 @@ impl ProviderConfig {
         }
         let openai = matches!(provider.as_str(), "openai" | "openai-codex");
         let chatgpt = provider == "openai-codex";
+        let chatgpt_client = if chatgpt {
+            Some(crate::openai_auth::signed_in_client()?)
+        } else {
+            None
+        };
         let api_key = if chatgpt {
-            crate::openai_auth::ensure_signed_in()?;
             String::new()
         } else {
             get("KNUT_PROVIDER_API_KEY")
@@ -295,7 +319,7 @@ impl ProviderConfig {
                 } else {
                     BillingPath::Metered
                 });
-            config.chatgpt = chatgpt;
+            config.chatgpt_client = chatgpt_client;
         }
         if let Some(seconds) = get("KNUT_PROVIDER_TIMEOUT_SECONDS") {
             let seconds = seconds
@@ -383,7 +407,7 @@ impl ProviderConfig {
             tier: self.tier,
             billing: self.billing,
             timeout: self.timeout,
-            api_key_source: if self.chatgpt {
+            api_key_source: if self.uses_chatgpt_plan() {
                 "ChatGPT sign-in"
             } else {
                 "environment"
@@ -446,12 +470,14 @@ impl ProviderModel {
         {
             return Err(KnutError::Model("provider URL requires HTTPS (or loopback HTTP), without credentials/query/fragment".to_owned()));
         }
-        if config.model.trim().is_empty() || !config.chatgpt && config.api_key.trim().is_empty() {
+        if config.model.trim().is_empty()
+            || !config.uses_chatgpt_plan() && config.api_key.trim().is_empty()
+        {
             return Err(KnutError::Model(
                 "provider model and credential must be nonempty".to_owned(),
             ));
         }
-        if config.chatgpt && config.base_url != "https://api.openai.com/v1" {
+        if config.uses_chatgpt_plan() && config.base_url != "https://api.openai.com/v1" {
             return Err(KnutError::ModelAuth(
                 "ChatGPT tokens can only be sent to https://api.openai.com/v1".to_owned(),
             ));
@@ -472,8 +498,8 @@ impl ProviderModel {
 
     /// List account-visible models using the same credential as inference.
     pub async fn list_models(&self) -> Result<Vec<(String, String)>, KnutError> {
-        let token = if self.config.chatgpt {
-            crate::openai_auth::access_token().await?
+        let token = if let Some(client_id) = self.config.chatgpt_client() {
+            crate::openai_auth::access_token(client_id).await?
         } else {
             self.config.api_key.clone()
         };
@@ -496,7 +522,7 @@ impl ProviderModel {
         }
         let body: Value = serde_json::from_str(&body)
             .map_err(|_| KnutError::Model("invalid model catalog".to_owned()))?;
-        let key = if self.config.chatgpt {
+        let key = if self.config.uses_chatgpt_plan() {
             "models"
         } else {
             "data"
@@ -506,13 +532,17 @@ impl ProviderModel {
             .ok_or_else(|| KnutError::Model("model catalog has no model array".to_owned()))?;
         let mut result = Vec::new();
         for entry in models {
-            if self.config.chatgpt && entry["visibility"] != "list" {
+            if self.config.uses_chatgpt_plan() && entry["visibility"] != "list" {
                 continue;
             }
-            let id = entry[if self.config.chatgpt { "slug" } else { "id" }]
-                .as_str()
-                .filter(|s| !s.is_empty())
-                .ok_or_else(|| KnutError::Model("model catalog entry has no ID".to_owned()))?;
+            let id = entry[if self.config.uses_chatgpt_plan() {
+                "slug"
+            } else {
+                "id"
+            }]
+            .as_str()
+            .filter(|s| !s.is_empty())
+            .ok_or_else(|| KnutError::Model("model catalog entry has no ID".to_owned()))?;
             result.push((
                 id.to_owned(),
                 entry["display_name"].as_str().unwrap_or(id).to_owned(),

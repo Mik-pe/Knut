@@ -101,7 +101,21 @@ export KNUT_PROVIDER_MODEL=gpt-6.1-sol
 ./target/release/knut tui
 ```
 
-For your ChatGPT plan, sign in through the system browser:
+For your ChatGPT plan, open `knut tui`, type `/`, search `account`, and choose
+**Continue with ChatGPT**. Complete consent in your browser, then choose a model
+from your account's catalog. The connection activates immediately; the model
+choice is saved for the next start. An explicit `KNUT_PROVIDER` overrides that
+saved choice at startup. Escape cancels browser sign-in and preserves your draft.
+Connection changes require an idle session, including when a task is awaiting
+approval. The account screen also switches accounts, adds another account,
+signs out, and opens **Manage usage**. A plan limit exposes `Ctrl+U` to open usage.
+
+This uses OpenAI's documented [open-source / locally hosted flow](https://developers.openai.com/siwc/token-sharing-open-source/)
+with the [required ChatGPT labels](https://developers.openai.com/siwc/ui-ux-guidelines).
+Knut sends native Responses requests through its own engine; Codex app-server
+is optional infrastructure and is not needed for this sign-in.
+
+The same sign-in is available from a normal terminal:
 
 ```sh
 ./target/release/knut login openai-codex
@@ -122,7 +136,8 @@ ChatGPT sign-in uses OpenAI's documented public-client OAuth flow with PKCE,
 state, nonce and signed ID-token validation. Knut stores separate registrations
 under `~/.config/knut/` (`XDG_CONFIG_HOME` or `KNUT_CONFIG_DIR` can override the
 location), with owner-only permissions and atomic token rotation. Refreshes
-are serialized across processes. `knut accounts` lists saved registrations;
+are serialized across processes. Each connected model keeps its own account
+registration, so another process changing accounts cannot switch a running task. `knut accounts` lists saved registrations;
 `knut accounts <client-id>` selects one; `knut login openai-codex --new` adds an
 account. `knut logout openai-codex` revokes the selected session and clears its
 local tokens. If remote revocation fails, it reports that explicitly. Sign-in
@@ -134,7 +149,7 @@ and [sign-in contract](https://developers.openai.com/siwc/token-sharing-open-sou
 API-key usage is metered; ChatGPT plan usage stays on the selected plan route.
 Knut never falls back from plan usage to API billing.
 
-Z.ai remains the default. Other Chat Completions providers can use
+Z.ai is the default when no saved ChatGPT model or explicit provider is selected. Other Chat Completions providers can use
 `KNUT_PROVIDER=chat-completions` with an explicit base URL and model.
 
 | variable | purpose |

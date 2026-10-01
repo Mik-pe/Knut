@@ -22,6 +22,9 @@ use crossterm::{execute, terminal};
 use ratatui::Terminal;
 use ratatui::backend::CrosstermBackend;
 
+use crate::connection::{
+    ConnectionAction, ConnectionJob, ConnectionOutcome, ConnectionPage, ConnectionPanel,
+};
 use crate::session::{SessionCommand, SessionEvent};
 use crate::tui_render::Tab;
 use crate::tui_state::{Focus, WorkbenchState};
@@ -41,6 +44,8 @@ pub enum ShellAction {
     Verify,
     /// Open the review workspace over the session's recorded changes.
     Review,
+    Connection(ConnectionAction),
+    CancelConnection,
 }
 
 /// Apply one keystroke to the state, returning the next action.
@@ -55,6 +60,43 @@ pub fn handle_key(state: &mut WorkbenchState, key: KeyEvent, tab: &mut Tab) -> S
     let alt = key.modifiers.contains(KeyModifiers::ALT);
     if key.kind == KeyEventKind::Repeat && (ctrl || alt || key.code == KeyCode::Enter) {
         return ShellAction::Continue;
+    }
+    if let Some(panel) = &mut state.connection {
+        if matches!(key.code, KeyCode::Esc) || (ctrl && key.code == KeyCode::Char('c')) {
+            if panel.busy {
+                return if panel.cancellable {
+                    ShellAction::CancelConnection
+                } else {
+                    ShellAction::Continue
+                };
+            }
+            if panel.page == ConnectionPage::Models {
+                panel.page = ConnectionPage::Account;
+                panel.selection = 0;
+            } else {
+                state.connection = None;
+            }
+            return ShellAction::Continue;
+        }
+        if !panel.busy {
+            match key.code {
+                KeyCode::Up => panel.selection = panel.selection.saturating_sub(1),
+                KeyCode::Down => {
+                    panel.selection =
+                        (panel.selection + 1).min(panel.choices().len().saturating_sub(1))
+                }
+                KeyCode::Enter => {
+                    if let Some((_, action)) = panel.choices().get(panel.selection) {
+                        return ShellAction::Connection(action.clone());
+                    }
+                }
+                _ => {}
+            }
+        }
+        return ShellAction::Continue;
+    }
+    if ctrl && key.code == KeyCode::Char('u') && state.usage_limit {
+        return ShellAction::PaletteCommand("usage");
     }
     if ctrl && key.code == KeyCode::Char('c') {
         if state.help || state.palette_open() || state.review.is_some() || *tab != Tab::Timeline {
@@ -561,6 +603,7 @@ pub async fn run_shell(
     mut state: WorkbenchState,
     mut events: tokio::sync::mpsc::UnboundedReceiver<SessionEvent>,
     commands: tokio::sync::mpsc::UnboundedSender<SessionCommand>,
+    connections: tokio::sync::mpsc::UnboundedSender<crate::ConnectionRequest>,
 ) -> std::io::Result<()> {
     // Signal-driven shutdown, so a Ctrl+C delivered as a signal (or a
     // closing terminal) still restores the display.
@@ -569,6 +612,13 @@ pub async fn run_shell(
 
     let mut guard = TerminalGuard::enter()?;
     let mut tab = Tab::Timeline;
+    if state.chatgpt_plan && crate::openai_auth::needs_plan_notice().unwrap_or(false) {
+        let mut panel = ConnectionPanel::open();
+        panel.page = ConnectionPage::Welcome;
+        panel.return_to_conversation = true;
+        state.connection = Some(panel);
+    }
+    let mut connection_job: Option<ConnectionJob> = None;
 
     // Checks run on demand and are *not* on the keystroke path: the loop
     // stays responsive, and a finished run arrives as a message.
@@ -584,6 +634,27 @@ pub async fn run_shell(
         while let Ok(outcome) = check_rx.try_recv() {
             checks.finish();
             state.apply_check_outcome(outcome);
+        }
+
+        if let Some(job) = &mut connection_job {
+            while let Ok(status) = job.progress.try_recv() {
+                if let Some(panel) = &mut state.connection {
+                    panel.status = status.to_owned();
+                }
+            }
+        }
+        if connection_job
+            .as_ref()
+            .and_then(|job| job.handle.as_ref())
+            .is_some_and(|handle| handle.is_finished())
+        {
+            let handle = connection_job.take().unwrap().handle.take().unwrap();
+            let outcome = handle.await.unwrap_or_else(|_| {
+                Err(crate::KnutError::Model(
+                    "Connection task interrupted; retry".to_owned(),
+                ))
+            });
+            finish_connection(&mut state, outcome);
         }
 
         // The tick drives the spinner and the header clock; state stays
@@ -616,6 +687,40 @@ pub async fn run_shell(
                         }
                         ShellAction::PaletteCommand("cancel") => {
                             let _ = commands.send(SessionCommand::Cancel);
+                        }
+                        ShellAction::PaletteCommand("account" | "model") => {
+                            state.connection = Some(ConnectionPanel::open());
+                        }
+                        ShellAction::PaletteCommand("usage") => {
+                            state.connection = Some(ConnectionPanel::open());
+                            start_connection(
+                                &mut state,
+                                ConnectionAction::ManageUsage,
+                                &connections,
+                                &mut connection_job,
+                            );
+                        }
+                        ShellAction::Connection(action) => {
+                            start_connection(&mut state, action, &connections, &mut connection_job);
+                        }
+                        ShellAction::CancelConnection => {
+                            connection_job = None;
+                            if let Some(panel) = &mut state.connection {
+                                panel.busy = false;
+                                match crate::openai_auth::account_list() {
+                                    Ok(accounts) => panel.accounts = accounts,
+                                    Err(error) => panel.error = Some(error.to_string()),
+                                }
+                                panel.selection = 0;
+                                panel.status = if panel.status.starts_with("Signed in.")
+                                    || panel.status.starts_with("Account selected.")
+                                {
+                                    "Stopped loading models. Open Choose model to continue."
+                                } else {
+                                    "Sign-in cancelled. You can try again."
+                                }
+                                .to_owned();
+                            }
                         }
                         ShellAction::PaletteCommand("doctor") => {
                             // The shell already knows its own engine
@@ -670,7 +775,11 @@ pub async fn run_shell(
                     }
                 }
                 Event::Paste(text) => {
-                    if !state.help && !state.palette_open() && state.review.is_none() {
+                    if !state.help
+                        && !state.palette_open()
+                        && state.review.is_none()
+                        && state.connection.is_none()
+                    {
                         state.composer.paste(&text);
                         state.focus = Focus::Composer;
                         tab = Tab::Timeline;
@@ -694,6 +803,131 @@ pub async fn run_shell(
 
     guard.restore();
     Ok(())
+}
+
+fn start_connection(
+    state: &mut WorkbenchState,
+    action: ConnectionAction,
+    connections: &tokio::sync::mpsc::UnboundedSender<crate::ConnectionRequest>,
+    job: &mut Option<ConnectionJob>,
+) {
+    let Some(panel) = &mut state.connection else {
+        return;
+    };
+    if panel.busy {
+        return;
+    }
+    if state.task_state.is_some_and(|state| !state.is_terminal())
+        && action != ConnectionAction::ManageUsage
+    {
+        panel.error =
+            Some("Finish or cancel the current task before changing the connection.".to_owned());
+        return;
+    }
+    panel.busy = true;
+    panel.error = None;
+    panel.cancellable = matches!(
+        action,
+        ConnectionAction::Login(_)
+            | ConnectionAction::SelectAccount(_)
+            | ConnectionAction::Models
+            | ConnectionAction::ManageUsage
+    );
+    panel.status = match &action {
+        ConnectionAction::Login(_) => "Continue with ChatGPT in your browser. Waiting for sign-in…",
+        ConnectionAction::Models | ConnectionAction::SelectAccount(_) => {
+            "Loading models available to this account…"
+        }
+        ConnectionAction::SelectModel(_) => "Connecting the model…",
+        ConnectionAction::Logout => "Signing out…",
+        ConnectionAction::ManageUsage => "Opening ChatGPT usage…",
+        ConnectionAction::Acknowledge => "Saving…",
+    }
+    .to_owned();
+    let connections = connections.clone();
+    let (progress, updates) = tokio::sync::mpsc::unbounded_channel();
+    *job = Some(ConnectionJob {
+        progress: updates,
+        handle: Some(tokio::spawn(crate::connection::execute(
+            action,
+            connections,
+            state.chatgpt_plan,
+            progress,
+        ))),
+    });
+}
+
+fn finish_connection(
+    state: &mut WorkbenchState,
+    outcome: Result<ConnectionOutcome, crate::KnutError>,
+) {
+    let Some(panel) = &mut state.connection else {
+        return;
+    };
+    panel.busy = false;
+    match crate::openai_auth::account_list() {
+        Ok(accounts) => panel.accounts = accounts,
+        Err(error) => panel.error = Some(error.to_string()),
+    }
+    match outcome {
+        Ok(ConnectionOutcome::Models {
+            models,
+            notice,
+            error,
+        }) => {
+            panel.models = models;
+            panel.page = if notice {
+                ConnectionPage::Welcome
+            } else {
+                ConnectionPage::Models
+            };
+            panel.selection = 0;
+            panel.error = error;
+            panel.status = "Choose a model. Access is checked when a task runs.".to_owned();
+        }
+        Ok(ConnectionOutcome::Connected { model, account }) => {
+            state.model = Some(model);
+            state.endpoint = Some("api.openai.com".to_owned());
+            state.chatgpt_plan = true;
+            state.usage_limit = false;
+            state.account = account;
+            state.unavailable = if state.checks == 0 {
+                Some("Connected. Configure repository checks before tasks can complete.".to_owned())
+            } else {
+                None
+            };
+            state.status = Some("Using ChatGPT plan · / account or / usage".to_owned());
+            state.connection = None;
+        }
+        Ok(ConnectionOutcome::LoggedOut(revoked)) => {
+            if state.chatgpt_plan {
+                state.model = None;
+                state.endpoint = None;
+                state.chatgpt_plan = false;
+                state.usage_limit = false;
+                state.unavailable = Some("Signed out. Open / account to connect again.".to_owned());
+            }
+            state.account = None;
+            panel.page = ConnectionPage::Account;
+            panel.selection = 0;
+            panel.status = if revoked { "Signed out." } else { "Local credentials removed. Remote revocation was not confirmed; manage connected apps in ChatGPT." }.to_owned();
+        }
+        Ok(ConnectionOutcome::Acknowledged) => {
+            if panel.return_to_conversation {
+                state.connection = None;
+            } else {
+                panel.page = ConnectionPage::Models;
+                panel.selection = 0;
+            }
+        }
+        Ok(ConnectionOutcome::BrowserOpened) => {
+            panel.status = "ChatGPT usage opened in your browser.".to_owned()
+        }
+        Err(error) => {
+            panel.status = "Try again, or press Esc to return to your conversation.".to_owned();
+            panel.error = Some(error.to_string());
+        }
+    }
 }
 
 #[cfg(test)]
@@ -1043,12 +1277,91 @@ mod tests {
 
         // Search for a command that is explicitly unavailable.
         state.open_palette();
-        for c in "model".chars() {
+        for c in "spawnsubagent".chars() {
             handle_key(&mut state, key(KeyCode::Char(c)), &mut tab);
         }
+        assert!(state.palette_results().is_empty());
         let action = handle_key(&mut state, key(KeyCode::Enter), &mut tab);
         // No palette command fires: the entry is honestly unavailable.
         assert_eq!(action, ShellAction::Continue);
         assert!(state.palette_open());
+    }
+    #[test]
+    fn account_navigation_preserves_drafts_and_cancels_only_abortable_work() {
+        let mut state = WorkbenchState::new("/tmp/ws");
+        state.composer.paste("unfinished task");
+        state.connection = Some(ConnectionPanel::open());
+        let mut tab = Tab::Timeline;
+        assert_eq!(
+            handle_key(&mut state, key(KeyCode::Enter), &mut tab),
+            ShellAction::Connection(ConnectionAction::Login(false))
+        );
+        let panel = state.connection.as_mut().unwrap();
+        panel.busy = true;
+        assert_eq!(
+            handle_key(&mut state, key(KeyCode::Esc), &mut tab),
+            ShellAction::CancelConnection
+        );
+        state.connection.as_mut().unwrap().cancellable = false;
+        assert_eq!(
+            handle_key(&mut state, ctrl('c'), &mut tab),
+            ShellAction::Continue
+        );
+        assert!(state.connection.is_some());
+        state.connection.as_mut().unwrap().busy = false;
+        handle_key(&mut state, key(KeyCode::Esc), &mut tab);
+        assert!(state.connection.is_none());
+        assert_eq!(state.composer_text(), "unfinished task");
+    }
+
+    #[test]
+    fn approval_wait_blocks_sign_in_before_any_browser_or_credentials_effect() {
+        let mut state = WorkbenchState::new("/tmp/ws");
+        state.task_state = Some(crate::TaskState::Waiting);
+        state.connection = Some(ConnectionPanel::open());
+        let (tx, mut rx) = tokio::sync::mpsc::unbounded_channel();
+        let mut job = None;
+        for action in [
+            ConnectionAction::Login(false),
+            ConnectionAction::Logout,
+            ConnectionAction::SelectModel("model".into()),
+        ] {
+            start_connection(&mut state, action, &tx, &mut job);
+            assert!(job.is_none());
+            assert!(rx.try_recv().is_err());
+            assert!(
+                state
+                    .connection
+                    .as_ref()
+                    .unwrap()
+                    .error
+                    .as_ref()
+                    .unwrap()
+                    .contains("current task")
+            );
+        }
+    }
+
+    #[test]
+    fn plan_limit_has_a_keyboard_recovery_and_sign_out_preserves_an_api_route() {
+        let mut state = WorkbenchState::new("/tmp/ws");
+        state.chatgpt_plan = true;
+        state.apply(&SessionEvent::TaskFailed {
+            task: TaskId(1),
+            reason:
+                "model provider rate limited the request: subscription_sharing_usage_limit_exceeded"
+                    .into(),
+        });
+        assert!(state.usage_limit);
+        let mut tab = Tab::Timeline;
+        assert_eq!(
+            handle_key(&mut state, ctrl('u'), &mut tab),
+            ShellAction::PaletteCommand("usage")
+        );
+        state.chatgpt_plan = false;
+        state.model = Some("api-model".into());
+        state.connection = Some(ConnectionPanel::open());
+        finish_connection(&mut state, Ok(ConnectionOutcome::LoggedOut(true)));
+        assert_eq!(state.model.as_deref(), Some("api-model"));
     }
 }

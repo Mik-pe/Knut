@@ -81,6 +81,10 @@ pub struct WorkbenchState {
     pub mode: String,
     /// Provider/model label, when configured.
     pub model: Option<String>,
+    pub chatgpt_plan: bool,
+    pub usage_limit: bool,
+    pub account: Option<String>,
+    pub(crate) connection: Option<crate::connection::ConnectionPanel>,
     /// The provider endpoint's host, when configured.
     pub endpoint: Option<String>,
     /// Why live work is unavailable, when it is.
@@ -176,6 +180,10 @@ impl WorkbenchState {
             branch: None,
             mode: "quality".to_owned(),
             model: None,
+            chatgpt_plan: false,
+            usage_limit: false,
+            account: None,
+            connection: None,
             endpoint: None,
             unavailable: None,
             checks: 0,
@@ -354,6 +362,7 @@ impl WorkbenchState {
                 self.status = None;
             }
             SessionEvent::TaskStarted { prompt, .. } => {
+                self.usage_limit = false;
                 self.status = None;
                 self.push(TimelineKind::User, prompt.clone(), false);
                 self.task_state = Some(TaskState::Running);
@@ -545,6 +554,9 @@ impl WorkbenchState {
                 self.push(TimelineKind::Terminal, text, false);
             }
             SessionEvent::TaskFailed { reason, .. } => {
+                self.usage_limit = self.chatgpt_plan
+                    && (reason.contains("rate limited")
+                        || reason.contains("subscription_sharing_usage_"));
                 self.status = None;
                 self.pending = None;
                 self.finish_timing();

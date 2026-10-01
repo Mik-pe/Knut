@@ -621,6 +621,8 @@ async fn tui() -> Result<(), KnutError> {
     let mut state = knut::WorkbenchState::new(root).with_theme(knut::Theme::detect());
     state.mode = std::env::var("KNUT_MODE").unwrap_or_else(|_| "quality".to_owned());
     state.model = report.model.clone();
+    state.chatgpt_plan = report.chatgpt_plan;
+    state.account = report.account.clone();
     state.endpoint = report.endpoint_label();
     state.unavailable = report.unavailable.clone();
     state.checks = report.checks.len();
@@ -630,9 +632,15 @@ async fn tui() -> Result<(), KnutError> {
     // block a keystroke.
     let (event_tx, event_rx) = tokio::sync::mpsc::unbounded_channel();
     let (command_tx, command_rx) = tokio::sync::mpsc::unbounded_channel();
-    tokio::spawn(knut::run_engine(engine, command_rx, event_tx));
+    let (connection_tx, connection_rx) = tokio::sync::mpsc::unbounded_channel();
+    tokio::spawn(knut::run_engine_with_connections(
+        engine,
+        command_rx,
+        event_tx,
+        connection_rx,
+    ));
 
-    knut::run_shell(state, event_rx, command_tx)
+    knut::run_shell(state, event_rx, command_tx, connection_tx)
         .await
         .map_err(|err| KnutError::Tool(format!("terminal: {err}")))
 }

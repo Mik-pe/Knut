@@ -91,6 +91,43 @@ pub fn render_themed(frame: &mut Frame, state: &WorkbenchState, tab: Tab, theme:
     let plan = plan_layout(area, rows);
 
     render_header(frame, state, plan.header, theme);
+    if let Some(connection) = &state.connection {
+        let body = Rect::new(
+            plan.timeline.x,
+            plan.timeline.y,
+            plan.timeline.width,
+            plan.timeline.height + plan.composer.height,
+        );
+        render_connection(frame, connection, body, theme);
+        let hint = if connection.busy {
+            if connection.cancellable {
+                " Esc cancel"
+            } else {
+                " Finishing connection update…"
+            }
+        } else {
+            " Up/Down choose   Enter continue   Esc back"
+        };
+        frame.render_widget(
+            Paragraph::new(vec![
+                Line::from(hint),
+                Line::from(if state.chatgpt_plan {
+                    format!(
+                        " Using ChatGPT plan: {}",
+                        crate::cards::sanitize_for_display(
+                            state.account.as_deref().unwrap_or("ChatGPT account")
+                        )
+                    )
+                } else {
+                    " Draft preserved".to_owned()
+                }),
+            ])
+            .style(theme.dim())
+            .wrap(Wrap { trim: false }),
+            plan.footer,
+        );
+        return;
+    }
     let mut body = plan.timeline;
     if let Some(pending) = &state.pending {
         let rows = Layout::vertical([
@@ -272,7 +309,16 @@ fn render_header(frame: &mut Frame, state: &WorkbenchState, area: Rect, theme: &
             state_style(state.task_state, theme),
         ),
         Span::styled(
-            format!("  · {}  {}", state.reasoner_label(), ticker_label(state)),
+            format!(
+                "  · {}{}  {}",
+                state.reasoner_label(),
+                if state.chatgpt_plan {
+                    " · Using ChatGPT plan"
+                } else {
+                    ""
+                },
+                ticker_label(state)
+            ),
             theme.dim(),
         ),
     ];
@@ -448,10 +494,16 @@ fn render_welcome(frame: &mut Frame, state: &WorkbenchState, area: Rect, theme: 
     let message = if let Some(reason) = &state.unavailable {
         reason.clone()
     } else if state.model.is_none() {
-        "Offline. Set KNUT_PROVIDER_API_KEY, then run knut doctor to check your setup.".to_owned()
+        "Offline. Open / account to continue with ChatGPT, or configure an API key.".to_owned()
     } else {
         "Describe a change, investigate a bug, or ask about this codebase.".to_owned()
     };
+    if state.model.is_none() {
+        lines.push(Line::from(Span::styled(
+            "  / account  >  Continue with ChatGPT",
+            theme.accent(),
+        )));
+    }
     for line in wrap_text(&message, width) {
         lines.push(Line::from(Span::styled(format!("  {line}"), theme.dim())));
     }
@@ -475,6 +527,81 @@ fn render_welcome(frame: &mut Frame, state: &WorkbenchState, area: Rect, theme: 
         ]);
     }
     frame.render_widget(Paragraph::new(lines), area);
+}
+
+fn render_connection(
+    frame: &mut Frame,
+    connection: &crate::connection::ConnectionPanel,
+    area: Rect,
+    theme: &Theme,
+) {
+    use crate::connection::ConnectionPage;
+    let title = match connection.page {
+        ConnectionPage::Account => " ChatGPT account ",
+        ConnectionPage::Models => " Choose a model ",
+        ConnectionPage::Welcome => " You're using your ChatGPT plan ",
+    };
+    let block = panel(title, theme.border_focused(), theme);
+    let inner = block.inner(area);
+    frame.render_widget(block, area);
+    let width = inner.width.saturating_sub(2).max(1) as usize;
+    let mut lines = Vec::new();
+    let description = if connection.page == ConnectionPage::Welcome {
+        "Your ChatGPT plan covers model usage in Knut. Usage limits apply. Manage usage opens ChatGPT settings. Knut keeps its own renewable sign-in on this computer."
+    } else {
+        &connection.status
+    };
+    for line in wrap_text(description, width) {
+        lines.push(Line::from(Span::styled(format!(" {line}"), theme.text())));
+    }
+    if connection.page != ConnectionPage::Welcome
+        && let Some(account) = connection.accounts.iter().find(|a| a.active && a.signed_in)
+    {
+        for line in wrap_text(
+            &format!(
+                "Account: {}",
+                crate::cards::sanitize_for_display(&account.label)
+            ),
+            width,
+        ) {
+            lines.push(Line::from(Span::styled(format!(" {line}"), theme.dim())));
+        }
+    }
+    if connection.page != ConnectionPage::Welcome
+        && let Some(error) = &connection.error
+    {
+        for line in wrap_text(error, width) {
+            lines.push(Line::from(Span::styled(format!(" {line}"), theme.danger())));
+        }
+    }
+    lines.push(Line::from(""));
+    // Reserve selectable rows when long errors or account names fill a small terminal.
+    let budget = inner.height.saturating_sub(2) as usize;
+    lines.truncate(budget.saturating_sub(3));
+    let available = (inner.height as usize).saturating_sub(lines.len()).max(1);
+    let choices = connection.choices();
+    let start = connection
+        .selection
+        .saturating_sub(available.saturating_sub(1));
+    for (index, (label, _)) in choices.iter().enumerate().skip(start).take(available) {
+        let selected = index == connection.selection;
+        let marker = if selected { "> " } else { "  " };
+        let style = if connection.busy {
+            theme.dim()
+        } else if selected {
+            theme.accent().add_modifier(Modifier::BOLD)
+        } else {
+            theme.text()
+        };
+        lines.push(Line::from(Span::styled(
+            format!(" {marker}{}", crate::cards::sanitize_for_display(label)),
+            style,
+        )));
+    }
+    frame.render_widget(
+        Paragraph::new(lines).style(theme.bg(theme.palette.bg)),
+        inner,
+    );
 }
 
 /// Wrap plain text to a width, preserving nothing but word boundaries.
@@ -976,6 +1103,8 @@ fn render_composer(frame: &mut Frame, state: &WorkbenchState, area: Rect, theme:
         " your answer "
     } else if state.task_state.is_some_and(|s| !s.is_terminal()) {
         " follow up "
+    } else if state.chatgpt_plan {
+        " message · Using ChatGPT plan "
     } else {
         " message "
     };
@@ -987,7 +1116,15 @@ fn render_composer(frame: &mut Frame, state: &WorkbenchState, area: Rect, theme:
 
     frame.render_widget(
         Paragraph::new(lines)
-            .block(panel(title, border, theme))
+            .block(panel(
+                &if theme.glyphs.unicode {
+                    title.to_owned()
+                } else {
+                    title.replace('·', "|")
+                },
+                border,
+                theme,
+            ))
             .style(theme.bg(theme.palette.bg_raise))
             .wrap(Wrap { trim: false }),
         area,
@@ -995,7 +1132,9 @@ fn render_composer(frame: &mut Frame, state: &WorkbenchState, area: Rect, theme:
 }
 
 fn render_footer(frame: &mut Frame, state: &WorkbenchState, area: Rect, theme: &Theme) {
-    let hint = if state
+    let hint = if state.usage_limit {
+        " Ctrl+U Manage usage   / account change account"
+    } else if state
         .pending
         .as_ref()
         .is_some_and(|p| matches!(p.kind, crate::session::WaitKind::Approval { .. }))
@@ -1011,6 +1150,13 @@ fn render_footer(frame: &mut Frame, state: &WorkbenchState, area: Rect, theme: &
     let detail = state.status.clone().unwrap_or_else(|| {
         if state.task_state.is_some_and(|s| !s.is_terminal()) {
             " Ctrl+C stop task · your next message steers or queues".to_owned()
+        } else if state.chatgpt_plan {
+            format!(
+                " ChatGPT: {} · / account · / usage",
+                crate::cards::sanitize_for_display(
+                    state.account.as_deref().unwrap_or("ChatGPT account")
+                )
+            )
         } else {
             " Ctrl+O jobs   Ctrl+B decisions   Ctrl+C quit".to_owned()
         }
@@ -1912,5 +2058,78 @@ mod tests {
         state.transcript_scroll = 100;
         let start = snapshot(&state, 80, 24, Tab::Timeline);
         assert!(start.contains("answer line 0"), "{start}");
+    }
+    #[test]
+    fn connection_flow_is_readable_at_supported_sizes_and_without_color() {
+        use crate::connection::{ConnectionPage, ConnectionPanel};
+        let mut state = WorkbenchState::new("/fixture");
+        let mut connection = ConnectionPanel::open();
+        connection.accounts.clear();
+        connection.error = None;
+        connection.models = (0..30)
+            .map(|i| (format!("model-{i}"), format!("Model {i}")))
+            .collect();
+        for level in [ColorLevel::TrueColor, ColorLevel::Mono] {
+            for (width, height) in [(60, 18), (80, 24), (140, 40)] {
+                for page in [
+                    ConnectionPage::Account,
+                    ConnectionPage::Welcome,
+                    ConnectionPage::Models,
+                ] {
+                    connection.page = page;
+                    connection.selection = if page == ConnectionPage::Models {
+                        29
+                    } else {
+                        0
+                    };
+                    state.connection = Some(connection.clone());
+                    let text = snapshot_themed(
+                        &state,
+                        width,
+                        height,
+                        Tab::Timeline,
+                        &Theme::for_level(level),
+                    );
+                    let expected = match page {
+                        ConnectionPage::Account => "Continue with ChatGPT",
+                        ConnectionPage::Welcome => "Got it",
+                        ConnectionPage::Models => "model-29",
+                    };
+                    assert!(text.contains(expected), "{width}x{height} {page:?}\n{text}");
+                    assert!(text.contains("Esc back"));
+                    if let Ok(dir) = std::env::var("KNUT_UI_CAPTURE_DIR") {
+                        std::fs::write(
+                            std::path::Path::new(&dir)
+                                .join(format!("{width}x{height}-{level:?}-{page:?}.txt")),
+                            text,
+                        )
+                        .unwrap();
+                    }
+                }
+            }
+        }
+        connection.page = ConnectionPage::Models;
+        connection.models.clear();
+        connection.selection = 0;
+        connection.error = Some("Could not load models. Retry or manage usage.".to_owned());
+        state.connection = Some(connection.clone());
+        let failed = snapshot(&state, 60, 18, Tab::Timeline);
+        assert!(failed.contains("Refresh available models"));
+        assert!(failed.contains("Manage usage"));
+        connection.error = None;
+        connection.busy = true;
+        connection.status =
+            "Continue with ChatGPT in your browser. Waiting for sign-in…".to_owned();
+        state.connection = Some(connection);
+        let waiting = snapshot(&state, 60, 18, Tab::Timeline);
+        assert!(waiting.contains("Esc cancel"));
+        state.connection = None;
+        state.chatgpt_plan = true;
+        state.account = Some("fixture@example.invalid".to_owned());
+        state.model = Some("model-1".into());
+        let ascii = snapshot_themed(&state, 60, 18, Tab::Timeline, &Theme::plain_ascii());
+        assert!(ascii.contains("Using ChatGPT plan"));
+        assert!(ascii.contains("fixture@example.invalid"));
+        assert!(ascii.is_ascii());
     }
 }

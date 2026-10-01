@@ -77,8 +77,8 @@ impl ProviderModel {
     ) -> Result<ModelResponse, KnutError> {
         let started = Instant::now();
         let body = self.responses_body(request, continuation)?;
-        let token = if self.config.chatgpt {
-            crate::openai_auth::access_token().await?
+        let token = if let Some(client_id) = self.config.chatgpt_client() {
+            crate::openai_auth::access_token(client_id).await?
         } else {
             self.config.api_key.clone()
         };

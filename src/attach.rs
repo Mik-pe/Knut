@@ -248,6 +248,18 @@ pub fn command_catalog() -> Vec<PaletteCommand> {
             ),
         },
         PaletteCommand {
+            id: "account",
+            title: "ChatGPT account",
+            description: "Continue with ChatGPT, choose a model or sign out",
+            availability: CommandAvailability::Available,
+        },
+        PaletteCommand {
+            id: "usage",
+            title: "Manage usage",
+            description: "Open ChatGPT plan usage in the browser",
+            availability: CommandAvailability::Available,
+        },
+        PaletteCommand {
             id: "doctor",
             title: "Diagnose setup",
             description: "Report configured providers without calling them",
@@ -280,10 +292,8 @@ pub fn command_catalog() -> Vec<PaletteCommand> {
         PaletteCommand {
             id: "model",
             title: "Switch model",
-            description: "Change the reasoner or its effort",
-            availability: CommandAvailability::Unavailable(
-                "model selection is env-based until #41 adds provider catalogs",
-            ),
+            description: "Choose an available ChatGPT model",
+            availability: CommandAvailability::Available,
         },
         PaletteCommand {
             id: "sessions",

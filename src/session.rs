@@ -743,6 +743,25 @@ where
         NodeId(id)
     }
 
+    pub(crate) fn replace_models(
+        &mut self,
+        planner: Planner,
+        cascade: Arc<crate::ComputeCascade>,
+    ) -> Result<(), KnutError> {
+        if self
+            .task
+            .as_ref()
+            .is_some_and(|task| !task.state.is_terminal())
+        {
+            return Err(KnutError::Model(
+                "Finish or cancel the current task before changing the connection".to_owned(),
+            ));
+        }
+        self.planner = planner;
+        self.cascade = cascade;
+        Ok(())
+    }
+
     /// Submit a command. Returns an error only for structurally invalid
     /// commands (empty prompts, unknown approval keys); everything else
     /// is accepted and reflected in the event stream.
