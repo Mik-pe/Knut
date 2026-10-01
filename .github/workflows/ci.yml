@@ -26,16 +26,16 @@ jobs:
       - name: Clippy
         run: cargo clippy --all-targets --all-features -- -D warnings
 
+      # The sandbox and process suites need the OS backend; without it the
+      # code must refuse rather than run unsandboxed, which these assert.
+      - name: Install sandbox backend
+        run: sudo apt-get update && sudo apt-get install -y bubblewrap
+
       # Offline fixtures only: no provider keys, no network. The suites
       # cover protocol fixtures, policy/patch state, fake-session
       # integration and the real local read/edit/check fixture.
       - name: Tests
         run: cargo test --all-targets --locked
-
-      # The sandbox and process suites need the OS backend; without it the
-      # code must refuse rather than run unsandboxed, which these assert.
-      - name: Install sandbox backend
-        run: sudo apt-get update && sudo apt-get install -y bubblewrap
 
       - name: Sandboxed process suite
         run: cargo test --lib sandbox --locked
