@@ -99,6 +99,7 @@ where
         }
 
         match decision.route {
+            Route::Plan => Action::Plan,
             Route::Clarify => Action::AskUser,
             Route::Retrieve => {
                 Action::Retrieve(decision.retrieval.unwrap_or(RetrievalSource::Mixed))

@@ -4,7 +4,7 @@
 //! Running a repository's build script or test suite *is* executing
 //! repository code, so the same trust and filesystem/network rules apply
 //! as to any other effect. The sandbox is enforced by the OS
-//! (bubblewrap on Linux: mount namespaces, no network namespace), never
+//! (bubblewrap on Linux, Seatbelt on macOS), never
 //! by keyword filtering, and an unavailable sandbox fails visibly rather
 //! than silently degrading to unsandboxed execution.
 //!
@@ -72,6 +72,8 @@ pub struct SandboxSpec {
 pub enum SandboxBackend {
     /// OS-enforced isolation via bubblewrap.
     Bubblewrap,
+    /// OS-enforced filesystem and network rules via sandbox-exec.
+    Seatbelt,
     /// No sandbox: only ever entered through an explicit, separately
     /// authorized mode, never as a fallback.
     Unsandboxed,
@@ -80,7 +82,7 @@ pub enum SandboxBackend {
 impl SandboxBackend {
     /// Whether this backend actually enforces restrictions.
     pub fn is_enforced(self) -> bool {
-        matches!(self, SandboxBackend::Bubblewrap)
+        matches!(self, SandboxBackend::Bubblewrap | SandboxBackend::Seatbelt)
     }
 }
 
@@ -347,6 +349,16 @@ impl Supervisor {
 
     /// Detect the sandbox backend actually available.
     pub fn backend(&self) -> Result<SandboxBackend, SandboxUnavailable> {
+        if cfg!(target_os = "macos") {
+            return if std::path::Path::new("/usr/bin/sandbox-exec").is_file() {
+                Ok(SandboxBackend::Seatbelt)
+            } else {
+                Err(SandboxUnavailable::BackendMissing {
+                    backend: "sandbox-exec",
+                    detail: "not found at /usr/bin/sandbox-exec".to_owned(),
+                })
+            };
+        }
         if !cfg!(target_os = "linux") {
             return Err(SandboxUnavailable::Unsupported {
                 platform: std::env::consts::OS.to_owned(),
@@ -609,6 +621,120 @@ fn sandboxed_command(
     Ok(command)
 }
 
+struct PrivateTemp(PathBuf);
+
+impl PrivateTemp {
+    fn new() -> Result<Self, KnutError> {
+        let path = std::env::temp_dir().join(format!(
+            "knut-command-{}-{}",
+            std::process::id(),
+            std::time::SystemTime::now()
+                .duration_since(std::time::UNIX_EPOCH)
+                .map_err(|error| KnutError::Tool(error.to_string()))?
+                .as_nanos(),
+        ));
+        let mut builder = std::fs::DirBuilder::new();
+        #[cfg(unix)]
+        {
+            use std::os::unix::fs::DirBuilderExt;
+            builder.mode(0o700);
+        }
+        builder
+            .create(&path)
+            .map_err(|error| KnutError::Tool(error.to_string()))?;
+        Ok(Self(path))
+    }
+}
+
+impl Drop for PrivateTemp {
+    fn drop(&mut self) {
+        let _ = std::fs::remove_dir_all(&self.0);
+    }
+}
+
+fn seatbelt_command(
+    workspace: &Workspace,
+    request: &CommandRequest,
+    temp: &std::path::Path,
+) -> Result<Command, KnutError> {
+    let working_dir = workspace
+        .resolve(&request.working_dir)
+        .map_err(|error| KnutError::Tool(format!("working dir rejected: {error}")))?;
+    if !working_dir.absolute().is_dir() {
+        return Err(KnutError::Tool(
+            "working directory does not exist".to_owned(),
+        ));
+    }
+    let writable = resolve_writable(workspace, request)?;
+    let temp = temp
+        .canonicalize()
+        .map_err(|error| KnutError::Tool(error.to_string()))?;
+    let mut profile = String::from(
+        "(version 1)(deny default)(import \"dyld-support.sb\")(allow process*)(allow sysctl-read)(allow file-read-metadata)",
+    );
+    let quoted = |path: &std::path::Path| serde_json::to_string(&path.to_string_lossy()).unwrap();
+    for path in [
+        "/System",
+        "/usr",
+        "/bin",
+        "/sbin",
+        "/Library/Developer",
+        "/Library/Apple",
+        "/Applications/Xcode.app",
+        "/private/etc",
+        "/private/var/db/dyld",
+        "/opt",
+    ] {
+        profile.push_str(&format!(
+            "(allow file-read* file-map-executable (subpath {}))",
+            quoted(std::path::Path::new(path))
+        ));
+    }
+    for path in request
+        .toolchain_paths
+        .iter()
+        .map(PathBuf::from)
+        .chain([workspace.root().to_owned(), temp.clone()])
+    {
+        let path = path
+            .canonicalize()
+            .map_err(|error| KnutError::Tool(error.to_string()))?;
+        profile.push_str(&format!(
+            "(allow file-read* file-map-executable (subpath {}))",
+            quoted(&path)
+        ));
+    }
+    profile.push_str("(allow file-read* (literal \"/Library/Preferences/com.apple.dt.Xcode.plist\") (literal \"/Library/Preferences/com.apple.dt.CommandLineTools.plist\"))");
+    profile.push_str("(allow file-read* (literal \"/dev/null\") (literal \"/dev/random\") (literal \"/dev/urandom\"))(allow file-write* (literal \"/dev/null\"))");
+    profile.push_str(&format!("(allow file-write* (subpath {}))", quoted(&temp)));
+    for path in writable {
+        profile.push_str(&format!(
+            "(allow file-write* (subpath {}))",
+            quoted(&workspace.root().join(path))
+        ));
+    }
+    if request.spec.network {
+        profile.push_str("(allow network*)");
+    }
+    let mut command = Command::new("/usr/bin/sandbox-exec");
+    command
+        .args(["-p", &profile, "--", &request.program])
+        .args(&request.args);
+    command.current_dir(working_dir.absolute());
+    command.env_clear();
+    command.env("PATH", sandbox_path(request));
+    command.env("HOME", &temp);
+    command.env("TMPDIR", &temp);
+    command.env("TERM", "dumb");
+    command.env("NO_COLOR", "1");
+    command.envs(&request.env);
+    command.envs(toolchain_env(request));
+    command.stdin(Stdio::null());
+    command.stdout(Stdio::piped());
+    command.stderr(Stdio::piped());
+    Ok(command)
+}
+
 /// Which workspace paths the command may write.
 fn resolve_writable(
     workspace: &Workspace,
@@ -665,7 +791,14 @@ fn run_blocking(
     abandoned: Arc<AtomicBool>,
     trust: bool,
 ) -> Result<CommandOutcome, KnutError> {
+    let mut _private_temp = None;
     let mut command = match backend {
+        SandboxBackend::Seatbelt => {
+            let temp = PrivateTemp::new()?;
+            let command = seatbelt_command(workspace, request, &temp.0)?;
+            _private_temp = Some(temp);
+            command
+        }
         SandboxBackend::Bubblewrap => sandboxed_command(workspace, request)?,
         SandboxBackend::Unsandboxed => {
             if !trust {
@@ -979,6 +1112,9 @@ impl Tool for RunCommandTool {
         }
 
         let outcome = self.supervisor.run(request).await?;
+        if !outcome.status.is_success() {
+            return Err(KnutError::Tool(outcome.model_summary));
+        }
         serde_json::to_value(&outcome)
             .map_err(|err| KnutError::Tool(format!("serialize outcome: {err}")))
     }
@@ -1054,7 +1190,7 @@ mod tests {
         assert_eq!(outcome.status, CommandStatus::Exited { code: 3 });
         assert!(outcome.stdout.text.contains("hello"));
         assert!(outcome.stderr.text.contains("oops"));
-        assert_eq!(outcome.backend, SandboxBackend::Bubblewrap);
+        assert_eq!(outcome.backend, supervisor(&fixture).backend().unwrap());
         assert!(outcome.backend.is_enforced());
         assert!(!outcome.is_retriable() || !outcome.possibly_effectful);
     }
@@ -1158,10 +1294,22 @@ mod tests {
     #[tokio::test]
     async fn provider_keys_and_parent_environment_do_not_reach_the_command() {
         let fixture = Fixture::new("env");
-        // Simulate a provider key in the parent environment.
-        unsafe {
-            std::env::set_var("ZAI_API_KEY", "super-secret-provider-key");
-            std::env::set_var("TYPESAFE_API_KEY", "super-secret-jev-key");
+        if std::env::var_os("KNUT_SANDBOX_ENV_FIXTURE").is_none() {
+            let result = Command::new(std::env::current_exe().unwrap())
+                .args([
+                    "--exact",
+                    "sandbox::tests::provider_keys_and_parent_environment_do_not_reach_the_command",
+                ])
+                .env("KNUT_SANDBOX_ENV_FIXTURE", "1")
+                .env("ZAI_API_KEY", "super-secret-provider-key")
+                .env("TYPESAFE_API_KEY", "super-secret-jev-key")
+                .output()
+                .unwrap();
+            assert!(
+                result.status.success(),
+                "environment isolation fixture failed"
+            );
+            return;
         }
 
         let outcome = supervisor(&fixture)
@@ -1172,11 +1320,6 @@ mod tests {
         assert!(!outcome.stdout.text.contains("super-secret"));
         assert!(!outcome.stdout.text.contains("ZAI_API_KEY"));
         assert!(!outcome.stdout.text.contains("TYPESAFE_API_KEY"));
-
-        unsafe {
-            std::env::remove_var("ZAI_API_KEY");
-            std::env::remove_var("TYPESAFE_API_KEY");
-        }
     }
 
     #[tokio::test]
@@ -1343,7 +1486,10 @@ mod tests {
         .await
         .unwrap();
 
-        assert_eq!(outcome["backend"], json!("bubblewrap"));
+        assert_eq!(
+            outcome["backend"],
+            serde_json::to_value(supervisor.backend().unwrap()).unwrap()
+        );
         assert!(
             outcome["stdout"]["text"]
                 .as_str()
@@ -1353,6 +1499,18 @@ mod tests {
         let metadata = crate::tool::Tool::metadata(&tool);
         assert_eq!(metadata.side_effect, SideEffect::NonIdempotentWrite);
         assert_eq!(metadata.capability, CAPABILITY);
+    }
+
+    #[tokio::test]
+    async fn a_failed_command_is_a_tool_failure() {
+        let fixture = Fixture::new("tool-failed");
+        let tool = RunCommandTool::new(Arc::new(supervisor(&fixture)));
+        let error = tool
+            .call(json!({"program":"/bin/sh", "args":["-c", "echo broken >&2; exit 9"]}))
+            .await
+            .unwrap_err();
+        assert!(error.to_string().contains("broken"));
+        assert!(error.to_string().contains("code: 9"));
     }
 
     #[test]

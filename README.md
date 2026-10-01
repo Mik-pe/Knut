@@ -98,8 +98,15 @@ repository:
 | `KNUT_PROVIDER_MODEL` | model id; defaults to `glm-5.3-flash` |
 | `KNUT_PROVIDER_REASONING_EFFORT` | explicit effort; GLM-5.3 supports `low`, `high`, `max` (default) |
 | `KNUT_PROVIDER_TIMEOUT_SECONDS` | positive request timeout; default 120 seconds |
-| `TYPESAFE_API_KEY` | Jev credential (optional; decisions fall back to deterministic rules) |
+| `TYPESAFE_API_KEY` | optional Jev credential; without it, the reasoner plans directly |
 | `KNUT_MODE` | `quality` (default) or `adaptive` |
+
+A decision model is optional. With only the reasoner configured, System Zero
+hands tasks to the same validated planner, which chooses from the complete file
+and command tool catalog. Tool policy, exact approvals, bounded repair and
+revision-bound checks stay in the runtime. An unusable Jev configuration emits
+a warning and uses this path; failures of a configured live Jev call remain
+explicit errors.
 
 `knut doctor` reports what is missing with actionable guidance, and makes
 no paid request unless you pass `--live`.
@@ -115,7 +122,8 @@ buffered/streaming mode, outcome, latency, and reported token usage—even when 
 run fails. It excludes prompt/response bodies and error text. Unknown usage stays
 unknown. Jev calls, cached-token breakdowns and costs are not yet included.
 This runs the normal coding task and can incur provider charges; `--census`
-does not grant write approval.
+does not grant write approval. `--yes` pre-approves file edits; commands still
+require their exact approval through TUI or JSONL.
 
 Small edits can use `files/edit`: a read hash plus a JSON-encoded array of exact
 `{old,new}` replacements. Ambiguous matches and stale revisions fail without
@@ -255,8 +263,11 @@ this commit), on Linux:
   30-task held-out evaluation the roadmap calls for.
 - Language servers are reported but never started implicitly; LSP
   navigation is fixture-tested, not live-verified here.
-- macOS and Windows are not verified. Do not treat command isolation as
-  working there.
+- Command isolation uses Bubblewrap on Linux and Seatbelt (`sandbox-exec`) on
+  macOS. Both start with a clean environment and deny network by default.
+  macOS commands use a private temporary directory and declared writable paths;
+  the backend is reported with every command result. Windows is unsupported.
+  A missing backend refuses execution.
 - TUI performance was measured on a synthetic fixture (p95 under 5 ms for
   reducer plus render), not against real provider latency.
 

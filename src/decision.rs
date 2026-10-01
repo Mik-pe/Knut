@@ -4,6 +4,8 @@ use serde_json::Value;
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(rename_all = "snake_case")]
 pub enum Route {
+    /// Delegate open-ended work to a validated reasoner plan.
+    Plan,
     Clarify,
     Retrieve,
     Act,
@@ -71,6 +73,8 @@ impl DecisionInput {
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(rename_all = "snake_case")]
 pub enum Action {
+    /// Plan against the complete configured tool catalog.
+    Plan,
     AskUser,
     Retrieve(RetrievalSource),
     /// Act without a resolved capability: an explicit intermediate action.

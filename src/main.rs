@@ -874,6 +874,9 @@ async fn coding_run(prompts: &[String], verbose: bool, yes: bool) -> Result<(), 
     }
     let workspace = knut::Workspace::open(".")?;
     let (engine, report) = knut::build_with_write_approval(workspace, yes);
+    if let Some(warning) = &report.routing_warning {
+        eprintln!("  routing: {warning}");
+    }
     if let Some(reason) = report.unavailable {
         return Err(KnutError::Tool(reason));
     }
@@ -1194,7 +1197,7 @@ async fn doctor(live: bool) -> Result<(), KnutError> {
                 }
             }
         }
-        _ => println!("  system one:  not configured (TYPESAFE_API_KEY unset)"),
+        _ => println!("  system one:  optional, not configured; reasoner plans directly"),
     }
 
     // Reasoner (BYOK provider) configuration. The Z.ai coding key is
@@ -1365,6 +1368,7 @@ fn always_reasoner_decision() -> Decision {
 /// Describe the executed action the way a `Decision` would have looked.
 fn action_decision(action: &Action) -> Decision {
     let (route, tier, capability) = match action {
+        Action::Plan => (Route::Plan, ModelTier::Reasoner, None),
         Action::AskUser => (Route::Clarify, ModelTier::Fast, None),
         Action::Retrieve(_) => (Route::Retrieve, ModelTier::Fast, None),
         Action::Discover => (Route::Act, ModelTier::Fast, None),
@@ -1393,6 +1397,7 @@ fn trace_for(
     outcome: TurnOutcome,
 ) -> TurnTrace {
     let action = match decision.route {
+        Route::Plan => Action::Plan,
         Route::Clarify => Action::AskUser,
         Route::Retrieve => Action::Retrieve(RetrievalSource::Files),
         Route::Act => Action::Tool {

@@ -634,6 +634,7 @@ pub struct TreeExecutor {
     verifier: Arc<dyn Verifier>,
     ask_handler: Option<Arc<dyn AskUserHandler>>,
     instructions: String,
+    effect_scope: Option<String>,
 }
 
 impl TreeExecutor {
@@ -652,11 +653,17 @@ impl TreeExecutor {
             verifier,
             ask_handler: None,
             instructions: String::new(),
+            effect_scope: None,
         }
     }
 
     pub fn with_instructions(mut self, instructions: String) -> Self {
         self.instructions = instructions;
+        self
+    }
+
+    pub fn with_effect_scope(mut self, scope: String) -> Self {
+        self.effect_scope = Some(scope);
         self
     }
 
@@ -843,9 +850,25 @@ impl TreeExecutor {
                 // Single execution path: availability, argument schema,
                 // policy, approval, and journal semantics all live in the
                 // gate. A node never calls an implementation directly.
+                let effect_key = self.effect_scope.as_ref().and_then(|scope| {
+                    self.registry
+                        .find_exact(capability, tool_id)
+                        .ok()
+                        .filter(|metadata| {
+                            metadata.side_effect == crate::SideEffect::NonIdempotentWrite
+                        })
+                        .map(|_| format!("{scope}:node:{id}"))
+                });
                 match self
                     .registry
-                    .invoke(&self.gate, capability, tool_id, resolved, None, Risk::Low)
+                    .invoke(
+                        &self.gate,
+                        capability,
+                        tool_id,
+                        resolved,
+                        effect_key,
+                        Risk::Low,
+                    )
                     .await
                 {
                     Ok(outcome) => {

@@ -527,11 +527,15 @@ struct ActiveTask {
     replans: usize,
     /// Latest routing decision, invalidated on revision bump.
     routed: Option<(TaskRevision, TurnId)>,
-    /// A validated plan paused on approval. Approving must resume this
-    /// exact plan instead of asking the reasoner for a new one: the
-    /// approval is bound to the actions inside it (steering bumps the
-    /// revision and discards it, so a stale plan can never be resumed).
-    pending_plan: Option<(TaskRevision, ValidatedPlan, String, crate::TreeRunResult)>,
+    /// Retains completed node outputs across approvals and questions.
+    /// Steering discards the plan; approval never asks the reasoner to
+    /// replace the exact actions the user reviewed.
+    pending_plan: Option<(
+        TaskRevision,
+        ValidatedPlan,
+        Option<String>,
+        crate::TreeRunResult,
+    )>,
 }
 
 /// The pending wait a task is blocked on: what the user must resolve.
@@ -877,7 +881,7 @@ where
                 Ok(())
             }
             SessionCommand::Answer { value } => {
-                let Some(wait) = self.pending_wait.take() else {
+                let Some(wait) = self.pending_wait.clone() else {
                     return Err(KnutError::InvalidArguments {
                         path: "answer".to_owned(),
                         reason: "no pending question to answer".to_owned(),
@@ -885,11 +889,26 @@ where
                 };
                 match wait.kind {
                     WaitKind::Question => {
-                        // Fold the answer into the task prompt and
-                        // continue with a fresh decision.
+                        if value.trim().is_empty() {
+                            return Err(KnutError::InvalidArguments {
+                                path: "answer".to_owned(),
+                                reason: "answer must not be empty".to_owned(),
+                            });
+                        }
+                        self.pending_wait = None;
+                        // A planned question resumes with its captured outputs;
+                        // ingress questions return to routing.
                         if let Some(task) = self.task.as_mut() {
                             task.prompt = format!("{}\nuser: {value}", task.prompt);
                             task.revision = TaskRevision(task.revision.0 + 1);
+                            if let Some((plan_revision, plan, _, run)) = &mut task.pending_plan {
+                                if let Some((id, _)) = blocked_question(&plan.plan, run) {
+                                    let id = id.to_owned();
+                                    run.statuses.insert(id.clone(), NodeStatus::Succeeded);
+                                    run.outputs.insert(id, Value::String(value));
+                                }
+                                *plan_revision = task.revision;
+                            }
                         }
                         self.emit(SessionEvent::WaitResolved {
                             task: wait.task,
@@ -1150,12 +1169,20 @@ where
         }
         // Record the wait for future commands.
         if let Some(kind) = waiting_kind {
-            let message = match &kind {
-                WaitKind::Question => "The task needs information only you can provide.".to_owned(),
-                WaitKind::Approval { .. } => {
-                    "The task needs your approval before proceeding.".to_owned()
-                }
-            };
+            let message = self
+                .events
+                .events()
+                .filter_map(|event| match event {
+                    SessionEvent::WaitingForUser {
+                        task,
+                        turn: event_turn,
+                        message,
+                        ..
+                    } if *task == task_id && *event_turn == turn => Some(message.clone()),
+                    _ => None,
+                })
+                .last()
+                .unwrap_or_else(|| "The task needs your input before proceeding.".to_owned());
             self.pending_wait = Some(PendingWait {
                 task: task_id,
                 turn,
@@ -1229,7 +1256,7 @@ where
             .map(|(_, _, capability, _)| capability.clone())
         {
             return self
-                .execute_capability(task_id, turn, revision, &capability)
+                .execute_plan(task_id, turn, revision, capability.as_deref())
                 .await;
         }
         // Ingress: System 0 fast paths, then System One judgment.
@@ -1264,6 +1291,7 @@ where
         });
 
         match routed.action {
+            Action::Plan => self.execute_plan(task_id, turn, revision, None).await,
             Action::AskUser => {
                 self.emit(SessionEvent::WaitingForUser {
                     task: task_id,
@@ -1274,7 +1302,7 @@ where
                 Tick::Waiting(WaitKind::Question)
             }
             Action::Retrieve(_) if self.checks.is_some() => {
-                self.execute_capability(task_id, turn, revision, "files")
+                self.execute_plan(task_id, turn, revision, Some("files"))
                     .await
             }
             Action::Retrieve(_) => {
@@ -1308,7 +1336,7 @@ where
                     1 => {
                         // Mechanical singleton: proceed to that capability.
                         let capability = candidates[0].0.clone();
-                        self.execute_capability(task_id, turn, revision, &capability)
+                        self.execute_plan(task_id, turn, revision, Some(&capability))
                             .await
                     }
                     _ => {
@@ -1318,8 +1346,11 @@ where
                             .map(|(id, _)| id.clone());
                         match exact {
                             Some(capability) => {
-                                self.execute_capability(task_id, turn, revision, &capability)
+                                self.execute_plan(task_id, turn, revision, Some(&capability))
                                     .await
+                            }
+                            None if self.frames.is_none() => {
+                                self.execute_plan(task_id, turn, revision, None).await
                             }
                             None => {
                                 // More than one legal choice: exactly the
@@ -1386,11 +1417,11 @@ where
                                     Ok(choice) => match choice.chosen() {
                                         Some(capability) => {
                                             let capability = capability.to_owned();
-                                            self.execute_capability(
+                                            self.execute_plan(
                                                 task_id,
                                                 turn,
                                                 revision,
-                                                &capability,
+                                                Some(&capability),
                                             )
                                             .await
                                         }
@@ -1422,26 +1453,24 @@ where
                 }
             }
             Action::Tool { capability } => {
-                self.execute_capability(task_id, turn, revision, &capability)
+                self.execute_plan(task_id, turn, revision, Some(&capability))
                     .await
             }
             // Repository generation must produce executable work, not tool-shaped text.
             Action::Generate(_) if self.checks.is_some() => {
-                self.execute_capability(task_id, turn, revision, "files")
-                    .await
+                self.execute_plan(task_id, turn, revision, None).await
             }
             Action::Generate(tier) => self.generate(task_id, turn, revision, prompt, tier).await,
         }
     }
 
-    /// Execute a capability through the planner -> validated plan ->
-    /// gated tree executor path.
-    async fn execute_capability(
+    /// Execute a validated tool plan, optionally guided by an ingress capability.
+    async fn execute_plan(
         &mut self,
         task_id: TaskId,
         turn: TurnId,
         revision: TaskRevision,
-        capability: &str,
+        capability: Option<&str>,
     ) -> Tick {
         // Resuming an approved plan: the user approved the exact actions
         // inside this validated plan, so re-asking the reasoner would
@@ -1451,7 +1480,7 @@ where
             .as_mut()
             .and_then(|task| match task.pending_plan.take() {
                 Some((plan_revision, plan, plan_capability, run))
-                    if plan_revision == revision && plan_capability == capability =>
+                    if plan_revision == revision && plan_capability.as_deref() == capability =>
                 {
                     Some((plan, run))
                 }
@@ -1480,7 +1509,8 @@ where
             Arc::clone(&self.cascade),
             Arc::clone(&self.verifier),
         )
-        .with_instructions(self.repository_context.clone());
+        .with_instructions(self.repository_context.clone())
+        .with_effect_scope(format!("task:{}:revision:{}", task_id.0, revision.0));
 
         let result = match previous {
             Some(run) => {
@@ -1541,11 +1571,31 @@ where
             .collect();
 
         if !blocked.is_empty() {
+            if let Some((_, question)) = blocked_question(&validated.plan, &run) {
+                let message = question.to_owned();
+                if let Some(task) = self.task.as_mut() {
+                    task.pending_plan = Some((
+                        revision,
+                        validated.clone(),
+                        capability.map(str::to_owned),
+                        run.clone(),
+                    ));
+                }
+                self.emit(SessionEvent::WaitingForUser {
+                    task: task_id,
+                    turn,
+                    wait: WaitKind::Question,
+                    message,
+                });
+                return Tick::Waiting(WaitKind::Question);
+            }
             // Approval-required is the recoverable block: ask the user.
             // The approval binds to the exact action fingerprint in the
             // gate, and the validated plan is retained so approval resumes
             // this plan instead of generating a different one.
-            let approval = self.pending_approval(&validated.plan, &run).await;
+            let approval = self
+                .pending_approval(task_id, revision, &validated.plan, &run)
+                .await;
 
             match approval {
                 Some((key, name, arguments)) => {
@@ -1553,7 +1603,7 @@ where
                         task.pending_plan = Some((
                             revision,
                             validated.clone(),
-                            capability.to_owned(),
+                            capability.map(str::to_owned),
                             run.clone(),
                         ));
                     }
@@ -1694,7 +1744,7 @@ where
                     task_id,
                     turn,
                     revision,
-                    capability,
+                    capability.unwrap_or("workspace"),
                     &failed_leaves,
                     repairable,
                 )
@@ -1818,18 +1868,20 @@ where
         task_id: TaskId,
         turn: TurnId,
         revision: TaskRevision,
-        capability: &str,
+        capability: Option<&str>,
     ) -> Option<ValidatedPlan> {
-        let mut context = crate::planner::PlanningContext::from_registry(
-            format!(
-                "Use the {capability} capability to make progress on: {}",
-                self.task
-                    .as_ref()
-                    .map(|t| t.prompt.clone())
-                    .unwrap_or_default()
-            ),
-            &self.registry,
-        );
+        let goal = self
+            .task
+            .as_ref()
+            .map(|task| task.prompt.clone())
+            .unwrap_or_default();
+        let goal = match capability {
+            Some(capability) => {
+                format!("Use the {capability} capability to make progress on: {goal}")
+            }
+            None => goal,
+        };
+        let mut context = crate::planner::PlanningContext::from_registry(goal, &self.registry);
 
         if !self.repository_context.is_empty() {
             context.constraints.push(self.repository_context.clone());
@@ -1869,17 +1921,21 @@ where
 
     async fn pending_approval(
         &self,
+        task: TaskId,
+        revision: TaskRevision,
         plan: &PlanNode,
         run: &crate::TreeRunResult,
     ) -> Option<(String, String, Value)> {
-        let (capability, tool_id, input) = find_blocked_tool_node(plan, run)?;
+        let (id, capability, tool_id, input) = find_blocked_tool_node(plan, run)?;
         let input =
             crate::tree::resolve_input(input, &crate::tree::ArtifactStore::from(&run.outputs))
                 .ok()?;
         let metadata = self.registry.find_exact(capability, tool_id).ok()?;
+        let effect_key = (metadata.side_effect == crate::SideEffect::NonIdempotentWrite)
+            .then(|| format!("task:{}:revision:{}:node:{id}", task.0, revision.0));
         match self
             .gate
-            .authorize(&metadata, &input, None, Risk::Low)
+            .authorize(&metadata, &input, effect_key.as_deref(), Risk::Low)
             .await
         {
             Err(KnutError::ApprovalRequired { approval_key, .. }) => {
@@ -1896,9 +1952,14 @@ where
         runner: Arc<crate::CheckRunner>,
     ) -> Tick {
         let result = async {
-            let revision = runner.current_revision("workspace")?;
-            let checks = runner.run_all(&revision).await;
-            let current = runner.current_revision("workspace")?;
+            let mut revision = runner.current_revision("workspace")?;
+            let mut checks = runner.run_all(&revision).await;
+            let mut current = runner.current_revision("workspace")?;
+            if revision != current && checks.iter().all(|check| check.outcome.is_green()) {
+                revision = current;
+                checks = runner.run_all(&revision).await;
+                current = runner.current_revision("workspace")?;
+            }
             Ok::<_, KnutError>((revision, checks, current))
         }
         .await;
@@ -2158,12 +2219,26 @@ impl crate::ModelStreamSink for SessionSink {
     }
 }
 
+fn blocked_question<'a>(
+    plan: &'a PlanNode,
+    run: &crate::TreeRunResult,
+) -> Option<(&'a str, &'a str)> {
+    if let PlanNode::AskUser { question, .. } = plan
+        && run.statuses.get(plan.id()) == Some(&NodeStatus::Blocked)
+    {
+        return Some((plan.id(), question));
+    }
+    plan.children()
+        .iter()
+        .find_map(|child| blocked_question(child, run))
+}
+
 /// Find the first tool node in a plan (pre-order), destructured to its
 /// invocation parts.
 fn find_blocked_tool_node<'a>(
     plan: &'a PlanNode,
     run: &crate::TreeRunResult,
-) -> Option<(&'a str, &'a str, &'a Value)> {
+) -> Option<(&'a str, &'a str, &'a str, &'a Value)> {
     if let PlanNode::Tool {
         capability,
         tool_id,
@@ -2172,7 +2247,7 @@ fn find_blocked_tool_node<'a>(
     } = plan
         && run.statuses.get(plan.id()) == Some(&NodeStatus::Blocked)
     {
-        return Some((capability, tool_id, input));
+        return Some((plan.id(), capability, tool_id, input));
     }
     for child in plan.children() {
         if let Some(found) = find_blocked_tool_node(child, run) {
@@ -4034,11 +4109,28 @@ mod tests {
             check: &str,
             approve: bool,
         ) -> (SessionRuntime<ActFiles>, Arc<ScriptedReasoner>) {
+            self.runtime_with_router(answers, check, approve, Knut::new(ActFiles))
+        }
+
+        fn runtime_with_router<S: SystemOne>(
+            &self,
+            answers: Vec<String>,
+            check: &str,
+            approve: bool,
+            router: Knut<S>,
+        ) -> (SessionRuntime<S>, Arc<ScriptedReasoner>) {
             let mut registry = ToolRegistry::default();
             crate::register_workspace_tools(&mut registry, self.workspace.clone()).unwrap();
+            crate::register_command_tools(
+                &mut registry,
+                Arc::new(crate::Supervisor::new(self.workspace.clone())),
+            )
+            .unwrap();
             let reasoner = Arc::new(ScriptedReasoner::with(answers));
             let cascade = Arc::new(ComputeCascade::empty().with_reasoner(reasoner.clone()));
-            let policy = crate::SideEffectPolicy::new().allow(SideEffect::ReadOnly);
+            let policy = crate::SideEffectPolicy::new()
+                .allow(SideEffect::ReadOnly)
+                .require_approval(SideEffect::NonIdempotentWrite);
             let policy = if approve {
                 policy.allow(SideEffect::IdempotentWrite)
             } else {
@@ -4062,7 +4154,7 @@ mod tests {
             );
             (
                 SessionRuntime::new(
-                    Arc::new(Knut::new(ActFiles)),
+                    Arc::new(router),
                     Planner::new(cascade.clone()),
                     Arc::new(registry),
                     Arc::new(ExecutionGate::new(policy)),
@@ -4090,6 +4182,299 @@ mod tests {
                 "expect_hash":{"$ref":"read", "kind":"text", "pointer":"/content_hash"}
             }}
         ]}).to_string()
+    }
+
+    #[tokio::test]
+    async fn reasoner_without_decision_model_edits_multiple_files_with_exact_approvals() {
+        let fixture = RepositoryFixture::new();
+        std::fs::write(fixture.root.join("other.txt"), "before").unwrap();
+        let mut plan: Value = serde_json::from_str(&repository_plan()).unwrap();
+        let mut other = plan["children"].as_array().unwrap().clone();
+        for node in &mut other {
+            node["id"] = json!(format!("other-{}", node["id"].as_str().unwrap()));
+            if let Some(input) = node.get_mut("input") {
+                let text = input
+                    .to_string()
+                    .replace("value.txt", "other.txt")
+                    .replace("\"read\"", "\"other-read\"")
+                    .replace("\"patch\"", "\"other-patch\"");
+                *input = serde_json::from_str(&text).unwrap();
+            }
+        }
+        plan["children"].as_array_mut().unwrap().extend(other);
+        let (mut runtime, reasoner) = fixture.runtime_with_router(
+            vec![plan.to_string(), "after".to_owned(), "after".to_owned()],
+            "test \"$(cat value.txt)\" = after && test \"$(cat other.txt)\" = after",
+            false,
+            crate::engine::deterministic_router(),
+        );
+        runtime
+            .command(SessionCommand::Submit {
+                prompt: "Update both files".to_owned(),
+            })
+            .await
+            .unwrap();
+        for path in ["value.txt", "other.txt"] {
+            assert_eq!(
+                drive_until_stable(&mut runtime, 5).await,
+                Some(TaskState::Waiting)
+            );
+            assert_eq!(
+                std::fs::read_to_string(fixture.root.join(path)).unwrap(),
+                "before"
+            );
+            let WaitKind::Approval { approval_key } = runtime.pending_wait().unwrap().kind.clone()
+            else {
+                panic!("expected approval");
+            };
+            runtime
+                .command(SessionCommand::Approve { approval_key })
+                .await
+                .unwrap();
+        }
+        assert_eq!(
+            drive_until_stable(&mut runtime, 5).await,
+            Some(TaskState::Completed)
+        );
+        assert_eq!(reasoner.calls(), 3);
+        assert!(runtime.events().events().any(|event| matches!(
+            event,
+            SessionEvent::Routed {
+                source: crate::DecisionSource::SystemZero,
+                action: Action::Plan,
+                ..
+            }
+        )));
+        assert!(
+            !runtime
+                .events()
+                .events()
+                .any(|event| matches!(event, SessionEvent::FrameDecided { .. }))
+        );
+        let requests = reasoner.requests.lock().unwrap();
+        assert_eq!(requests[0].input["goal"], "Update both files");
+    }
+
+    #[tokio::test]
+    async fn discovery_without_a_decision_model_uses_the_validated_planner() {
+        let mut runtime = runtime_with(
+            Arc::new(ActNoCapRouter),
+            vec![plan_json("read")],
+            crate::SideEffectPolicy::new().allow(SideEffect::ReadOnly),
+        )
+        .with_discovery(DiscoveryCandidates {
+            candidates: vec![
+                ("files".to_owned(), "Read files".to_owned()),
+                ("shell".to_owned(), "Run commands".to_owned()),
+            ],
+        });
+        runtime
+            .command(SessionCommand::Submit {
+                prompt: "inspect the workspace".to_owned(),
+            })
+            .await
+            .unwrap();
+        assert_eq!(
+            drive_until_stable(&mut runtime, 5).await,
+            Some(TaskState::Completed)
+        );
+        assert!(
+            !runtime
+                .events()
+                .events()
+                .any(|event| matches!(event, SessionEvent::WaitingForUser { .. }))
+        );
+    }
+
+    #[tokio::test]
+    async fn commands_resume_after_exact_approval_and_are_not_repeated() {
+        let fixture = RepositoryFixture::new();
+        std::fs::write(fixture.root.join("runs.txt"), "").unwrap();
+        let mut plan: Value = serde_json::from_str(&repository_plan()).unwrap();
+        plan["children"].as_array_mut().unwrap().insert(0, json!({
+            "type":"tool", "id":"command", "capability":"shell", "tool_id":"run",
+            "input":{"program":"/bin/sh", "args":["-c", "echo run >> runs.txt"], "writable":["runs.txt"]}
+        }));
+        plan["children"].as_array_mut().unwrap().insert(
+            1,
+            json!({
+                "type":"ask_user", "id":"question", "question":"Which value should be written?"
+            }),
+        );
+        let (mut runtime, reasoner) = fixture.runtime_with_router(
+            vec![plan.to_string(), "after".to_owned()],
+            "test \"$(cat runs.txt)\" = run && test \"$(cat value.txt)\" = after",
+            false,
+            crate::engine::deterministic_router(),
+        );
+        runtime
+            .command(SessionCommand::Submit {
+                prompt: "Run the command and update the file".to_owned(),
+            })
+            .await
+            .unwrap();
+        assert_eq!(
+            drive_until_stable(&mut runtime, 5).await,
+            Some(TaskState::Waiting)
+        );
+        assert_eq!(
+            std::fs::read_to_string(fixture.root.join("runs.txt")).unwrap(),
+            ""
+        );
+        for approval in 0..2 {
+            let WaitKind::Approval { approval_key } = runtime.pending_wait().unwrap().kind.clone()
+            else {
+                panic!("expected approval");
+            };
+            runtime
+                .command(SessionCommand::Approve { approval_key })
+                .await
+                .unwrap();
+            drive_until_stable(&mut runtime, 5).await.unwrap();
+            if approval == 0 {
+                assert!(matches!(
+                    runtime.pending_wait().unwrap().kind,
+                    WaitKind::Question
+                ));
+                runtime
+                    .command(SessionCommand::Answer {
+                        value: "after".to_owned(),
+                    })
+                    .await
+                    .unwrap();
+                assert_eq!(
+                    drive_until_stable(&mut runtime, 5).await,
+                    Some(TaskState::Waiting)
+                );
+            }
+        }
+        assert_eq!(runtime.task_state(), Some(TaskState::Completed));
+        assert_eq!(
+            std::fs::read_to_string(fixture.root.join("runs.txt")).unwrap(),
+            "run\n"
+        );
+        assert_eq!(reasoner.calls(), 2);
+        assert!(
+            reasoner.requests.lock().unwrap()[0].input["capabilities"]
+                .as_array()
+                .unwrap()
+                .contains(&json!("shell"))
+        );
+    }
+
+    #[tokio::test]
+    async fn reasoner_questions_resume_the_plan_with_the_answer() {
+        let (mut runtime, reasoner) = runtime_with_reasoner(
+            Arc::new(ActFiles),
+            vec![
+                json!({"type":"sequence", "id":"root", "children":[
+                    {"type":"ask_user", "id":"question", "question":"Which file?"},
+                    {"type":"generate", "id":"answer", "tier":"reasoner", "instruction":"Use the supplied answer",
+                     "input":{"answer":{"$ref":"question", "kind":"text"}}}
+                ]}).to_string(),
+                "answer accepted".to_owned(),
+            ],
+            crate::SideEffectPolicy::new().allow(SideEffect::ReadOnly),
+        );
+        runtime
+            .command(SessionCommand::Submit {
+                prompt: "Read my file".to_owned(),
+            })
+            .await
+            .unwrap();
+        assert_eq!(
+            drive_until_stable(&mut runtime, 5).await,
+            Some(TaskState::Waiting)
+        );
+        assert!(runtime.events().events().any(|event| matches!(event,
+            SessionEvent::WaitingForUser { message, wait: WaitKind::Question, .. } if message == "Which file?"
+        )));
+        assert!(
+            runtime
+                .command(SessionCommand::Answer {
+                    value: " ".to_owned()
+                })
+                .await
+                .is_err()
+        );
+        assert_eq!(runtime.pending_wait().unwrap().message, "Which file?");
+        runtime
+            .command(SessionCommand::Answer {
+                value: "value.txt".to_owned(),
+            })
+            .await
+            .unwrap();
+        assert_eq!(
+            drive_until_stable(&mut runtime, 5).await,
+            Some(TaskState::Completed)
+        );
+        assert_eq!(reasoner.calls(), 2);
+        assert_eq!(
+            reasoner.requests.lock().unwrap()[1].input["answer"],
+            "value.txt"
+        );
+    }
+
+    #[tokio::test]
+    async fn answering_an_approval_does_not_discard_it() {
+        let mut runtime = runtime_with(
+            Arc::new(ActFiles),
+            vec![plan_json("write")],
+            crate::SideEffectPolicy::new().require_approval(SideEffect::IdempotentWrite),
+        );
+        runtime
+            .command(SessionCommand::Submit {
+                prompt: "files".to_owned(),
+            })
+            .await
+            .unwrap();
+        assert_eq!(
+            drive_until_stable(&mut runtime, 5).await,
+            Some(TaskState::Waiting)
+        );
+        let wait = runtime.pending_wait().unwrap().clone();
+        assert!(
+            runtime
+                .command(SessionCommand::Answer {
+                    value: "yes".to_owned()
+                })
+                .await
+                .is_err()
+        );
+        assert_eq!(runtime.pending_wait(), Some(&wait));
+    }
+
+    #[tokio::test]
+    async fn generated_build_files_trigger_rechecks_without_replanning() {
+        let fixture = RepositoryFixture::new();
+        std::fs::write(
+            fixture.root.join("Cargo.toml"),
+            "[package]\nname=\"fixture\"\nversion=\"0.1.0\"\n",
+        )
+        .unwrap();
+        let (mut runtime, reasoner) = fixture.runtime_with_router(
+            vec![json!({"type":"tool", "id":"read", "capability":"files", "tool_id":"read", "input":{"path":"value.txt"}}).to_string()],
+            "mkdir -p target; echo generated >> target/output; test -e generated.lock || touch generated.lock",
+            true, crate::engine::deterministic_router(),
+        );
+        runtime
+            .command(SessionCommand::Submit {
+                prompt: "Inspect the value and run checks".to_owned(),
+            })
+            .await
+            .unwrap();
+        assert_eq!(
+            drive_until_stable(&mut runtime, 5).await,
+            Some(TaskState::Completed)
+        );
+        assert_eq!(reasoner.calls(), 1);
+        assert_eq!(
+            std::fs::read_to_string(fixture.root.join("target/output"))
+                .unwrap()
+                .lines()
+                .count(),
+            2
+        );
     }
 
     #[tokio::test]

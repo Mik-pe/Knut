@@ -628,9 +628,23 @@ impl CheckRunner {
         // any of them does. Ignore files are honored the same way the
         // read/search tools honor them.
         let mut files: Vec<(String, String)> = Vec::new();
-        let walker = ignore::WalkBuilder::new(self.workspace.root())
+        let root = self.workspace.root().to_owned();
+        let rust_workspace = root.join("Cargo.toml").is_file();
+        let node_workspace = root.join("package.json").is_file();
+        let walker = ignore::WalkBuilder::new(&root)
             .standard_filters(true)
             .require_git(false)
+            .filter_entry(move |entry| {
+                let Ok(relative) = entry.path().strip_prefix(&root) else {
+                    return false;
+                };
+                let first = relative
+                    .components()
+                    .next()
+                    .map(|component| component.as_os_str());
+                !(rust_workspace && first == Some(std::ffi::OsStr::new("target"))
+                    || node_workspace && first == Some(std::ffi::OsStr::new("node_modules")))
+            })
             .build();
         for entry in walker.flatten() {
             if !entry.file_type().is_some_and(|t| t.is_file()) {

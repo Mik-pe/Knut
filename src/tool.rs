@@ -326,142 +326,102 @@ pub fn validate_schema_supported(schema: &Value) -> Result<(), SchemaError> {
             path: path.to_owned(),
             reason: reason.to_owned(),
         };
-
-        let schema_type = schema
-            .get("type")
-            .and_then(Value::as_str)
-            .ok_or_else(|| err("schema missing supported \"type\""))?;
-
-        match schema_type {
-            "object" => {
+        if let Some(options) = schema.get("enum")
+            && !options.is_array()
+        {
+            return Err(err("enum must be an array"));
+        }
+        match schema.get("type").and_then(Value::as_str) {
+            Some("string" | "number" | "boolean") => Ok(()),
+            Some("array") => {
+                let items = schema
+                    .get("items")
+                    .ok_or_else(|| err("array schema needs items"))?;
+                check(items, &format!("{path}[]"))
+            }
+            Some("object") => {
                 if let Some(required) = schema.get("required") {
                     let Some(list) = required.as_array() else {
-                        return Err(err("\"required\" must be an array of field names"));
+                        return Err(err("required must be an array of field names"));
                     };
-                    if list.iter().any(|v| !v.is_string()) {
-                        return Err(err("\"required\" entries must be strings"));
+                    if list.iter().any(|value| !value.is_string()) {
+                        return Err(err("required entries must be strings"));
+                    }
+                }
+                if let Some(properties) = schema.get("properties") {
+                    let properties = properties
+                        .as_object()
+                        .ok_or_else(|| err("properties must be an object"))?;
+                    for (key, field) in properties {
+                        check(field, &format!("{path}.{key}"))?;
+                    }
+                }
+                Ok(())
+            }
+            other => Err(err(&format!(
+                "unsupported schema type {}",
+                other.unwrap_or("<missing>")
+            ))),
+        }
+    }
+    check(schema, "$")
+}
+
+pub fn validate_arguments(schema: &Value, input: &Value) -> Result<(), SchemaError> {
+    fn check(schema: &Value, input: &Value, path: &str) -> Result<(), SchemaError> {
+        let err = |reason: &str| SchemaError {
+            path: path.to_owned(),
+            reason: reason.to_owned(),
+        };
+        if let Some(options) = schema.get("enum").and_then(Value::as_array)
+            && !options.contains(input)
+        {
+            return Err(err("value is not one of the enum options"));
+        }
+        match schema.get("type").and_then(Value::as_str) {
+            Some("string") if input.is_string() => Ok(()),
+            Some("number") if input.is_number() => Ok(()),
+            Some("boolean") if input.is_boolean() => Ok(()),
+            Some("array") => {
+                let items = schema
+                    .get("items")
+                    .ok_or_else(|| err("array schema needs items"))?;
+                let list = input.as_array().ok_or_else(|| err("expected an array"))?;
+                for (index, value) in list.iter().enumerate() {
+                    check(items, value, &format!("{path}[{index}]"))?;
+                }
+                Ok(())
+            }
+            Some("object") => {
+                let object = input
+                    .as_object()
+                    .ok_or_else(|| err("expected a JSON object"))?;
+                for required in schema
+                    .get("required")
+                    .and_then(Value::as_array)
+                    .into_iter()
+                    .flatten()
+                {
+                    if let Some(required) = required.as_str()
+                        && !object.contains_key(required)
+                    {
+                        return Err(err(&format!("missing required field {required:?}")));
                     }
                 }
                 if let Some(properties) = schema.get("properties").and_then(Value::as_object) {
-                    for (key, field_schema) in properties {
-                        let leaf = field_schema.get("type").and_then(Value::as_str);
-                        match leaf {
-                            Some("string") | Some("number") | Some("boolean") => {}
-                            Some("object") | Some("array") => {
-                                check(field_schema, &format!("{path}.{key}"))?
-                            }
-                            other => {
-                                return Err(err(&format!(
-                                    "unsupported schema type {}",
-                                    other.unwrap_or("<missing>")
-                                )));
-                            }
+                    for (key, field) in properties {
+                        if let Some(value) = object.get(key) {
+                            check(field, value, &format!("{path}.{key}"))?;
                         }
                     }
                 }
                 Ok(())
             }
-            other => Err(err(&format!("unsupported schema type {other:?}"))),
+            _ => Err(err("value does not match its declared schema type")),
         }
     }
-
-    check(schema, "$")
-}
-
-pub fn validate_arguments(schema: &Value, input: &Value) -> Result<(), SchemaError> {
-    fn check(
-        schema: &Value,
-        input: &Value,
-        path: &str,
-        allow_non_object: bool,
-    ) -> Result<(), SchemaError> {
-        let err = |reason: &str| SchemaError {
-            path: path.to_owned(),
-            reason: reason.to_owned(),
-        };
-
-        let schema_type = schema
-            .get("type")
-            .and_then(Value::as_str)
-            .ok_or_else(|| err("schema missing supported \"type\""))?;
-
-        if schema_type != "object" {
-            if allow_non_object && schema_type == "string" {
-                // Leaf at the top level only; values below the root must
-                // live in properties.
-                return Ok(());
-            }
-            return Err(err(&format!("unsupported schema type {schema_type:?}")));
-        }
-
-        let Some(object) = input.as_object() else {
-            return Err(err("expected a JSON object"));
-        };
-
-        for required in schema
-            .get("required")
-            .and_then(Value::as_array)
-            .map(|a| a.iter().filter_map(Value::as_str).collect::<Vec<_>>())
-            .unwrap_or_default()
-        {
-            if !object.contains_key(required) {
-                return Err(err(&format!("missing required field {required:?}")));
-            }
-        }
-
-        if let Some(enum_values) = schema.get("enum").and_then(Value::as_array)
-            && !enum_values.contains(input)
-        {
-            return Err(err("value is not one of the enum options"));
-        }
-
-        let Some(properties) = schema.get("properties").and_then(Value::as_object) else {
-            return Ok(());
-        };
-
-        for (key, field_schema) in properties {
-            if let Some(value) = object.get(key) {
-                let leaf_type = field_schema.get("type").and_then(Value::as_str);
-                match leaf_type {
-                    Some("string") | Some("number") | Some("boolean") => {
-                        // Leaf check: only type compatibility, no recursion.
-                        let ok = match leaf_type {
-                            Some("string") => value.is_string(),
-                            Some("number") => value.is_number(),
-                            _ => value.is_boolean(),
-                        };
-                        if !ok {
-                            return Err(err(&format!("field {key:?} has the wrong JSON type")));
-                        }
-                    }
-                    Some("object") => {
-                        check(field_schema, value, &format!("{path}.{key}"), false)?;
-                    }
-                    Some("array") => {
-                        let items = field_schema
-                            .get("items")
-                            .ok_or_else(|| err("array schema missing supported \"items\""))?;
-                        let Some(list) = value.as_array() else {
-                            return Err(err(&format!("field {key:?} is not an array")));
-                        };
-                        for (i, item) in list.iter().enumerate() {
-                            check(items, item, &format!("{path}.{key}[{i}]"), false)?;
-                        }
-                    }
-                    other => {
-                        return Err(err(&format!(
-                            "unsupported schema type {}",
-                            other.unwrap_or("<missing>")
-                        )));
-                    }
-                }
-            }
-        }
-
-        Ok(())
-    }
-
-    check(schema, input, "$", true)
+    validate_schema_supported(schema)?;
+    check(schema, input, "$")
 }
 
 fn terms(text: &str) -> Vec<String> {
@@ -633,5 +593,28 @@ mod tests {
         let candidates = registry.top_k_candidates("email", "send", 5);
 
         assert_eq!(candidates[0].side_effect, SideEffect::NonIdempotentWrite);
+    }
+
+    #[test]
+    fn command_arrays_validate_items_and_nested_enums() {
+        let schema = serde_json::json!({"type":"object", "properties":{
+            "args":{"type":"array", "items":{"type":"string"}},
+            "modes":{"type":"array", "items":{"type":"object", "properties":{
+                "mode":{"type":"string", "enum":["read", "write"]}}, "required":["mode"]}}
+        }});
+        validate_schema_supported(&schema).unwrap();
+        validate_arguments(
+            &schema,
+            &serde_json::json!({"args":["-c", "echo hello"], "modes":[{"mode":"read"}]}),
+        )
+        .unwrap();
+        for input in [
+            serde_json::json!({"args":[1]}),
+            serde_json::json!({"args":"hello"}),
+            serde_json::json!({"modes":[{"mode":"delete"}]}),
+            serde_json::json!({"modes":[{}]}),
+        ] {
+            assert!(validate_arguments(&schema, &input).is_err(), "{input}");
+        }
     }
 }

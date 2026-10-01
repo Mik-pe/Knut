@@ -25,7 +25,6 @@ use tokio::sync::mpsc::{UnboundedReceiver, UnboundedSender};
 use crate::decision::{Action, Decision, ModelTier, Risk, Route};
 use crate::error::KnutError;
 use crate::session::{SessionCommand, SessionEvent, SessionRuntime, TaskState};
-use crate::system_one::StaticSystemOne;
 use crate::{
     CheckProfile, CheckRunner, ComputeCascade, ExecutionGate, JevSystemOne, Knut, Planner,
     SideEffectPolicy, Supervisor, SystemZero, ToolRegistry, TypeSafeConfig, Workspace,
@@ -47,6 +46,8 @@ pub struct EngineReport {
     pub checks: Vec<String>,
     /// Why live tasks are unavailable, when they are.
     pub unavailable: Option<String>,
+    /// A configuration problem with the optional decision model.
+    pub routing_warning: Option<String>,
 }
 impl EngineReport {
     /// A one-line label for the header.
@@ -85,6 +86,7 @@ pub fn build_here() -> (Engine, EngineReport) {
                 tools: Vec::new(),
                 checks: Vec::new(),
                 unavailable: Some(format!("workspace unavailable: {err}")),
+                routing_warning: None,
             },
         ),
     }
@@ -166,12 +168,17 @@ pub fn build_with_write_approval(
         tools: Vec::new(),
         checks: Vec::new(),
         unavailable: None,
+        routing_warning: None,
     };
 
     // Tools are the real bounded read/search/write set for this workspace.
     let mut registry = ToolRegistry::default();
     if let Err(err) = register_workspace_tools(&mut registry, workspace.clone()) {
         report.unavailable = Some(format!("workspace tools unavailable: {err}"));
+    }
+    let supervisor = Arc::new(Supervisor::new(workspace.clone()));
+    if let Err(error) = crate::register_command_tools(&mut registry, supervisor.clone()) {
+        report.unavailable = Some(format!("command tools unavailable: {error}"));
     }
     report.tools = registry.capabilities();
     let profile = CheckProfile::for_workspace(&workspace);
@@ -230,16 +237,17 @@ pub fn build_with_write_approval(
 
     // The gate: the shell is interactive, so a write asks rather than
     // assuming consent. Pre-approving writes belongs to scripted runs.
-    let policy = SideEffectPolicy::new().allow(crate::SideEffect::ReadOnly);
+    let policy = SideEffectPolicy::new()
+        .allow(crate::SideEffect::ReadOnly)
+        .require_approval(crate::SideEffect::NonIdempotentWrite);
     let gate = Arc::new(ExecutionGate::new(if approve_writes {
         policy.allow(crate::SideEffect::IdempotentWrite)
     } else {
         policy.require_approval(crate::SideEffect::IdempotentWrite)
     }));
 
-    // Routing: a live System One when a key is configured, otherwise the
-    // deterministic router. A prompt that asks about the workspace must be
-    // able to reach the workspace tools, and only a real router knows how.
+    // The optional router selects bounded routes; without it, System Zero
+    // delegates tool selection to the validated reasoner plan.
     let jev = match std::env::var("TYPESAFE_API_KEY") {
         Ok(_) => match TypeSafeConfig::from_env()
             .ok()
@@ -252,9 +260,10 @@ pub fn build_with_write_approval(
             // A key that is present but unusable is reported rather than
             // quietly ignored: the deterministic path still runs.
             None => {
-                report
-                    .unavailable
-                    .get_or_insert_with(|| "TYPESAFE_API_KEY is set but unusable".to_owned());
+                report.routing_warning = Some(
+                    "decision model configuration is unusable; the reasoner will plan directly"
+                        .to_owned(),
+                );
                 None
             }
         },
@@ -262,9 +271,8 @@ pub fn build_with_write_approval(
     };
     let jev = jev.map(Arc::new);
     let frames = jev.clone();
-    let router = Arc::new(Knut::new(LiveRouter::new(jev)).with_system_zero(SystemZero::empty()));
+    let router = Arc::new(session_router(jev));
 
-    let supervisor = Arc::new(Supervisor::new(workspace.clone()));
     let checks = profile
         .ok()
         .map(|profile| Arc::new(CheckRunner::new(workspace.clone(), supervisor, profile)));
@@ -301,30 +309,14 @@ pub fn build_with_write_approval(
 
 /// The router the shell runs on.
 ///
-/// A live System One (Jev) is used when it is configured, because routing
-/// is the one decision the harness must not invent: a prompt asking about
-/// the workspace should reach the workspace tools, not a text-only
-/// generation. Without a key the deterministic router below is used, and
-/// its limits are reported rather than papered over.
+/// The optional bounded-model ingress adapter.
 pub struct LiveRouter {
     live: Option<Arc<JevSystemOne>>,
-    fallback: StaticSystemOne,
 }
 
 impl LiveRouter {
     fn new(live: Option<Arc<JevSystemOne>>) -> Self {
-        Self {
-            live,
-            fallback: StaticSystemOne::new(Decision {
-                route: Route::Act,
-                confidence: 0.9,
-                retrieval: None,
-                capability: Some("files".to_owned()),
-                model_tier: ModelTier::Reasoner,
-                risk: Risk::Low,
-                parallelizable: false,
-            }),
-        }
+        Self { live }
     }
 }
 
@@ -336,15 +328,44 @@ impl crate::SystemOne for LiveRouter {
             // different decision: the failure is surfaced so the task
             // reports it.
             Some(live) => live.decide(input).await,
-            None => self.fallback.decide(input).await,
+            None => Err(KnutError::SystemOne(
+                "decision model is not configured".to_owned(),
+            )),
         }
     }
 }
 
-/// The deterministic router for an offline shell: no System 0 shortcuts,
-/// one confident generation decision.
-fn deterministic_router() -> Knut<LiveRouter> {
-    Knut::new(LiveRouter::new(None)).with_system_zero(SystemZero::empty())
+/// Deterministic ingress delegates open-ended tasks to reasoner planning.
+pub(crate) fn deterministic_router() -> Knut<LiveRouter> {
+    session_router(None)
+}
+
+fn session_router(live: Option<Arc<JevSystemOne>>) -> Knut<LiveRouter> {
+    let mut rules = SystemZero::with_default_rules();
+    if live.is_none() {
+        rules = rules.with_rule(ReasonerPlanRule);
+    }
+    Knut::new(LiveRouter::new(live)).with_system_zero(rules)
+}
+
+struct ReasonerPlanRule;
+
+impl crate::SystemZeroRule for ReasonerPlanRule {
+    fn name(&self) -> &str {
+        "reasoner-plan"
+    }
+
+    fn evaluate(&self, _input: &crate::DecisionInput) -> crate::RuleVerdict {
+        crate::RuleVerdict::Decide(Decision {
+            route: Route::Plan,
+            confidence: 1.0,
+            retrieval: None,
+            capability: None,
+            model_tier: ModelTier::Reasoner,
+            risk: Risk::Low,
+            parallelizable: false,
+        })
+    }
 }
 
 /// The driver's handle on the runtime, plus the bookkeeping needed to
@@ -575,6 +596,7 @@ fn describe(command: &SessionCommand) -> &'static str {
 /// A short label for a routed action, for the status line and timeline.
 pub fn action_label(action: &Action) -> String {
     match action {
+        Action::Plan => "plan·reasoner".to_owned(),
         Action::Generate(tier) => match tier {
             ModelTier::Fast => "generate·fast".to_owned(),
             ModelTier::Standard => "generate·standard".to_owned(),
@@ -599,6 +621,26 @@ pub fn source_label(source: crate::DecisionSource) -> &'static str {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[tokio::test]
+    async fn no_decision_model_routes_to_planning_as_system_zero() {
+        let router = deterministic_router();
+        for capabilities in [vec![], vec!["files".to_owned(), "shell".to_owned()]] {
+            let routed = router
+                .route(&crate::DecisionInput::new("fix the build", capabilities))
+                .await
+                .unwrap();
+            assert_eq!(routed.action, Action::Plan);
+            assert_eq!(routed.source, crate::DecisionSource::SystemZero);
+            assert_eq!(routed.decision.capability, None);
+        }
+        assert!(
+            router
+                .route(&crate::DecisionInput::new(" ", vec![]))
+                .await
+                .is_err()
+        );
+    }
 
     fn fixture_workspace() -> (Workspace, std::path::PathBuf) {
         let root = std::env::temp_dir().join(format!(
@@ -689,6 +731,7 @@ mod tests {
         let _ = std::fs::remove_dir_all(root);
 
         assert!(report.tools.contains(&"files".to_owned()));
+        assert!(report.tools.contains(&"shell".to_owned()));
         assert!(report.checks.contains(&"build".to_owned()));
         assert!(report.checks.contains(&"test".to_owned()));
     }
@@ -976,20 +1019,27 @@ mod tests {
     #[tokio::test]
     async fn live_stream_reaches_client_and_cancel_interrupts_stalled_provider() {
         let cascade = Arc::new(ComputeCascade::empty().with_reasoner(StalledStream));
-        let router = LiveRouter {
-            live: None,
-            fallback: StaticSystemOne::new(Decision {
-                route: Route::Generate,
-                confidence: 1.0,
-                retrieval: None,
-                capability: None,
-                model_tier: ModelTier::Reasoner,
-                risk: Risk::Low,
-                parallelizable: false,
-            }),
-        };
+        struct GenerateRule;
+        impl crate::SystemZeroRule for GenerateRule {
+            fn name(&self) -> &str {
+                "test-generation"
+            }
+            fn evaluate(&self, _: &crate::DecisionInput) -> crate::RuleVerdict {
+                crate::RuleVerdict::Decide(Decision {
+                    route: Route::Generate,
+                    confidence: 1.0,
+                    retrieval: None,
+                    capability: None,
+                    model_tier: ModelTier::Reasoner,
+                    risk: Risk::Low,
+                    parallelizable: false,
+                })
+            }
+        }
+        let router = Knut::new(LiveRouter::new(None))
+            .with_system_zero(SystemZero::empty().with_rule(GenerateRule));
         let runtime = SessionRuntime::new(
-            Arc::new(Knut::new(router)),
+            Arc::new(router),
             Planner::new(cascade.clone()),
             Arc::new(ToolRegistry::default()),
             Arc::new(ExecutionGate::new(SideEffectPolicy::new())),
