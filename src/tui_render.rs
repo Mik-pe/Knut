@@ -500,7 +500,7 @@ fn render_welcome(frame: &mut Frame, state: &WorkbenchState, area: Rect, theme: 
     };
     if state.model.is_none() {
         lines.push(Line::from(Span::styled(
-            "  / account  >  Continue with ChatGPT",
+            "  F2 settings  >  Continue with ChatGPT",
             theme.accent(),
         )));
     }
@@ -537,6 +537,7 @@ fn render_connection(
 ) {
     use crate::connection::ConnectionPage;
     let title = match connection.page {
+        ConnectionPage::Settings => " Settings ",
         ConnectionPage::Account => " ChatGPT account ",
         ConnectionPage::Models => " Choose a model ",
         ConnectionPage::Welcome => " You're using your ChatGPT plan ",
@@ -1143,9 +1144,9 @@ fn render_footer(frame: &mut Frame, state: &WorkbenchState, area: Rect, theme: &
     } else if !state.follow {
         " PgUp/PgDn scroll   Esc latest   type to compose"
     } else if area.width < 70 {
-        " Enter send   / commands   ? shortcuts"
+        " Enter send   F2 settings   / commands"
     } else {
-        " Enter send   Shift+Enter newline   / commands   ? shortcuts"
+        " Enter send   Shift+Enter newline   F2 settings   / commands"
     };
     let detail = state.status.clone().unwrap_or_else(|| {
         if state.task_state.is_some_and(|s| !s.is_terminal()) {
@@ -1398,6 +1399,7 @@ fn render_palette(frame: &mut Frame, state: &WorkbenchState, area: Rect, theme: 
 
 fn render_help(frame: &mut Frame, state: &WorkbenchState, area: Rect, theme: &Theme) {
     let mut lines = vec![
+        " F2             Settings",
         " Enter          Send message",
         " Shift+Enter    Newline (Ctrl+J fallback)",
         " Ctrl+P /       Commands",
@@ -2072,6 +2074,7 @@ mod tests {
         for level in [ColorLevel::TrueColor, ColorLevel::Mono] {
             for (width, height) in [(60, 18), (80, 24), (140, 40)] {
                 for page in [
+                    ConnectionPage::Settings,
                     ConnectionPage::Account,
                     ConnectionPage::Welcome,
                     ConnectionPage::Models,
@@ -2082,7 +2085,14 @@ mod tests {
                     } else {
                         0
                     };
-                    state.connection = Some(connection.clone());
+                    state.connection = Some(if page == ConnectionPage::Settings {
+                        let mut settings = ConnectionPanel::settings(false, None);
+                        settings.accounts.clear();
+                        settings.error = None;
+                        settings
+                    } else {
+                        connection.clone()
+                    });
                     let text = snapshot_themed(
                         &state,
                         width,
@@ -2091,7 +2101,9 @@ mod tests {
                         &Theme::for_level(level),
                     );
                     let expected = match page {
-                        ConnectionPage::Account => "Continue with ChatGPT",
+                        ConnectionPage::Settings | ConnectionPage::Account => {
+                            "Continue with ChatGPT"
+                        }
                         ConnectionPage::Welcome => "Got it",
                         ConnectionPage::Models => "model-29",
                     };

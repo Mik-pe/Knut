@@ -72,8 +72,9 @@ Use the same runtime and approval gate in every view.
   support full logs, long diffs, and scroll position preservation as work arrives.
 - [ ] Add word navigation/deletion and an external-editor shortcut. Keep paste
   as one undo operation and surface truncation immediately.
-- [x] ChatGPT setup opens consent in the system browser, validates OAuth,
-  chooses account-visible models, saves the choice, and exposes usage recovery.
+- [x] F2 Settings opens ChatGPT consent in the system browser, validates OAuth,
+  chooses account-visible models, saves the choice ahead of environment defaults,
+  and exposes usage recovery.
   Model access is confirmed by real inference; API-key setup still uses env.
 - [ ] Make help and keyboard hints adapt to very short terminals; ensure every
   command remains discoverable without memorizing modifier keys.

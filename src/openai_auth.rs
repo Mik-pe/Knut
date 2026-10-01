@@ -774,6 +774,12 @@ pub(crate) fn saved_model() -> Result<Option<String>, KnutError> {
     Ok(Store::configured()?.read()?.preferred_model)
 }
 
+pub(crate) async fn use_environment() -> Result<(), KnutError> {
+    let mut store = lock_store().await?;
+    store.accounts.preferred_model = None;
+    store.save()
+}
+
 pub(crate) fn needs_plan_notice() -> Result<bool, KnutError> {
     Ok(!Store::configured()?.read()?.plan_notice_seen)
 }

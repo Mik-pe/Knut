@@ -101,11 +101,13 @@ export KNUT_PROVIDER_MODEL=gpt-6.1-sol
 ./target/release/knut tui
 ```
 
-For your ChatGPT plan, open `knut tui`, type `/`, search `account`, and choose
+For your ChatGPT plan, start `knut`, press **F2** (or `/ settings`), and choose
 **Continue with ChatGPT**. Complete consent in your browser, then choose a model
 from your account's catalog. The connection activates immediately; the model
-choice is saved for the next start. An explicit `KNUT_PROVIDER` overrides that
-saved choice at startup. Escape cancels browser sign-in and preserves your draft.
+choice is saved for the next start and takes priority over environment
+configuration, so no launch arguments or exports are needed. Settings also has
+**Use environment configuration** to switch back explicitly; this keeps the
+account signed in. Escape cancels browser sign-in and preserves your draft.
 Connection changes require an idle session, including when a task is awaiting
 approval. The account screen also switches accounts, adds another account,
 signs out, and opens **Manage usage**. A plan limit exposes `Ctrl+U` to open usage.

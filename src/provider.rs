@@ -221,15 +221,18 @@ impl ProviderConfig {
 
     /// Build from the environment.
     ///
-    /// `KNUT_PROVIDER` selects the credential source and transport. OpenAI
+    /// A saved ChatGPT setting takes priority over environment configuration.
+    /// Otherwise `KNUT_PROVIDER` selects the credential source and transport. OpenAI
     /// API credentials come from `OPENAI_API_KEY` or `KNUT_PROVIDER_API_KEY`;
     /// `openai-codex` uses the selected protected ChatGPT registration.
     pub fn from_env() -> Result<Self, KnutError> {
-        if std::env::var_os("KNUT_PROVIDER").is_none()
-            && let Some(model) = crate::openai_auth::saved_model()?
-        {
+        if let Some(model) = crate::openai_auth::saved_model()? {
             return Self::chatgpt(model);
         }
+        Self::from_environment()
+    }
+
+    pub(crate) fn from_environment() -> Result<Self, KnutError> {
         Self::from_settings(|key| std::env::var(key).ok())
     }
 

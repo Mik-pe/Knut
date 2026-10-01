@@ -248,6 +248,12 @@ pub fn command_catalog() -> Vec<PaletteCommand> {
             ),
         },
         PaletteCommand {
+            id: "settings",
+            title: "Settings",
+            description: "Save your connection and model without launch arguments · F2",
+            availability: CommandAvailability::Available,
+        },
+        PaletteCommand {
             id: "account",
             title: "ChatGPT account",
             description: "Continue with ChatGPT, choose a model or sign out",

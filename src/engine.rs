@@ -209,7 +209,7 @@ pub fn build_with_write_approval(
         }
         _ => {
             report.unavailable = Some(format!(
-                "reasoner unavailable: {}. Choose KNUT_PROVIDER and configure its API key or run `knut login openai-codex`, then restart",
+                "reasoner unavailable: {}. Open Settings (F2) to continue with ChatGPT and choose a model, or configure an API provider",
                 provider_error.unwrap_or_else(|| "adapter could not be built".to_owned())
             ));
         }
@@ -378,6 +378,7 @@ fn provider_cascade(config: &crate::ProviderConfig) -> Result<ComputeCascade, Kn
 pub enum ConnectionChange {
     CheckIdle,
     Use(Option<crate::ProviderConfig>),
+    Environment(crate::ProviderConfig),
 }
 
 pub struct ConnectionRequest {
@@ -587,13 +588,19 @@ pub async fn run_engine_with_connections(
                             if !commands.is_empty() || engine.task_state().is_some_and(|state| !state.is_terminal()) {
                                 return Err(KnutError::Model("Finish or cancel the current task before changing the connection".to_owned()));
                             }
-                            let ConnectionChange::Use(config) = &request.change else { return Ok(()); };
+                            let (config, environment) = match &request.change {
+                                ConnectionChange::CheckIdle => return Ok(()),
+                                ConnectionChange::Use(config) => (config.as_ref(), false),
+                                ConnectionChange::Environment(config) => (Some(config), true),
+                            };
                             let cascade = Arc::new(match config {
                                 Some(config) => provider_cascade(config)?,
                                 None => ComputeCascade::empty(),
                             });
                             let planner = Planner::new(cascade.clone());
-                            if let Some(config) = config && let Some(client_id) = config.chatgpt_client() {
+                            if environment {
+                                crate::openai_auth::use_environment().await?;
+                            } else if let Some(config) = config && let Some(client_id) = config.chatgpt_client() {
                                 crate::openai_auth::save_model(config.model(), client_id).await?;
                             }
                             engine.runtime.replace_models(planner, cascade)

@@ -70,9 +70,12 @@ pub fn handle_key(state: &mut WorkbenchState, key: KeyEvent, tab: &mut Tab) -> S
                     ShellAction::Continue
                 };
             }
-            if panel.page == ConnectionPage::Models {
-                panel.page = ConnectionPage::Account;
+            if panel.page != panel.home && panel.page != ConnectionPage::Welcome {
+                panel.page = panel.home;
                 panel.selection = 0;
+                panel.status =
+                    "Choose your connection and model. Changes are saved for the next start."
+                        .to_owned();
             } else {
                 state.connection = None;
             }
@@ -165,6 +168,9 @@ pub fn handle_key(state: &mut WorkbenchState, key: KeyEvent, tab: &mut Tab) -> S
             }
             _ => ShellAction::Continue,
         };
+    }
+    if key.code == KeyCode::F(2) {
+        return ShellAction::PaletteCommand("settings");
     }
     if key.code == KeyCode::F(1)
         || (key.code == KeyCode::Char('?')
@@ -688,6 +694,12 @@ pub async fn run_shell(
                         ShellAction::PaletteCommand("cancel") => {
                             let _ = commands.send(SessionCommand::Cancel);
                         }
+                        ShellAction::PaletteCommand("settings") => {
+                            state.connection = Some(ConnectionPanel::settings(
+                                state.chatgpt_plan,
+                                state.model.as_deref(),
+                            ));
+                        }
                         ShellAction::PaletteCommand("account" | "model") => {
                             state.connection = Some(ConnectionPanel::open());
                         }
@@ -817,6 +829,13 @@ fn start_connection(
     if panel.busy {
         return;
     }
+    if action == ConnectionAction::OpenAccount {
+        panel.page = ConnectionPage::Account;
+        panel.selection = 0;
+        panel.status = "Connect your ChatGPT plan to Knut's coding harness.".to_owned();
+        panel.error = None;
+        return;
+    }
     if state.task_state.is_some_and(|state| !state.is_terminal())
         && action != ConnectionAction::ManageUsage
     {
@@ -842,6 +861,8 @@ fn start_connection(
         ConnectionAction::Logout => "Signing out…",
         ConnectionAction::ManageUsage => "Opening ChatGPT usage…",
         ConnectionAction::Acknowledge => "Saving…",
+        ConnectionAction::Environment => "Saving environment configuration…",
+        ConnectionAction::OpenAccount => unreachable!("navigation was handled above"),
     }
     .to_owned();
     let connections = connections.clone();
@@ -885,10 +906,15 @@ fn finish_connection(
             panel.error = error;
             panel.status = "Choose a model. Access is checked when a task runs.".to_owned();
         }
-        Ok(ConnectionOutcome::Connected { model, account }) => {
+        Ok(ConnectionOutcome::Connected {
+            model,
+            endpoint,
+            plan,
+            account,
+        }) => {
             state.model = Some(model);
-            state.endpoint = Some("api.openai.com".to_owned());
-            state.chatgpt_plan = true;
+            state.endpoint = Some(endpoint);
+            state.chatgpt_plan = plan;
             state.usage_limit = false;
             state.account = account;
             state.unavailable = if state.checks == 0 {
@@ -896,7 +922,14 @@ fn finish_connection(
             } else {
                 None
             };
-            state.status = Some("Using ChatGPT plan · / account or / usage".to_owned());
+            state.status = Some(
+                if plan {
+                    "Using ChatGPT plan · F2 settings"
+                } else {
+                    "Using environment configuration · F2 settings"
+                }
+                .to_owned(),
+            );
             state.connection = None;
         }
         Ok(ConnectionOutcome::LoggedOut(revoked)) => {
@@ -1363,5 +1396,37 @@ mod tests {
         state.connection = Some(ConnectionPanel::open());
         finish_connection(&mut state, Ok(ConnectionOutcome::LoggedOut(true)));
         assert_eq!(state.model.as_deref(), Some("api-model"));
+    }
+    #[test]
+    fn settings_are_discoverable_and_account_navigation_returns_to_settings() {
+        let mut state = WorkbenchState::new("/tmp/ws");
+        state.composer.paste("keep this draft");
+        let mut tab = Tab::Timeline;
+        assert_eq!(
+            handle_key(&mut state, key(KeyCode::F(2)), &mut tab),
+            ShellAction::PaletteCommand("settings")
+        );
+        state.connection = Some(ConnectionPanel::settings(false, None));
+        let (connections, _) = tokio::sync::mpsc::unbounded_channel();
+        let mut job = None;
+        start_connection(
+            &mut state,
+            ConnectionAction::OpenAccount,
+            &connections,
+            &mut job,
+        );
+        assert!(job.is_none());
+        assert_eq!(
+            state.connection.as_ref().unwrap().page,
+            ConnectionPage::Account
+        );
+        handle_key(&mut state, key(KeyCode::Esc), &mut tab);
+        assert_eq!(
+            state.connection.as_ref().unwrap().page,
+            ConnectionPage::Settings
+        );
+        handle_key(&mut state, key(KeyCode::Esc), &mut tab);
+        assert!(state.connection.is_none());
+        assert_eq!(state.composer_text(), "keep this draft");
     }
 }

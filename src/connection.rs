@@ -10,10 +10,13 @@ pub enum ConnectionAction {
     Logout,
     ManageUsage,
     Acknowledge,
+    OpenAccount,
+    Environment,
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub(crate) enum ConnectionPage {
+    Settings,
     Account,
     Models,
     Welcome,
@@ -30,6 +33,7 @@ pub(crate) struct ConnectionPanel {
     pub status: String,
     pub error: Option<String>,
     pub return_to_conversation: bool,
+    pub home: ConnectionPage,
 }
 
 impl ConnectionPanel {
@@ -45,11 +49,55 @@ impl ConnectionPanel {
             status: "Connect your ChatGPT plan to Knut's coding harness.".to_owned(),
             error: accounts.err().map(|error| error.to_string()),
             return_to_conversation: false,
+            home: ConnectionPage::Account,
         }
+    }
+
+    pub fn settings(using_plan: bool, model: Option<&str>) -> Self {
+        let mut panel = Self::open();
+        panel.page = ConnectionPage::Settings;
+        panel.home = ConnectionPage::Settings;
+        panel.status = format!(
+            "Connection: {}. Model: {}. Changes are saved for the next start.",
+            if using_plan {
+                "ChatGPT plan"
+            } else {
+                "environment configuration"
+            },
+            model.unwrap_or("not connected")
+        );
+        panel
     }
 
     pub fn choices(&self) -> Vec<(String, ConnectionAction)> {
         match self.page {
+            ConnectionPage::Settings => {
+                let mut choices = vec![if self
+                    .accounts
+                    .iter()
+                    .any(|account| account.active && account.signed_in)
+                {
+                    (
+                        "Use ChatGPT plan / choose model".to_owned(),
+                        ConnectionAction::Models,
+                    )
+                } else {
+                    (
+                        "Continue with ChatGPT".to_owned(),
+                        ConnectionAction::Login(false),
+                    )
+                }];
+                choices.push((
+                    "Manage ChatGPT account".to_owned(),
+                    ConnectionAction::OpenAccount,
+                ));
+                choices.push((
+                    "Use environment configuration".to_owned(),
+                    ConnectionAction::Environment,
+                ));
+                choices.push(("Manage usage".to_owned(), ConnectionAction::ManageUsage));
+                choices
+            }
             ConnectionPage::Welcome => vec![("Got it".to_owned(), ConnectionAction::Acknowledge)],
             ConnectionPage::Models => {
                 let mut choices: Vec<_> = self
@@ -111,6 +159,8 @@ pub(crate) enum ConnectionOutcome {
     },
     Connected {
         model: String,
+        endpoint: String,
+        plan: bool,
         account: Option<String>,
     },
     LoggedOut(bool),
@@ -179,8 +229,31 @@ pub(crate) async fn execute(
             let config = ProviderConfig::chatgpt(model.clone())?;
             let account = config.chatgpt_client().and_then(account_label);
             update_engine(&connections, ConnectionChange::Use(Some(config))).await?;
-            Ok(ConnectionOutcome::Connected { model, account })
+            Ok(ConnectionOutcome::Connected {
+                model,
+                endpoint: "api.openai.com".to_owned(),
+                plan: true,
+                account,
+            })
         }
+        ConnectionAction::Environment => {
+            let config = ProviderConfig::from_environment()?;
+            let model = config.model().to_owned();
+            let endpoint = reqwest::Url::parse(config.base_url())
+                .ok()
+                .and_then(|url| url.host_str().map(str::to_owned))
+                .unwrap_or_default();
+            let plan = config.uses_chatgpt_plan();
+            let account = config.chatgpt_client().and_then(account_label);
+            update_engine(&connections, ConnectionChange::Environment(config)).await?;
+            Ok(ConnectionOutcome::Connected {
+                model,
+                endpoint,
+                plan,
+                account,
+            })
+        }
+        ConnectionAction::OpenAccount => unreachable!("navigation is handled by the shell"),
         ConnectionAction::Logout => {
             let revoked = openai_auth::logout().await?;
             if using_plan {

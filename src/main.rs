@@ -249,7 +249,8 @@ Playground backends (--backend):
   jev                live TypeSafe System One API; reads TYPESAFE_API_KEY,
                      optional TYPESAFE_BASE_URL / TYPESAFE_MODEL
 
-Reasoner provider (knut doctor, and KNUT_PROVIDER_* env):
+Connection and model: F2 Settings in the TUI; saved choices take priority.
+Environment provider configuration (knut doctor, and KNUT_PROVIDER_* env):
   KNUT_PROVIDER           zai (default) | openai | openai-codex | chat-completions
   KNUT_PROVIDER_API_KEY   API credential; OPENAI_API_KEY / ZAI_API_KEY also accepted
   KNUT_PROVIDER_BASE_URL  default https://api.z.ai/api/coding/paas/v4
@@ -1461,7 +1462,7 @@ async fn openai_account_command(command: &str, args: &[String]) -> Result<(), Kn
         {
             let account = knut::openai_auth::login(args.len() == 2).await?;
             println!(
-                "Signed in: {account}\nUse KNUT_PROVIDER=openai-codex to run with your ChatGPT plan."
+                "Signed in: {account}\nOpen knut and press F2 to choose and save your ChatGPT model."
             );
         }
         "logout" if args.len() == 1 && args[0] == "openai-codex" => {
