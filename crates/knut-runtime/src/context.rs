@@ -1,20 +1,5 @@
-//! Role-specific context projections (issue #32).
-//!
-//! Jev should see exactly the decision evidence it needs, bounded; the
-//! reasoner must not lose the code, constraints or diagnostics it needs
-//! for correctness. Both are *projections of the same revisioned
-//! artifacts*, so a projection never becomes the only copy of anything.
-//!
-//! Rules carried through the implementation:
-//! - a lossy summary is never the only copy: originals stay in the
-//!   artifact store and every projection records what it dropped;
-//! - selection and truncation are deterministic, with explicit limits;
-//! - token budgets distinguish *estimated* from *measured* usage, and an
-//!   oversized request is caught before it fails repeatedly;
-//! - a provider-required reasoning block is never trimmed to fit: the
-//!   context is reset at a supported boundary and that choice is visible;
-//! - a changed file cannot be presented as current from a cached excerpt
-//!   (projections carry revision identities and re-check them).
+//! Lossy projections retain revisioned originals. Provider-required reasoning
+//! is preserved verbatim; exceeding its budget requires a context reset.
 
 use std::collections::BTreeMap;
 

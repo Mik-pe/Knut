@@ -1,11 +1,3 @@
-//! Rendering for the workbench shell.
-//!
-//! Pure functions over [`WorkbenchState`]: given state and a frame area,
-//! produce widgets. No state mutation, no I/O, no terminal control beyond
-//! the frame it is handed — so every layout can be snapshot-tested with
-//! `TestBackend` at any size.
-//!
-
 use ratatui::Frame;
 use ratatui::layout::{Constraint, Layout, Rect};
 use ratatui::style::{Modifier, Style};
@@ -14,7 +6,6 @@ use ratatui::widgets::{Block, BorderType, Borders, Clear, Paragraph, Wrap};
 use unicode_segmentation::UnicodeSegmentation;
 use unicode_width::UnicodeWidthStr;
 
-use crate::attach::CommandAvailability;
 use crate::review::MAX_HUNK_LINES;
 use crate::session::TaskState;
 use crate::theme::Theme;
@@ -128,6 +119,18 @@ pub fn render_themed(frame: &mut Frame, state: &WorkbenchState, tab: Tab, theme:
         );
         return;
     }
+    if state.review_open
+        && let Some(review) = &state.review
+    {
+        render_review_themed(frame, review, theme);
+        if state.help {
+            render_help(frame, state, area, theme);
+        } else if state.palette_open() {
+            render_palette(frame, state, area, theme);
+        }
+        return;
+    }
+
     let mut body = plan.timeline;
     if let Some(pending) = &state.pending
         && !state.approval_open
@@ -157,16 +160,6 @@ pub fn render_themed(frame: &mut Frame, state: &WorkbenchState, tab: Tab, theme:
     render_composer(frame, state, plan.composer, theme);
     render_footer(frame, state, plan.footer, theme);
 
-    // The review workspace replaces the workbench while it is open: a diff
-    // needs the room, and review is the point of the view.
-    if let Some(review) = &state.review {
-        render_review_themed(frame, review, theme);
-        if state.help {
-            render_help(frame, state, area, theme);
-        }
-        return;
-    }
-
     if state.help {
         render_help(frame, state, area, theme);
     }
@@ -180,7 +173,7 @@ pub fn render_themed(frame: &mut Frame, state: &WorkbenchState, tab: Tab, theme:
     // is mapped through the same wrapping the composer drew with, so the
     // caret stays on the character it will edit even in a long line.
     if state.focus == Focus::Composer
-        && state.review.is_none()
+        && !state.review_open
         && !state.help
         && !state.palette_open()
         && plan.composer.width > 6
@@ -1043,7 +1036,6 @@ fn render_inspector(frame: &mut Frame, state: &WorkbenchState, area: Rect, theme
         width,
         theme,
     ));
-    lines.push(field("mode", &state.mode, width, theme));
     lines.push(field("reasoner", &state.reasoner_label(), width, theme));
     if let Some(endpoint) = &state.endpoint {
         lines.push(field("endpoint", endpoint, width, theme));
@@ -1087,9 +1079,6 @@ fn render_inspector(frame: &mut Frame, state: &WorkbenchState, area: Rect, theme
         width,
         theme,
     ));
-    if state.model_calls > 0 {
-        lines.push(field("calls", &state.model_calls.to_string(), width, theme));
-    }
     if state.stats.dropped > 0 {
         lines.push(field(
             "dropped",
@@ -1540,8 +1529,6 @@ fn render_review_checks(
     );
 }
 
-/// The decision inspector overlay.
-/// The command palette: every entry states whether it exists.
 fn render_palette(frame: &mut Frame, state: &WorkbenchState, area: Rect, theme: &Theme) {
     let width = area.width.saturating_sub(4).min(80);
     let results = state.palette_results();
@@ -1566,21 +1553,15 @@ fn render_palette(frame: &mut Frame, state: &WorkbenchState, area: Rect, theme: 
                 .text()
                 .patch(theme.bg(theme.palette.bg_sel))
                 .add_modifier(Modifier::BOLD)
-        } else if command.is_available() {
-            theme.text()
         } else {
-            theme.faint()
-        };
-        let detail = match command.availability {
-            CommandAvailability::Available => command.title,
-            CommandAvailability::Unavailable(_) => "not available in this session",
+            theme.text()
         };
         lines.push(Line::from(Span::styled(
             format!(
                 " {} {:<12} {}",
                 if selected { ">" } else { " " },
                 command.id,
-                detail
+                command.title
             ),
             style,
         )));
@@ -1615,7 +1596,7 @@ pub(crate) fn shortcuts(state: &WorkbenchState) -> Vec<&'static str> {
         " Ctrl+C         Stop / clear / quit",
         " Ctrl+Q         Save draft and quit when idle",
     ];
-    if state.review.is_some() {
+    if state.review_open {
         lines = vec![
             " Left / Right   Previous / next file",
             " Up / Down      Previous / next hunk",
@@ -1707,6 +1688,22 @@ mod tests {
             out.push('\n');
         }
         out
+    }
+
+    #[test]
+    fn retained_review_evidence_does_not_hide_the_composer_and_palette() {
+        let mut state = WorkbenchState::new("/workspace");
+        state.composer.insert("unfinished draft");
+        state.review = Some(crate::review::ReviewView::new(
+            crate::review::ChangeSet::empty(),
+        ));
+        assert!(snapshot(&state, 80, 24, Tab::Timeline).contains("unfinished draft"));
+        state.review_open = true;
+        let review = snapshot(&state, 80, 24, Tab::Timeline);
+        assert!(review.contains("Changes"));
+        assert!(!review.contains("unfinished draft"));
+        state.open_palette();
+        assert!(snapshot(&state, 80, 24, Tab::Timeline).contains("commands"));
     }
 
     fn populated_state() -> WorkbenchState {

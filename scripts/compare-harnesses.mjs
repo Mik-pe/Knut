@@ -4,6 +4,7 @@ import os from 'node:os';
 import crypto from 'node:crypto';
 import { spawn, spawnSync } from 'node:child_process';
 import { fileURLToPath } from 'node:url';
+import { knutBinary } from './binary.mjs';
 
 const source = path.resolve(path.dirname(fileURLToPath(import.meta.url)), '..');
 const [operation, directory, arm, effort = 'high'] = process.argv.slice(2);
@@ -71,7 +72,11 @@ async function execute(program, args, cwd, env, log, seconds) {
     try { process.kill(-child.pid, 'SIGKILL'); } catch {}
   }, seconds * 1000);
   return await new Promise((resolve, reject) => {
-    child.once('error', error => { clearTimeout(timer); fs.closeSync(fd); reject(error); });
+    child.once('error', error => {
+      clearTimeout(timer);
+      fs.closeSync(fd);
+      reject(error);
+    });
     child.once('close', (code, signal) => {
       clearTimeout(timer);
       fs.closeSync(fd);
@@ -88,6 +93,8 @@ if (operation === 'prepare') {
   fs.mkdirSync(path.join(root, 'bin'));
   const driver = fs.readFileSync(fileURLToPath(import.meta.url));
   save(path.join(root, 'comparison-driver.mjs'), driver.toString('utf8'));
+  const binaryHelper = fs.readFileSync(path.join(source, 'scripts/binary.mjs'));
+  save(path.join(root, 'binary.mjs'), binaryHelper.toString('utf8'));
   const files = command('git', ['ls-files', '--cached', '--others', '--exclude-standard', '-z']).split('\0').filter(Boolean)
     .filter(file => !/^(scripts|\.agents|reports)\//.test(file) && !/(^|\/)\.env(?:\.|$)/.test(file));
   const hash = crypto.createHash('sha256');
@@ -100,11 +107,12 @@ if (operation === 'prepare') {
     fs.mkdirSync(path.dirname(destination), { recursive: true });
     fs.copyFileSync(origin, destination);
   }
-  fs.copyFileSync(path.join(source, 'target/debug/knut'), path.join(root, 'bin/knut'));
+  fs.copyFileSync(knutBinary(), path.join(root, 'bin/knut'));
   fs.chmodSync(path.join(root, 'bin/knut'), 0o700);
   save(path.join(root, 'manifest.json'), {
     schema: 1, task: 'composer-newline-budget', prompt, snapshot_sha256: hash.digest('hex'),
     driver_sha256: crypto.createHash('sha256').update(driver).digest('hex'),
+    binary_helper_sha256: crypto.createHash('sha256').update(binaryHelper).digest('hex'),
     source_commit: command('git', ['rev-parse', 'HEAD']).trim(), source_dirty: true,
     model: 'glm-5.3-flash', endpoint: 'https://api.z.ai/api/coding/paas/v4',
     ante_version: command('ante', ['--version']).trim(),
@@ -129,13 +137,19 @@ if (operation === 'prepare') {
     env.ANTE_HOME = state;
     env.CARGO_TARGET_DIR = path.join(work, 'target');
     if (arm === 'ante') {
-      save(path.join(state, 'catalog.json'), { providers: { 'zai-coding-plan': {
-        display_name: 'Z.ai GLM Coding Plan', base_url: manifest.endpoint,
-        wire_style: 'OpenAiCompatible', thinking_display: 'detailed',
-        auth: { bearer: { env_key: 'ZAI_API_KEY' } },
-        preferred_models: [{ id: manifest.model, supported_efforts: ['low', 'high', 'max'],
-          effort, temperature: 1, top_p: 0.95, max_tokens: 131072, context_limit: 1000000, support_vision: true }],
-      } } });
+      save(path.join(state, 'catalog.json'), {
+        providers: {
+          'zai-coding-plan': {
+            display_name: 'Z.ai GLM Coding Plan', base_url: manifest.endpoint,
+            wire_style: 'OpenAiCompatible', thinking_display: 'detailed',
+            auth: { bearer: { env_key: 'ZAI_API_KEY' } },
+            preferred_models: [{
+              id: manifest.model, supported_efforts: ['low', 'high', 'max'],
+              effort, temperature: 1, top_p: 0.95, max_tokens: 131072, context_limit: 1000000, support_vision: true,
+            }],
+          },
+        },
+      });
       const catalog = JSON.parse(command('ante', ['catalog'], work, env));
       const provider = catalog.providers.find(provider => provider.id === 'zai-coding-plan');
       if (provider?.base_url !== manifest.endpoint) throw new Error('Isolated Ante endpoint did not match; refusing fallback');

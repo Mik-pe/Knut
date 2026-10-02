@@ -3,11 +3,6 @@ pub use knut_runtime::*;
 pub use knut_terminal::ConnectionAction;
 pub use knut_terminal::logo_lines;
 pub use knut_terminal::{AdapterEquivalence, replay_state};
-pub use knut_terminal::{
-    AttachError, Attachment, CommandAvailability, MAX_ATTACHMENTS, PaletteCommand,
-    attachment_payload, attachment_summary, command_catalog, extract_mentions, filter_catalog,
-    resolve_mention, resolve_mentions,
-};
 pub use knut_terminal::{ColorLevel, Glyphs, Palette, Rgb, Theme};
 pub use knut_terminal::{
     ContextInspection, DecisionInspector, DecisionProvenance, DecisionRecord, LatencyBreakdown,
@@ -20,4 +15,5 @@ pub use knut_terminal::{
 pub use knut_terminal::{
     LayoutPlan, Tab, plan_layout, render, render_review, render_review_themed, render_themed,
 };
+pub use knut_terminal::{PaletteCommand, command_catalog, filter_catalog};
 pub use knut_terminal::{ShellAction, TerminalGuard, handle_key, run_shell};

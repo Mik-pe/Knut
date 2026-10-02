@@ -1,29 +1,5 @@
-//! Trusted MCP tools through the existing capability and policy gates
-//! (issue #39).
-//!
-//! External tools from a Model Context Protocol server are imported into
-//! the same bounded capability catalog as every built-in tool. They do not
-//! get a bypass, a second policy path or an implicit permission.
-//!
-//! Pinned to protocol revision 2026-07-28 (the revision the specification
-//! resolves to), via `rmcp`, whose supported version list includes exactly
-//! that revision. Older revisions are accepted only when explicitly
-//! configured, and are reported.
-//!
-//! Rules carried through:
-//! - **trust is per server and explicit.** A repository configuration
-//!   cannot start a process until a human grants trust — never from a
-//!   README, a skill file or a tool description.
-//! - **annotations are hints, not grants.** An MCP tool that claims to be
-//!   read-only is still routed through the gate, and its declared side
-//!   effect is a *claim* the operator maps explicitly.
-//! - **schemas are validated on import.** A tool whose schema is outside
-//!   the supported subset is refused, and a changed schema invalidates the
-//!   previously imported entry.
-//! - **catalogs stay bounded.** Discovery produces bounded candidates
-//!   rather than fanning every schema into Jev and the reasoner.
-//! - **a failing server never breaks built-in tools.** Its tools disappear
-//!   and the failure is reported.
+//! The host supplies MCP transport. Imported tools use the same schema
+//! validation, capability catalog and execution gates as built-in tools.
 
 use std::collections::BTreeMap;
 
@@ -376,11 +352,8 @@ pub fn import_tools(
     let mut imported = Vec::new();
     let mut rejections = Vec::new();
 
-    if let Err(refusal) = config.may_start() {
-        let _ = refusal;
-        if !config.trusted {
-            return (imported, vec![ImportRejection::NotTrusted]);
-        }
+    if !config.trusted {
+        return (imported, vec![ImportRejection::NotTrusted]);
     }
 
     if discovered.len() > MAX_TOOLS_PER_SERVER {

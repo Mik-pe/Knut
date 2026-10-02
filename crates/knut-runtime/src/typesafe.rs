@@ -1,18 +1,5 @@
-//! TypeSafe System One HTTP adapter (Jev).
-//!
-//! Wire contract (https://docs.typesafe.ai/api, checked 2026-09-20):
-//! `POST {base}/v1/systemone` with `Authorization: Bearer <key>`, body
-//! `{ model, state, questions }`. Questions are one of three primitives:
-//! `noul` (yes/no probability), `choice` (criteria map -> choice +
-//! probabilities + confidence), `score` (criteria array -> fractional
-//! score + legend + probabilities + confidence). The response envelope is
-//! `{ model, answers: {question_id: answer}, usage }`; every answer
-//! carries a `type` matching its question. Errors: 401 auth, 422
-//! validation, 429 rate limit, 529 overloaded. No hidden retries; every
-//! failure surfaces as a typed [`SystemOneFailure`].
-//!
-//! Jev-specific wire details stay in this module: the rest of Knut sees
-//! a `SystemOne` / `JudgmentRouter` implementation.
+//! TypeSafe wire errors remain typed and are never retried implicitly.
+//! API contract: <https://docs.typesafe.ai/api>.
 
 use std::collections::BTreeMap;
 use std::time::Duration;

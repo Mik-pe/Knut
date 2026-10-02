@@ -1,10 +1,5 @@
-//! Verification-evidence contract (issue #16).
-//!
-//! `Done` is a deterministic conclusion, not a judgment: it becomes
-//! legal only when every required check has passing evidence bound to
-//! the exact artifact revision that would be shipped. Fake verifiers
-//! exercise this contract now; real compiler/test runners implement the
-//! same trait in M1.
+//! Completion requires passing evidence bound to the exact artifact revision.
+//! Stale evidence cannot satisfy a requirement.
 
 use std::collections::BTreeMap;
 
@@ -141,11 +136,6 @@ impl CompletionRequirements {
     }
 }
 
-/// A verifier of artifacts: the trait real tooling implements.
-///
-/// Deterministic fake implementations let the whole completion flow be
-/// exercised now; compilers and test runners arrive in M1 without
-/// changing this contract.
 #[async_trait::async_trait]
 pub trait ArtifactVerifier: Send + Sync {
     fn checks_for(&self, subject: &ArtifactRevision) -> Vec<String>;

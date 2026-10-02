@@ -10,7 +10,7 @@ use crate::{KnutError, Risk};
 
 /// What executing a tool does to the world.
 ///
-/// Policy (issue #10) reads this class; tools merely declare it.
+/// Tools declare effects; policy authorizes them.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord, Serialize, Deserialize)]
 #[serde(rename_all = "snake_case")]
 pub enum SideEffect {
@@ -276,17 +276,14 @@ impl ToolRegistry {
             idempotency_key.as_deref(),
             *risk,
         );
-        // Unknown identity is a policy denial (issue #14: unknown
-        // capabilities/tools are denied, not "not found" into an
-        // escalate-elsewhere path). Metadata lookup stays available for
-        // discovery; the execution route never exposes absence details.
+        // Missing identities are policy denials, so callers cannot interpret
+        // absence as permission to escalate through another execution path.
         let Ok(entry) = self.find_entry(capability, tool_id) else {
             return Err(KnutError::PolicyDenied {
                 reason: format!("tool {tool_id:?} is not available in capability {capability:?}"),
             });
         };
 
-        // Supported-schema check against the registered schema.
         validate_arguments(&entry.metadata.input_schema, input).map_err(KnutError::from)?;
 
         let authorization = gate

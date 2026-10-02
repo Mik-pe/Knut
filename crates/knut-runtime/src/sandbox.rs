@@ -1,24 +1,6 @@
-//! Supervised sandboxed commands with real cancellation and bounded
-//! output (issue #25).
-//!
-//! Running a repository's build script or test suite *is* executing
-//! repository code, so the same trust and filesystem/network rules apply
-//! as to any other effect. The sandbox is enforced by the OS
-//! (bubblewrap on Linux, Seatbelt on macOS), never
-//! by keyword filtering, and an unavailable sandbox fails visibly rather
-//! than silently degrading to unsandboxed execution.
-//!
-//! Boundaries:
-//! - executable + argv are explicit; a shell is a *separate* capability,
-//!   never an implicit implementation detail;
-//! - the parent environment is not inherited: provider keys and other
-//!   secrets do not reach repository code;
-//! - process groups are supervised, output is drained without deadlock
-//!   and bounded, and cancellation stops descendants — not just the
-//!   direct child;
-//! - exit status, signal, timeout/cancel and unknown effects are recorded
-//!   separately, and a potentially effectful command is never retried
-//!   automatically after an ambiguous failure.
+//! An unavailable OS sandbox fails closed. Repository processes receive no
+//! inherited environment; cancellation targets process groups, and ambiguous
+//! effectful failures are never retried automatically.
 
 use std::collections::BTreeMap;
 use std::io::Read;

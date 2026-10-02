@@ -223,7 +223,7 @@ impl<T: EdgeRouter + ?Sized> EdgeRouter for &T {
 
 /// Picks edges: mechanically when possible, System One otherwise.
 ///
-/// Guarantees (issue #16):
+/// Guarantees:
 /// - singleton allowed sets need no judgment call at all;
 /// - low-confidence, out-of-set, malformed, and invalid answers fall
 ///   back deterministically with a structured reason — never into `Done`

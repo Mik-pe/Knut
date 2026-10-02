@@ -1,7 +1,7 @@
 use serde::{Deserialize, Serialize};
 use unicode_segmentation::UnicodeSegmentation;
 
-use super::{Composer, MAX_COMPOSER_CHARS, MAX_HISTORY, Snapshot};
+use super::{Composer, MAX_COMPOSER_CHARS, MAX_HISTORY, MAX_LINES, Snapshot};
 
 const MAX_HISTORY_CHARS: usize = 1_000_000;
 
@@ -44,11 +44,11 @@ impl Composer {
 
     pub fn from_memory(memory: ComposerMemory) -> Result<Self, &'static str> {
         if memory.draft.chars().count() > MAX_COMPOSER_CHARS
+            || memory.draft.split('\n').count() > MAX_LINES
             || memory.history.len() > MAX_HISTORY
-            || memory
-                .history
-                .iter()
-                .any(|entry| entry.chars().count() > MAX_COMPOSER_CHARS)
+            || memory.history.iter().any(|entry| {
+                entry.chars().count() > MAX_COMPOSER_CHARS || entry.split('\n').count() > MAX_LINES
+            })
             || memory
                 .history
                 .iter()
@@ -125,6 +125,23 @@ mod tests {
         assert!(memory.history[0].starts_with('2'));
         assert!(memory.history[4].starts_with('6'));
         assert!(Composer::from_memory(memory).is_ok());
+    }
+
+    #[test]
+    fn saved_input_cannot_bypass_the_line_limit() {
+        for (draft, history) in [
+            ("\n".repeat(MAX_LINES), vec![]),
+            (String::new(), vec!["\n".repeat(MAX_LINES)]),
+        ] {
+            assert!(
+                Composer::from_memory(ComposerMemory {
+                    draft,
+                    cursor: (0, 0),
+                    history,
+                })
+                .is_err()
+            );
+        }
     }
 
     #[test]

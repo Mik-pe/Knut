@@ -1,31 +1,14 @@
-//! A real coding benchmark: matched arms over executed tasks (issue #35).
-//!
-//! The playground's numbers are demo-only and say so. This module runs
-//! *executed* tasks in fresh isolated workspaces and reports what
-//! happened, including failures.
-//!
-//! Design rules carried through:
-//! - **matched arms.** Arm A (baseline) is the configured reasoner driving
-//!   coding with no control layer; arm B is the same tools, model, effort,
-//!   task snapshots and budgets with the control layer choosing selected
-//!   decisions. A cheaper-generation cascade is a *separate* arm, so it
-//!   cannot masquerade as a control-loop speedup.
-//! - **real tasks, real checks.** Success means a trusted check passed
-//!   against the patched revision, not that a model said so.
-//! - **everything recorded.** Failures, timeouts, repairs and provider
-//!   usage are all in the report, and unknown usage stays unknown.
-//! - **negative results are published.** No arm is presented as faster
-//!   without measurement, and a small pilot is never called proof.
-//! - evaluation labels stay out of model context.
+//! Offline and live measurements stay separate. Missing usage remains unknown,
+//! and held-out coverage requires explicit task labels.
 
-use std::collections::BTreeMap;
+use std::collections::{BTreeMap, BTreeSet};
 use std::path::{Path, PathBuf};
 
 use serde::{Deserialize, Serialize};
 
 use crate::KnutError;
 use crate::verify::{CheckEvidence, CheckOutcome};
-use crate::workspace::{Workspace, content_hash};
+use crate::workspace::{Workspace, source_revision};
 
 /// Which arm a run belongs to.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord, Serialize, Deserialize)]
@@ -140,6 +123,8 @@ pub struct TaskRun {
     pub task: String,
     pub kind: TaskKind,
     pub arm: Arm,
+    #[serde(default)]
+    pub held_out: bool,
     /// Whether the trusted check passed against the final revision.
     pub verified: bool,
     /// Check evidence, including failures.
@@ -258,7 +243,12 @@ impl BenchReport {
         for run in &runs {
             *coverage.entry(run.kind.label().to_owned()).or_default() += 1;
         }
-        let held_out_tasks = runs.iter().filter(|run| run.arm == Arm::Baseline).count();
+        let held_out_tasks = runs
+            .iter()
+            .filter(|run| run.held_out)
+            .map(|run| &run.task)
+            .collect::<BTreeSet<_>>()
+            .len();
 
         let arms = [Arm::Baseline, Arm::Hybrid, Arm::CheaperCascade];
         let summaries: Vec<ArmSummary> = arms
@@ -592,23 +582,8 @@ impl TaskWorkspace {
         Workspace::open(&self.directory)
     }
 
-    /// A content hash of the whole workspace, so two runs can be compared
-    /// for snapshot equality.
     pub fn revision(&self) -> Result<String, KnutError> {
-        let mut files: Vec<(String, String)> = Vec::new();
-        for entry in walk(&self.directory)? {
-            let bytes = std::fs::read(&entry)
-                .map_err(|err| KnutError::Tool(format!("reading {}: {err}", entry.display())))?;
-            let relative = entry
-                .strip_prefix(&self.directory)
-                .unwrap_or(&entry)
-                .to_string_lossy()
-                .into_owned();
-            files.push((relative, content_hash(&bytes)));
-        }
-        files.sort();
-        let serialized = serde_json::to_vec(&files).unwrap_or_default();
-        Ok(content_hash(&serialized))
+        source_revision(&self.workspace()?)
     }
 }
 
@@ -616,25 +591,6 @@ impl Drop for TaskWorkspace {
     fn drop(&mut self) {
         let _ = std::fs::remove_dir_all(&self.directory);
     }
-}
-
-fn walk(directory: &Path) -> Result<Vec<PathBuf>, KnutError> {
-    let mut files = Vec::new();
-    let mut stack = vec![directory.to_path_buf()];
-    while let Some(current) = stack.pop() {
-        let entries = std::fs::read_dir(&current)
-            .map_err(|err| KnutError::Tool(format!("reading {}: {err}", current.display())))?;
-        for entry in entries {
-            let entry = entry.map_err(|err| KnutError::Tool(format!("reading an entry: {err}")))?;
-            let path = entry.path();
-            if path.is_dir() {
-                stack.push(path);
-            } else {
-                files.push(path);
-            }
-        }
-    }
-    Ok(files)
 }
 
 /// The built-in task suite.
@@ -843,6 +799,7 @@ mod tests {
             task: task.to_owned(),
             kind: TaskKind::LocalBugFix,
             arm,
+            held_out: false,
             verified,
             checks: Vec::new(),
             failure: None,
@@ -882,6 +839,13 @@ mod tests {
         assert!(workspace.path().join("src/lib.rs").exists());
         assert!(workspace.path().join("Cargo.toml").exists());
         let revision_before = workspace.revision().unwrap();
+        std::fs::create_dir_all(workspace.path().join("target/debug")).unwrap();
+        std::fs::write(
+            workspace.path().join("target/debug/build-output"),
+            "generated",
+        )
+        .unwrap();
+        assert_eq!(workspace.revision().unwrap(), revision_before);
 
         // A second workspace for the same task is fresh, not shared.
         let other = TaskWorkspace::create(&task, &root).unwrap();
@@ -1102,6 +1066,31 @@ mod tests {
         );
 
         let _ = std::fs::remove_dir_all(&directory);
+    }
+
+    #[test]
+    fn held_out_coverage_requires_explicit_labels_and_counts_tasks_once() {
+        let baseline = run("ordinary", Arm::Baseline, true, Some(1));
+        let mut held_out = run("unseen", Arm::Baseline, true, Some(1));
+        let mut paired = run("unseen", Arm::Hybrid, true, Some(1));
+        let report = BenchReport::build(
+            versions(RunMode::Offline),
+            vec![baseline.clone(), held_out.clone(), paired.clone()],
+        );
+        assert_eq!(report.held_out_tasks, 0);
+        held_out.held_out = true;
+        paired.held_out = true;
+        let report =
+            BenchReport::build(versions(RunMode::Offline), vec![baseline, held_out, paired]);
+        assert_eq!(report.held_out_tasks, 1);
+    }
+
+    #[test]
+    fn legacy_runs_do_not_claim_held_out_evaluation() {
+        let mut legacy = serde_json::to_value(run("old", Arm::Baseline, true, Some(1))).unwrap();
+        legacy.as_object_mut().unwrap().remove("held_out");
+        let restored: TaskRun = serde_json::from_value(legacy).unwrap();
+        assert!(!restored.held_out);
     }
 
     #[test]

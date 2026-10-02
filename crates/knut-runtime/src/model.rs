@@ -188,10 +188,9 @@ pub trait Model: Send + Sync {
     /// than silently losing reasoning continuity.
     async fn continue_turn(
         &self,
-        continuation: Option<&Continuation>,
+        _continuation: Option<&Continuation>,
         request: &ModelRequest,
     ) -> Result<ModelResponse, KnutError> {
-        let _ = continuation;
         self.complete(request).await
     }
 }
@@ -1095,8 +1094,6 @@ mod tests {
 
         assert_eq!(*seen.lock().unwrap(), vec![json!({ "code": "let x = 1;" })]);
     }
-
-    // --- streaming (#20) -------------------------------------------------
 
     /// A streaming adapter that emits a scripted event sequence.
     struct ScriptedStreamer {

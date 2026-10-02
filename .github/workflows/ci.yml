@@ -21,10 +21,10 @@ jobs:
       - uses: Swatinem/rust-cache@v2
 
       - name: Format
-        run: cargo fmt --check
+        run: cargo fmt --all --check
 
       - name: Clippy
-        run: cargo clippy --all-targets --all-features -- -D warnings
+        run: cargo clippy --workspace --all-targets --all-features --locked -- -D warnings
 
       # The sandbox and process suites need the OS backend; without it the
       # code must refuse rather than run unsandboxed, which these assert.
@@ -47,24 +47,12 @@ jobs:
       # cover protocol fixtures, policy/patch state, fake-session
       # integration and the real local read/edit/check fixture.
       - name: Tests
-        run: cargo test --all-targets --locked
+        run: cargo test --workspace --all-targets --locked -- --test-threads=2
 
-      - name: Sandboxed process suite
-        run: cargo test --lib sandbox --locked
-
-      # A PTY-level check that the shell restores the terminal on exit.
-      - name: Terminal cleanup
+      - name: Headless process regression
         run: |
-          cargo build --locked
-          printf 'q' | timeout 20 script -qec './target/debug/knut jsonl' /dev/null || true
-          echo "headless adapter exited cleanly"
-
-      # Paid or network-dependent checks stay opt-in: this job never sets
-      # the live-smoke variables.
-      - name: Confirm live tests stay opt-in
-        run: |
-          grep -q "KNUT_LIVE_SMOKE" src/provider.rs
-          echo "live provider smoke tests require KNUT_LIVE_SMOKE=1"
+          cargo build -p knut --locked
+          node scripts/smoke-harness.mjs
 
   release:
     name: release artifacts (linux)

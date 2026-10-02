@@ -2,513 +2,82 @@
 
 ![Knut — Your code, untangled.](assets/knut-cover.webp)
 
-Knut is an experimental general-purpose agent harness in Rust. Coding is its
-first workspace profile; the runtime also supports custom tools, document work,
-lookups and conversation without requiring a repository.
+Knut is an experimental agent harness for your terminal, written in Rust. Open
+it in a project, connect a model, and ask it to inspect code or make a change.
+You review proposed edits and commands before they run; Knut checks changed
+code before reporting completion. It also supports general tasks and custom
+tools through the same runtime.
 
-One live loop runs model turns, gated tool calls and their observations. An
-optional decision model prioritizes context and tool capabilities and helps
-classify failures. It never grants permissions or supplies completion evidence.
+## Start
 
-```text
-user task + tools + instructions + context + completion requirements
-                              |
-                              v
-                       SessionRuntime
-                              |
-                 model -> gated tools -> observations
-                   ^                         |
-                   +-------------------------+
-                              |
-                      completion evidence
+Build from this checkout with Rust and Cargo:
 
-optional decision model: context priority / tool priority / failure triage
+```sh
+cargo build --release --locked
+./target/release/knut
 ```
 
-## Prototype goals
+Press **F2** to open Settings, choose **Continue with ChatGPT**, complete sign-in
+in your browser, and select a model. The selection is saved for future starts.
+Model access is checked when a task runs.
 
-- Keep control flow explicit and testable.
-- Use System One for bounded selection and failure triage.
-- Batch independent routing judgments when possible.
-- Escalate on uncertainty instead of trusting a weak route.
-- Keep permissions and side effects outside model judgment.
-- Make every routing decision observable and evaluable.
-- Stay model-provider agnostic above thin adapters.
-
-## Current scope
-
-The core contains:
-
-- typed routing decisions,
-- a `SystemOne` trait,
-- deterministic System 0 fast paths (named rules, routing cache),
-- batched ingress judgments in one System One call,
-- confidence-gated escalation,
-- a capability-oriented tool registry with bounded candidate discovery,
-- a model tier abstraction with a bounded compute cascade,
-- a native model/tool conversation loop with cooperative cancellation,
-- task-specific tools, instructions, context and completion requirements,
-- a policy layer: permission and side-effect approval are Rust, not judgment,
-- generic context providers and revision-bound completion monitors,
-- validated planner/tree utilities for the offline playground,
-- eval traces, shadow routing, replay, and offline benchmarks,
-- one event-driven session runtime shared by the TUI, headless and editor
-  clients,
-- real workspace tools, reviewable patches and sandboxed command execution,
-- revision-bound check evidence, persistent sessions and calibrated routing,
-- optional language intelligence, bounded subagents and trusted MCP tools.
-
-## Invariants
-
-These hold across every client (TUI, headless JSONL, ACP) and every phase:
-
-- **one engine.** TUI, JSONL and editor clients submit commands to one
-  `SessionRuntime` and consume its events. No client implements its own
-  execution loop.
-- **a mandatory gate.** Every tool invocation passes through
-  `ExecutionGate`: policy, approval and replay semantics live in Rust, and
-  nothing a model controls can bypass them.
-- **quality mode by default.** Substantive code reasoning stays on the
-  configured reasoner; cheaper-generation routing is opt-in and must earn
-  promotion through measured results.
-- **real evidence, not assertions.** Completion requires checks that
-  actually ran against the current revision. Valid JSON is not correct
-  code, and a router's confidence is not a probability that code is right.
-- **honest unknowns.** Unreported usage is unknown, not zero; a stale
-  revision says so; an unavailable capability is reported, never silently
-  substituted.
-
-## Workspace layout
-
-| Crate | Responsibility |
-| --- | --- |
-| `knut` | CLI entry point and compatibility exports |
-| `knut-runtime` | Sessions, providers, tools, checks, persistence and headless protocols |
-| `knut-terminal` | Terminal UI, connection screens and event replay |
-| `knut-auth` | Account storage, authentication and token refresh |
-| `knut-editor` | Composer state and edit memory, independent of the runtime/UI |
-
-The terminal depends on the runtime. Runtime and terminal share auth/editor
-primitives; the runtime does not depend on the terminal. All adapters keep using
-one session engine. `cargo test --workspace` validates every crate.
-
-## Updating a running installation
-
-An operator can enable self-update by setting `KNUT_UPDATE_TARGET` to a fixed,
-absolute installed binary path and opening Knut's source checkout as the
-workspace. Credentials and service configuration stay outside the checkout.
-Ask Knut to implement the change, inspect its installation and request an update.
-
-`self/inspect_installation` reports the installed binary hash and source revision.
-`self/install_update` requires those exact identities and a normal write approval.
-It runs offline sandboxed formatting, workspace tests, Clippy and a release build,
-then checks the identities again before atomically activating the new executable.
-Missing dependencies, unsupported sandboxing, failed checks or changed inputs
-refuse activation. No network or unsandboxed fallback is used during installation.
-
-Existing sessions keep their original executable; new sessions use the update.
-The previous executable is kept as `knut.previous` beside the installation.
-Updating the binary does not restart its host service or publish the source.
-Process-crash recovery belongs to the hosting adapter; installation itself never
-replays tools or restores approvals.
-
-## Getting started
-
-```console
-$ cargo build --release
-$ ./target/release/knut doctor          # what is configured, offline
-$ ./target/release/knut doctor --live   # one real call per configured provider
-$ ./target/release/knut tui             # the workbench shell
-$ ./target/release/knut run "fix the failing test"   # one real coding task
-```
-
-Choose a reasoner provider independently from the optional decision model.
-
-For OpenAI API models, including Codex models:
+For an API connection, configure the environment before starting:
 
 ```sh
 export KNUT_PROVIDER=openai
 export OPENAI_API_KEY="your-api-key"
-export KNUT_PROVIDER_MODEL=gpt-6.1-sol
-./target/release/knut models
-./target/release/knut doctor --live
-./target/release/knut tui
+./target/release/knut doctor
+./target/release/knut
 ```
 
-For your ChatGPT plan, start `knut`, press **F2** (or `/ settings`), and choose
-**Continue with ChatGPT**. Complete consent in your browser, then choose a model
-from your account's catalog. The connection activates immediately; the model
-choice is saved for the next start and takes priority over environment
-configuration, so no launch arguments or exports are needed. Settings also has
-**Use environment configuration** to switch back explicitly; this keeps the
-account signed in. Escape cancels browser sign-in and preserves your draft.
-Connection changes require an idle session, including when a task is awaiting
-approval. The account screen also switches accounts, adds another account,
-signs out, and opens **Manage usage**. A plan limit exposes `Ctrl+U` to open usage.
+The OpenAI adapter defaults to `gpt-6.1-sol`; set `KNUT_PROVIDER_MODEL` to change
+it. A saved ChatGPT model takes priority over environment settings. Choose
+**Use environment configuration** in Settings to switch back. Z.ai and other
+Chat Completions endpoints are also supported; see
+[connection and configuration](docs/configuration.md).
 
-This uses OpenAI's documented [open-source / locally hosted flow](https://developers.openai.com/siwc/token-sharing-open-source/)
-with the [required ChatGPT labels](https://developers.openai.com/siwc/ui-ux-guidelines).
-Knut sends native Responses requests through its own engine; Codex app-server
-is optional infrastructure and is not needed for this sign-in.
+Command execution requires **Bubblewrap on Linux** or **sandbox-exec on macOS**.
+An unavailable sandbox blocks commands. Windows command execution is unsupported.
+`doctor` inspects setup offline; `doctor --live` makes real provider calls.
 
-The same sign-in is available from a normal terminal:
+## Work in a project
+
+Add the built binary to your `PATH`, then start it from the directory you want
+to work in:
 
 ```sh
-./target/release/knut login openai-codex
-export KNUT_PROVIDER=openai-codex
-./target/release/knut models
-export KNUT_PROVIDER_MODEL=gpt-6.1-sol # choose an ID from the account's catalog
-./target/release/knut tui
+export PATH="$PWD/target/release:$PATH"
+cd /path/to/project
+knut
 ```
 
-The OpenAI profiles use the native Responses API with `store: false` and
-streaming. They preserve encrypted reasoning items and full input history,
-validate completed responses, and report interrupted streams or usage-limit
-failures. `gpt-5-codex` and other account-available Responses models can also be
-selected with `KNUT_PROVIDER_MODEL`. Access depends on your API account or the
-ChatGPT account. The ChatGPT model picker includes GPT-6.1 Sol, GPT-6 Astra and
-GPT-6 Luna alongside the account's refreshed catalog, which can omit usable
-models. Access is checked when a task runs.
+Type a task and press **Enter**. Use **Alt+A** to approve an exact pending action
+or **Alt+D** to deny it. **Ctrl+R** opens changes and checks; **F1** shows help.
+During work, Enter queues another task and **Alt+S** switches the draft to
+steering the current task. **Ctrl+C** stops work or closes the current overlay.
+See the [terminal guide](docs/terminal.md) for shortcuts and saved drafts.
 
-ChatGPT sign-in uses OpenAI's documented public-client OAuth flow with PKCE,
-state, nonce and signed ID-token validation. Knut stores separate registrations
-under `~/.config/knut/` (`XDG_CONFIG_HOME` or `KNUT_CONFIG_DIR` can override the
-location), with owner-only permissions and atomic token rotation. Refreshes
-are serialized across processes. Each connected model keeps its own account
-registration, so another process changing accounts cannot switch a running task. `knut accounts` lists saved registrations;
-`knut accounts <client-id>` selects one; `knut login openai-codex --new` adds an
-account. `knut logout openai-codex` revokes the selected session and clears its
-local tokens. If remote revocation fails, it reports that explicitly. Sign-in
-does not read Codex's credentials or grant access to ChatGPT conversation history.
-Review or disconnect Knut under [ChatGPT Settings → Usage](https://chatgpt.com/settings/usage).
-
-See OpenAI's [models and inference](https://developers.openai.com/siwc/token-sharing-open-source/models-and-inference)
-and [sign-in contract](https://developers.openai.com/siwc/token-sharing-open-source/sign-in).
-API-key usage is metered; ChatGPT plan usage stays on the selected plan route.
-Knut never falls back from plan usage to API billing.
-
-Z.ai is the default when no saved ChatGPT model or explicit provider is selected. Other Chat Completions providers can use
-`KNUT_PROVIDER=chat-completions` with an explicit base URL and model.
-
-| variable | purpose |
-| --- | --- |
-| `KNUT_PROVIDER` | `zai` (default), `openai`, `openai-codex`, or `chat-completions` |
-| `KNUT_PROVIDER_API_KEY` | explicit API credential; otherwise `OPENAI_API_KEY` for OpenAI or `ZAI_API_KEY` for Z.ai/compatible endpoints |
-| `KNUT_PROVIDER_BASE_URL` | endpoint prefix; defaults to Z.ai coding or `https://api.openai.com/v1` for OpenAI; ChatGPT tokens are restricted to the OpenAI origin |
-| `KNUT_PROVIDER_MODEL` | model ID; defaults to `glm-5.3-flash` or `gpt-6.1-sol` for OpenAI |
-| `KNUT_PROVIDER_REASONING_EFFORT` | explicit effort; GLM-5.3 uses `low`, `high`, `max`; GPT-6.1 Sol accepts `low`, `medium`, `high`, `xhigh`, `max` |
-| `KNUT_PROVIDER_TIMEOUT_SECONDS` | positive request timeout; default 120 seconds |
-| `TYPESAFE_API_KEY` | optional Jev credential; without it, the reasoner plans directly |
-| `TYPESAFE_MODEL` | Jev model override; default pinned to `jev-1.13.0` |
-| `KNUT_MODE` | `quality` (default) or `adaptive` |
-| `KNUT_PROFILE` | `auto` (default), `general`, or `coding` |
-
-A decision model is optional. With only the reasoner configured, System Zero
-hands tasks to the native model/tool loop. The model sees registered tool schemas
-and receives results with their original call IDs. Tool policy, exact approvals,
-bounded repair and revision-bound checks stay in the runtime. An unusable Jev configuration emits
-a warning and uses this path; failures of a configured live Jev call remain
-explicit errors.
-
-`knut doctor` reports what is missing with actionable guidance, and makes
-no paid request unless you pass `--live`.
-
-To inspect generator calls during a real coding run:
+For a single task or an independent check:
 
 ```sh
-./target/debug/knut run "fix the failing test" --census /tmp/knut-census.json
+knut run "explain why this test fails"
+knut run "fix the failing test" --yes
+knut verify
+knut verify --json
 ```
 
-The output path must be new. The report records model/tier, call purpose,
-buffered/streaming mode, outcome, latency, and reported token usage—even when the
-run fails. It excludes prompt/response bodies and error text. Unknown usage stays
-unknown. Jev calls, cached-token breakdowns and costs are not yet included.
-This runs the normal coding task and can incur provider charges; `--census`
-does not grant write approval. `--yes` pre-approves file edits; commands still
-require their exact approval through TUI or JSONL.
+`--yes` approves file writes for that run. Commands still need exact approval
+through the terminal or a JSONL client; a blocked approval ends a scripted run.
+The default profile discovers Rust and basic Node/TypeScript checks. Use
+`KNUT_PROFILE=general` for document work or conversation without coding checks.
 
-Small edits can use `files/edit`: a read hash plus a JSON-encoded array of exact
-`{old,new}` replacements. Ambiguous matches and stale revisions fail without
-writing. A task is bounded to 32 runtime turns and 16 tool calls per model response,
-with two completion-repair attempts. A blocked approval
-ends the scripted run, and successful existing tests cannot hide failed edits.
+Verification covers every Rust workspace member and requires evidence for the
+current source revision. `verify --json` emits one workspace report. See
+[workspace profiles and verification](docs/runtime.md#workspace-profiles) for details.
 
-For a live repository-edit comparison with Ante, see
-[the comparison runner](scripts/compare-harnesses.mjs). Prepare an empty temporary
-directory, then run each harness against its isolated snapshot:
+## More
 
-```sh
-trial_dir=$(mktemp -d /var/tmp/knut-comparison.XXXXXX)
-node scripts/compare-harnesses.mjs prepare "$trial_dir"
-node scripts/compare-harnesses.mjs run "$trial_dir" knut high
-node scripts/compare-harnesses.mjs run "$trial_dir" ante high
-node scripts/compare-harnesses.mjs verify "$trial_dir" knut high
-node scripts/compare-harnesses.mjs verify "$trial_dir" ante high
-```
-
-Requires Linux Bubblewrap, Node, Ante and a built `target/debug/knut`.
-Live runs use credentials from the environment or local `.env` and may incur
-provider charges. Both use GLM-5.3 Flash on the coding-plan endpoint with the
-requested native effort. Prompts/tools differ by harness; this is a development
-pilot, not proof of Jev savings. Logs and diffs can contain repository content.
-The source repository is mounted read-only and masked inside the test sandbox;
-edits happen only in the temporary copies. Compiler caches remain writable.
-
-## Interactive CLI
-
-![Knut's woven knot and terminal workspace](assets/knut-terminal.png)
-
-The trefoil knot has a moving highlight on opening and during active work.
-It settles after the introduction and stays still while waiting for approval.
-[Watch the opening animation](assets/knut-terminal.gif).
-
-Run `knut` in a terminal (or `knut tui`) to open a coding session. The main
-screen is one conversation, a compact status line, and an input that grows with
-your draft. Jobs, routing details, and changes open only when requested.
-
-Type a task and press Enter. During work, Enter queues a separate task. Alt+S
-switches the current draft to steering, which adds a correction to the active
-goal. Successful completion starts the next queued task; failure or cancellation
-holds the queue. Open jobs to edit, remove or explicitly start held requests.
-Queue acknowledgements arrive at the next runtime boundary.
-
-Approvals open a scrollable preview of the exact action, replacements, read hash
-and complete arguments. Alt+V toggles the preview; PgUp/PgDn scrolls it. Enter
-while approval is pending preserves the draft unless steering was explicitly
-selected.
-
-| Key | Action |
-| --- | --- |
-| Enter | Send a task, answer a question, or follow up |
-| Shift+Enter | New line (Ctrl+J fallback for terminals without enhanced keyboard support) |
-| Up / Down | Move through input lines; recall history at its edges |
-| Ctrl+A / Ctrl+E | Start / end of input line |
-| Ctrl+Z / Ctrl+Y | Undo / redo, including an idle draft cleared with Ctrl+C |
-| / at empty input, Ctrl+P, Ctrl+K | Search working commands |
-| Up / Down, Enter in commands | Select and run a command |
-| Ctrl+R | Open/close recorded changes and checks |
-| Ctrl+O | Open/close jobs and queued requests |
-| Alt+S | Switch the current draft between queue and steer during work |
-| Up / Down in jobs | Select a queued request |
-| Alt+E / Alt+X in jobs | Edit / remove the selected queued request |
-| Alt+R in jobs | Start the selected queued request when idle |
-| Ctrl+B | Open/close decision details |
-| PgUp / PgDn | Scroll the conversation or current detail view |
-| Tab / Shift+Tab | Switch input and conversation navigation |
-| Esc | Close a detail view or return to the latest output |
-| Alt+A / Alt+D | Allow / deny the exact pending approval |
-| Alt+V | Open/close the full pending-action preview |
-| Ctrl+Left / Right or Alt+B / F | Move by word |
-| Ctrl+W or Alt+Backspace | Delete the previous word |
-| Ctrl+C | Close an overlay; otherwise stop work, clear an idle draft, or exit |
-| Ctrl+D | Exit when idle with an empty draft |
-| Ctrl+Q | Save the draft and exit when idle |
-| ? / F1 | Quick shortcut modal (`?` with empty input; F1 anytime) |
-
-In changes, Left/Right selects a file, Up/Down selects a hunk, and PgUp/PgDn
-scrolls it. The review is read-only; it does not pretend to revert applied edits.
-Use the command menu for pause, resume, cancel, setup diagnostics, and checks.
-
-The theme uses warm text, teal accents, and explicit state labels. It
-adapts to truecolor, 256 colors, 16 colors, and `NO_COLOR`; configure
-`KNUT_TUI_COLORS=truecolor|256|16|none` to override detection, including
-`NO_COLOR`. Use `/motion` to toggle animation, or `KNUT_TUI_MOTION=off` to
-start with reduced motion. `TERM=dumb` uses a static ASCII mark.
-Bracketed paste is one undoable edit, normalizes Windows newlines, and reports
-truncation. Browsing prompt history preserves the unfinished draft and cursor.
-The terminal is restored on exit.
-
-Drafts, cursor positions and recent prompt history survive restarts in the same
-workspace. Input is saved locally in the background every 400 ms and flushed on
-normal exit; Ctrl+Q keeps the draft for next time. Up/Down recalls saved history.
-Storage uses `$XDG_DATA_HOME/knut/sessions.db` (normally
-`~/.local/share/knut/sessions.db`), or `KNUT_SESSION_STORE`, with owner-only file
-permissions. History keeps up to 100 prompts within a one-million-character budget.
-Storage errors and conflicting saves from another terminal are reported.
-This restores input only; running tasks, queue edits and approvals are not resumed.
-
-See [CLI_UX.md](CLI_UX.md) for the design and remaining usability work.
-
-## Commands
-
-```console
-$ knut doctor [--live]      configuration, capabilities, and live checks
-$ knut tui                  Ratatui workbench
-$ knut run <prompt>         real provider + tools + sandboxed checks
-$ knut jsonl [prompt]       headless: commands on stdin, events on stdout
-$ knut verify [--json]      the workspace's real checks for this revision
-$ knut bench                pilot benchmark with an inspectable report
-$ knut sessions list|show|export|plan    stored sessions
-$ knut lsp                  language-server availability
-$ knut release              versioned artifact and checksum instructions
-$ knut route|repl|demo-tree|eval         offline playground (mock, demo-only)
-```
-
-The playground commands are explicitly demo-only: they use a deterministic
-mock router and canned tools, and their numbers are not measurements of
-coding quality. `run` and `tui` use the shared live runtime; `verify` and `bench` run real checks.
-
-Session and JSONL protocol version 2 replaces implicit steer-or-queue routing
-with `queue`, `steer`, `update_queued`, `remove_queued` and `run_queued` commands.
-Queue events carry stable request IDs. JSONL clients must consume version 2.
-
-For a local process regression using a deliberately fallible provider:
-
-```sh
-cargo build
-node scripts/smoke-harness.mjs
-```
-
-It uses an isolated Rust fixture, makes no paid provider calls, and verifies
-tool-argument repair, failed-check recovery, exact approvals and queued task execution.
-This is not evidence of improved live-model success rates.
-
-For terminal regression checks, install the optional `tuistory` package where
-Node can resolve it, then run `node scripts/smoke-tui.mjs --screenshots`.
-For an existing installation, set `KNUT_TUISTORY_MODULE` to its absolute
-`dist/index.js` path. This uses the local fixture provider, exercises four
-terminal sizes, editing, help, approvals and repair, and saves snapshots in a
-temporary directory. It also checks truecolor overrides and ASCII/reduced motion.
-
-## General tasks and embedding
-
-The CLI opens the current directory for file and sandboxed command tools.
-`auto` enables coding checks when a supported project manifest is present and
-otherwise uses the general profile. Select `general` explicitly for document
-work or conversation inside a repository; `coding` requires configured checks.
-Coding checks run when project content changes. Questions that leave the project
-unchanged can complete without a build; explicit task requirements still apply.
-
-```sh
-KNUT_PROFILE=general knut run "Summarize notes.txt"
-KNUT_PROFILE=general knut tui
-```
-
-Hosts can set `KNUT_LOAD_ENV=0` to skip loading the workspace `.env` file and
-supply an isolated environment to the child process.
-
-JSONL submit, queue and update commands accept optional task configuration:
-
-```json
-{"type":"submit","prompt":"Summarize the report","options":{"tools":["read"],"instructions":"Be concise.","context":[{"source":{"uri":"document:report","revision":"v1"},"description":"Report excerpt","content":{"text":"Quarterly results…"}}]}}
-```
-
-`tools` restricts registered tool IDs; an empty list permits no tools. Omit it to
-use the configured catalog. Instructions and context stay with queued tasks.
-`requirements` accepts an array of `{check, description, blocking}` records and
-adds to the profile's completion contract. Required evidence cannot be waived
-by the model. Task configuration is bounded to 128 KiB.
-
-For embedding, `HarnessSetup` supplies tools, instructions, an optional
-`ContextProvider` and an optional `CompletionMonitor`. `build_harness` builds the
-same engine without opening a workspace. `SessionRuntime::new` also accepts an
-injected model cascade for hosts that manage providers themselves. The CLI adds
-an `AskUserTool`; its answer returns through the tool-result continuation.
-
-Context records identify snapshots with a resource URI and revision. Supplied
-URL/document records do not fetch or establish freshness of external resources;
-that belongs to the configured provider. Workspace context performs gated reads
-and retains their content hashes. Decision-model priorities reorder context and
-tool schemas while retaining the full evidence/catalog. They are advisory; no
-cost or quality improvement is claimed without measurements.
-
-## Architecture
-
-```text
-commands/events -> SessionRuntime -> TUI / JSONL / editor events
-                         |
-                 model/tool conversation
-                         |
-          ExecutionGate + CompletionMonitor + ContextProvider
-                         |
-               configured tools and provider adapters
-
-workspace profile: files / sandboxed commands / repository instructions
-coding profile:    workspace tools + revision-bound build/test/lint evidence
-custom setup:      application tools + context + completion contract
-```
-
-See the [provider compatibility matrix](src/matrix.rs) for what each
-endpoint actually supports, with the evidence behind every claim.
-
-## Alpha status and limitations
-
-**Verified on 2026-09-21 at commit `9b5b3f9`** (plus the release work in
-this commit), on Linux:
-
-| check | evidence |
-| --- | --- |
-| `knut doctor` (offline) | reports missing configuration with actionable guidance |
-| `knut doctor --live` | one real call each to Jev and the configured reasoner; both succeeded |
-| provider adapters | GLM (`glm-5.3-flash`, coding endpoint) and DeepSeek (`deepseek-v4.1-flash`, Ollama Cloud) streamed, returned tool calls, reported usage and preserved reasoning parts |
-| `knut verify` | ran build, 246 tests and clippy inside the OS sandbox and reported the real result |
-| `knut bench` | wrote an inspectable report showing 1/6 tasks verified offline, with limitations stated |
-| `knut tui` | launched, accepted input, streamed events, and restored the terminal on exit |
-| `knut jsonl` | stdout stayed parseable JSONL with malformed input piped in |
-| sandbox | bubblewrap denied a read outside the workspace and unreachable network |
-| session store | created owner-only (`0600`) and refused a corrupt file without resetting it |
-
-**Known limitations, stated rather than implied:**
-
-- TUI, `run`, and JSONL drive the same native conversation runtime. It performs
-  real reads/edits, resumes exact approved calls, and runs repository checks
-  against the edited revision. Failed checks and tool failures have a bounded
-  repair budget. This integration is regression-tested; the earlier measured
-  Ante pilot used the previous standalone CLI loop.
-- Check discovery currently covers Rust and a basic TypeScript/Node profile;
-  project-specific scripts and other package managers need richer setup support.
-- Typed artifact references support JSON-pointer projections, including a
-  search hit's path and a read's content hash. Unsupported or missing selected
-  values fail explicitly.
-- `bench` is a pilot: six fixture tasks, all offline. It is not the
-  30-task held-out evaluation the roadmap calls for.
-- Language servers are reported but never started implicitly; LSP
-  navigation is fixture-tested, not live-verified here.
-- Command isolation uses Bubblewrap on Linux and Seatbelt (`sandbox-exec`) on
-  macOS. Both start with a clean environment and deny network by default.
-  macOS commands use a private temporary directory and declared writable paths;
-  the backend is reported with every command result. Windows is unsupported.
-  A missing backend refuses execution.
-- TUI performance was measured on a synthetic fixture (p95 under 5 ms for
-  reducer plus render), not against real provider latency.
-
-## Example
-
-```rust
-use knut::{
-    Action, Decision, ModelTier, Risk, Route, StaticSystemOne, Knut,
-};
-
-# async fn demo() -> Result<(), knut::KnutError> {
-let system_one = StaticSystemOne::new(Decision {
-    route: Route::Generate,
-    confidence: 0.94,
-    retrieval: None,
-    capability: None,
-    model_tier: ModelTier::Fast,
-    risk: Risk::Low,
-    parallelizable: false,
-});
-
-let knut = Knut::new(system_one).with_confidence_floor(0.75);
-let action = knut.next("Explain this error", vec![]).await?;
-
-assert_eq!(action, Action::Generate(ModelTier::Fast));
-# Ok(())
-# }
-```
-
-## Design rule
-
-If Knut can write the valid `match` arms before asking the model, System One is a candidate. If the output space cannot be bounded ahead of time, hand the work to a generative model.
-
-The interesting experiment is not merely `Jev -> LLM`. It is a loop:
-
-```text
-System One -> cheap action -> System One verifies/routes
-                              |
-                              +-- confident -> continue
-                              `-- uncertain -> stronger model
-```
-
-That makes fast judgment part of the runtime rather than a one-time front door.
+- [Connection and configuration](docs/configuration.md): providers, accounts and environment variables.
+- [Terminal guide](docs/terminal.md): approvals, queueing, shortcuts and input memory.
+- [Runtime and integration](docs/runtime.md): JSONL, task options and embedding.
+- [Development](docs/development.md): workspace layout, checks, smoke runs and installation updates.

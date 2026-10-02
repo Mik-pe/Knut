@@ -1,29 +1,11 @@
-//! Real workspace read/search tools with revisioned evidence (issue #23).
-//!
-//! Gives the coding slice useful local context without loading a whole
-//! repository or introducing a vector database:
-//!
-//! - bounded listing, text search and range reads with stable
-//!   workspace-relative paths, line ranges and content hashes;
-//! - ignore-aware traversal (`.gitignore` plus explicit secret
-//!   exclusions), with binary and oversize limits that are *reported*
-//!   rather than silently hidden;
-//! - a trusted root whose traversal and symlink boundaries are enforced
-//!   at the moment of access, not only by an earlier string check;
-//! - repository text is untrusted evidence, never new permission or
-//!   instruction authority;
-//! - results are revisioned: editing a file invalidates its earlier
-//!   evidence identity so a later patch can detect a stale precondition.
-//!
-//! The search implementation is the maintained `ignore` crate (the same
-//! traversal engine ripgrep uses) rather than a hand-rolled walker, so
-//! ignore semantics match what developers expect.
-
-use std::io::Read;
+use std::io::{Read, Write};
+use std::os::unix::fs::{OpenOptionsExt, PermissionsExt};
 use std::path::{Component, Path, PathBuf};
+use std::sync::atomic::{AtomicU64, Ordering};
 
 use serde::{Deserialize, Serialize};
 use serde_json::{Value, json};
+use sha2::{Digest, Sha256};
 
 use crate::KnutError;
 use crate::tool::{SideEffect, Tool, ToolMetadata};
@@ -104,16 +86,11 @@ impl SafePath {
     }
 }
 
-/// A trusted workspace root.
-///
-/// Every access re-validates the resolved path, so a symlink or a
-/// filesystem change after an earlier check cannot silently escape the
-/// root.
+/// A trusted workspace root with canonicalized access paths.
 #[derive(Debug, Clone)]
 pub struct Workspace {
     root: PathBuf,
-    /// Extra deny globs beyond [`DENIED_PATTERNS`].
-    denied: Vec<String>,
+    denied: globset::GlobSet,
 }
 
 impl Workspace {
@@ -132,9 +109,18 @@ impl Workspace {
                 canonical.display()
             )));
         }
+        let mut denied = globset::GlobSetBuilder::new();
+        for pattern in DENIED_PATTERNS {
+            denied.add(globset::Glob::new(pattern).map_err(|err| {
+                KnutError::Tool(format!("invalid workspace exclusion {pattern:?}: {err}"))
+            })?);
+        }
+        let denied = denied
+            .build()
+            .map_err(|err| KnutError::Tool(format!("invalid workspace exclusions: {err}")))?;
         Ok(Self {
             root: canonical,
-            denied: DENIED_PATTERNS.iter().map(|s| (*s).to_owned()).collect(),
+            denied,
         })
     }
 
@@ -159,7 +145,6 @@ impl Workspace {
             return Err(deny("absolute paths are not workspace paths"));
         }
 
-        // Reject traversal components before touching the filesystem.
         for component in candidate.components() {
             match component {
                 Component::ParentDir => return Err(deny("`..` traversal is not allowed")),
@@ -172,25 +157,30 @@ impl Workspace {
 
         let joined = self.root.join(candidate);
 
-        // Resolve symlinks if the path exists; for a not-yet-existing
-        // path, validate the deepest existing ancestor.
-        let resolved = match joined.canonicalize() {
-            Ok(resolved) => resolved,
-            Err(_) => {
-                let mut ancestor = joined.as_path();
-                loop {
-                    match ancestor.parent() {
-                        Some(parent) => match parent.canonicalize() {
-                            Ok(resolved_parent) => {
-                                let tail = joined
-                                    .strip_prefix(parent)
-                                    .map_err(|_| deny("path is outside the workspace"))?;
-                                break resolved_parent.join(tail);
-                            }
-                            Err(_) => ancestor = parent,
-                        },
-                        None => return Err(deny("path is outside the workspace")),
+        let mut ancestor = joined.as_path();
+        let resolved = loop {
+            match ancestor.canonicalize() {
+                Ok(resolved) => {
+                    let tail = joined
+                        .strip_prefix(ancestor)
+                        .map_err(|_| deny("path is outside the workspace"))?;
+                    break if tail.as_os_str().is_empty() {
+                        resolved
+                    } else {
+                        resolved.join(tail)
+                    };
+                }
+                Err(err) => {
+                    // A dangling symlink is not a missing file: creating through it
+                    // could follow an unchecked target outside the workspace.
+                    if err.kind() != std::io::ErrorKind::NotFound
+                        || std::fs::symlink_metadata(ancestor).is_ok()
+                    {
+                        return Err(deny("path cannot be resolved"));
                     }
+                    ancestor = ancestor
+                        .parent()
+                        .ok_or_else(|| deny("path is outside the workspace"))?;
                 }
             }
         };
@@ -216,21 +206,8 @@ impl Workspace {
 
     /// Whether a workspace-relative path is denied by policy.
     pub fn is_denied(&self, relative: &str) -> bool {
-        let matcher = globset::GlobSetBuilder::new();
-        let mut builder = matcher;
-        for pattern in &self.denied {
-            if let Ok(glob) = globset::Glob::new(pattern) {
-                builder.add(glob);
-            }
-        }
-        // Matching against both the relative path and the basename keeps
-        // patterns like `.env` effective for nested files.
-        let Ok(set) = builder.build() else {
-            // A broken deny list must fail closed.
-            return true;
-        };
         let basename = relative.rsplit('/').next().unwrap_or(relative);
-        set.is_match(relative) || set.is_match(basename)
+        self.denied.is_match(relative) || self.denied.is_match(basename)
     }
 
     /// Read a file's bytes after validating the path and its bounds.
@@ -242,14 +219,8 @@ impl Workspace {
                 path.relative()
             )));
         }
-        let metadata = std::fs::metadata(path.absolute())
-            .map_err(|err| KnutError::Tool(format!("stat {:?}: {err}", path.relative())))?;
-        if !metadata.is_file() {
-            return Err(KnutError::Tool(format!(
-                "path {:?} is not a file",
-                path.relative()
-            )));
-        }
+        let (file, metadata) = open_regular_file(path.absolute())
+            .map_err(|err| KnutError::Tool(format!("open {:?}: {err}", path.relative())))?;
         if metadata.len() > MAX_FILE_BYTES {
             return Err(KnutError::Tool(format!(
                 "file {:?} is {} bytes, over the {MAX_FILE_BYTES}-byte read limit",
@@ -258,11 +229,16 @@ impl Workspace {
             )));
         }
 
-        let mut file = std::fs::File::open(path.absolute())
-            .map_err(|err| KnutError::Tool(format!("open {:?}: {err}", path.relative())))?;
         let mut buffer = Vec::new();
-        file.read_to_end(&mut buffer)
+        file.take(MAX_FILE_BYTES + 1)
+            .read_to_end(&mut buffer)
             .map_err(|err| KnutError::Tool(format!("read {:?}: {err}", path.relative())))?;
+        if buffer.len() as u64 > MAX_FILE_BYTES {
+            return Err(KnutError::Tool(format!(
+                "file {:?} exceeds the {MAX_FILE_BYTES}-byte read limit",
+                path.relative()
+            )));
+        }
         Ok(buffer)
     }
 
@@ -277,6 +253,131 @@ impl Workspace {
         }
         Ok(String::from_utf8_lossy(&bytes).into_owned())
     }
+}
+
+fn open_regular_file(path: &Path) -> std::io::Result<(std::fs::File, std::fs::Metadata)> {
+    let file = std::fs::OpenOptions::new()
+        .read(true)
+        .custom_flags(libc::O_NOFOLLOW | libc::O_NONBLOCK)
+        .open(path)?;
+    let metadata = file.metadata()?;
+    if !metadata.is_file() {
+        return Err(std::io::Error::new(
+            std::io::ErrorKind::InvalidInput,
+            "path is not a file",
+        ));
+    }
+    Ok((file, metadata))
+}
+
+pub(crate) fn source_revision(workspace: &Workspace) -> Result<String, KnutError> {
+    let mut files: Vec<(String, String)> = Vec::new();
+    let root = workspace.root().to_owned();
+    let rust_workspace = root.join("Cargo.toml").is_file();
+    let node_workspace = root.join("package.json").is_file();
+    let walker = ignore::WalkBuilder::new(&root)
+        .standard_filters(true)
+        .require_git(false)
+        .filter_entry(move |entry| {
+            let Ok(relative) = entry.path().strip_prefix(&root) else {
+                return false;
+            };
+            let first = relative
+                .components()
+                .next()
+                .map(|component| component.as_os_str());
+            !(rust_workspace && first == Some(std::ffi::OsStr::new("target"))
+                || node_workspace && first == Some(std::ffi::OsStr::new("node_modules")))
+        })
+        .build();
+    let mut buffer = [0u8; 64 * 1024];
+    for entry in walker {
+        let entry = entry.map_err(|error| {
+            KnutError::Tool(format!("could not enumerate revision files: {error}"))
+        })?;
+        if !entry.file_type().is_some_and(|t| t.is_file()) {
+            continue;
+        }
+        let path = entry.path();
+        let Ok(relative) = path.strip_prefix(workspace.root()) else {
+            continue;
+        };
+        let relative = relative
+            .components()
+            .map(|c| c.as_os_str().to_string_lossy().into_owned())
+            .collect::<Vec<_>>()
+            .join("/");
+        if workspace.is_denied(&relative) {
+            continue;
+        }
+        let (mut file, _) = open_regular_file(path).map_err(|error| {
+            KnutError::Tool(format!(
+                "could not read revision file {relative:?}: {error}"
+            ))
+        })?;
+        let mut digest = Sha256::new();
+        loop {
+            let count = file.read(&mut buffer).map_err(|error| {
+                KnutError::Tool(format!(
+                    "could not hash revision file {relative:?}: {error}"
+                ))
+            })?;
+            if count == 0 {
+                break;
+            }
+            digest.update(&buffer[..count]);
+        }
+        files.push((relative, format!("sha256:{:x}", digest.finalize())));
+    }
+    if files.is_empty() {
+        return Err(KnutError::Tool(
+            "no files to derive a revision from".to_owned(),
+        ));
+    }
+    files.sort();
+    let serialized = serde_json::to_vec(&files).map_err(|error| {
+        KnutError::Tool(format!("could not serialize source revision: {error}"))
+    })?;
+    Ok(content_hash(&serialized))
+}
+
+pub(crate) fn write_atomically(path: &Path, bytes: &[u8]) -> Result<(), KnutError> {
+    static NEXT_TEMP: AtomicU64 = AtomicU64::new(0);
+    let directory = path
+        .parent()
+        .ok_or_else(|| KnutError::Tool("target has no parent directory".to_owned()))?;
+    std::fs::create_dir_all(directory)
+        .map_err(|err| KnutError::Tool(format!("create {}: {err}", directory.display())))?;
+    let permissions = match std::fs::metadata(path) {
+        Ok(metadata) => Some(metadata.permissions()),
+        Err(err) if err.kind() == std::io::ErrorKind::NotFound => None,
+        Err(err) => return Err(KnutError::Tool(format!("stat {}: {err}", path.display()))),
+    };
+    let temp = directory.join(format!(
+        ".knut-tmp-{}-{}",
+        std::process::id(),
+        NEXT_TEMP.fetch_add(1, Ordering::Relaxed)
+    ));
+    let mut file = std::fs::OpenOptions::new()
+        .write(true)
+        .create_new(true)
+        .mode(permissions.as_ref().map_or(0o666, PermissionsExt::mode))
+        .open(&temp)
+        .map_err(|err| KnutError::Tool(format!("create temporary file: {err}")))?;
+    let result = (|| {
+        file.write_all(bytes)
+            .map_err(|err| KnutError::Tool(format!("write temporary file: {err}")))?;
+        if let Some(permissions) = permissions {
+            file.set_permissions(permissions)
+                .map_err(|err| KnutError::Tool(format!("set file permissions: {err}")))?;
+        }
+        std::fs::rename(&temp, path)
+            .map_err(|err| KnutError::Tool(format!("replace {}: {err}", path.display())))
+    })();
+    if result.is_err() {
+        let _ = std::fs::remove_file(&temp);
+    }
+    result
 }
 
 /// A stable, bounded content hash.
@@ -475,7 +576,9 @@ impl Tool for SearchTool {
 }
 
 fn search_blocking(workspace: &Workspace, query: &str, limit: usize) -> Result<Value, KnutError> {
-    let pattern = globset::Glob::new(query).ok();
+    let pattern = globset::Glob::new(query)
+        .ok()
+        .map(|glob| glob.compile_matcher());
     let mut results: Vec<Value> = Vec::new();
     let mut truncated = false;
     let mut skipped_binary = 0usize;
@@ -513,17 +616,13 @@ fn search_blocking(workspace: &Workspace, query: &str, limit: usize) -> Result<V
             continue;
         }
 
-        let metadata = match std::fs::metadata(path) {
-            Ok(metadata) => metadata,
-            Err(_) => continue,
-        };
+        let metadata = std::fs::metadata(path)
+            .map_err(|err| KnutError::Tool(format!("stat {relative:?}: {err}")))?;
         if metadata.len() > MAX_FILE_BYTES {
             skipped_large += 1;
             continue;
         }
-        let Ok(bytes) = std::fs::read(path) else {
-            continue;
-        };
+        let bytes = workspace.read_bytes(&relative)?;
         if is_binary(&bytes) {
             skipped_binary += 1;
             continue;
@@ -532,11 +631,7 @@ fn search_blocking(workspace: &Workspace, query: &str, limit: usize) -> Result<V
         let text = String::from_utf8_lossy(&bytes);
         let hash = content_hash(&bytes);
         for (index, line) in text.lines().enumerate() {
-            if !line.contains(query)
-                && !pattern
-                    .as_ref()
-                    .is_some_and(|p| p.compile_matcher().is_match(line))
-            {
+            if !line.contains(query) && !pattern.as_ref().is_some_and(|p| p.is_match(line)) {
                 continue;
             }
             if results.len() >= limit {
@@ -630,7 +725,12 @@ impl Tool for ReadTool {
             .min(start.saturating_add(MAX_READ_LINES).saturating_sub(1));
 
         let mut out = Vec::new();
-        if start <= total_lines {
+        if requested_end < start {
+            return Err(KnutError::Tool(
+                "end_line must not precede start_line".to_owned(),
+            ));
+        }
+        if start <= end {
             for (index, line) in lines
                 .iter()
                 .enumerate()
@@ -748,12 +848,7 @@ impl Tool for WriteTool {
                 safe.relative()
             )));
         }
-        if let Some(parent) = safe.absolute().parent() {
-            std::fs::create_dir_all(parent)
-                .map_err(|err| KnutError::Tool(format!("creating {parent:?}: {err}")))?;
-        }
-        std::fs::write(safe.absolute(), content.as_bytes())
-            .map_err(|err| KnutError::Tool(format!("writing {:?}: {err}", safe.relative())))?;
+        write_atomically(safe.absolute(), content.as_bytes())?;
 
         let bytes = content.as_bytes();
         Ok(json!({
@@ -938,14 +1033,12 @@ pub fn discover_instructions(workspace: &Workspace) -> Result<Vec<InstructionFil
                 continue;
             };
             if metadata.len() > MAX_INSTRUCTION_BYTES {
-                // Reported by omission-with-marker rather than silently
-                // truncated: an oversized instruction file is skipped.
                 continue;
             }
             let Ok(bytes) = workspace.read_bytes(&relative) else {
                 continue;
             };
-            if is_binary(&bytes) {
+            if bytes.len() as u64 > MAX_INSTRUCTION_BYTES || is_binary(&bytes) {
                 continue;
             }
             found.push(InstructionFile {
@@ -1167,6 +1260,109 @@ mod tests {
         );
     }
 
+    #[test]
+    fn non_regular_files_are_rejected_without_waiting_for_a_writer() {
+        use std::os::unix::ffi::OsStrExt;
+        let fixture = Fixture::new("fifo");
+        let path = fixture.dir.join("pipe");
+        let c_path = std::ffi::CString::new(path.as_os_str().as_bytes()).unwrap();
+        assert_eq!(unsafe { libc::mkfifo(c_path.as_ptr(), 0o600) }, 0);
+        let err = fixture.workspace().read_bytes("pipe").unwrap_err();
+        assert!(err.to_string().contains("not a file"), "{err}");
+    }
+
+    #[test]
+    fn regular_file_open_refuses_a_symlink_substituted_for_a_walked_file() {
+        let fixture = Fixture::new("replaced-source");
+        fixture.write("actual.txt", "content");
+        let path = fixture.dir.join("replaced.txt");
+        std::os::unix::fs::symlink(fixture.dir.join("actual.txt"), &path).unwrap();
+        assert!(open_regular_file(&path).is_err());
+        assert_eq!(
+            fixture.workspace().read_text("replaced.txt").unwrap(),
+            "content"
+        );
+    }
+
+    #[tokio::test]
+    async fn dangling_symlinks_cannot_be_used_to_create_outside_files() {
+        let fixture = Fixture::new("dangling");
+        let outside = Fixture::new("dangling-outside");
+        let missing = outside.dir.join("new.txt");
+        std::os::unix::fs::symlink(&missing, fixture.dir.join("escape.txt")).unwrap();
+        let missing_directory = outside.dir.join("new-directory");
+        std::os::unix::fs::symlink(&missing_directory, fixture.dir.join("escape-dir")).unwrap();
+        let workspace = fixture.workspace();
+        let tool = WriteTool::new(workspace.clone());
+        for path in ["escape.txt", "escape-dir/new.txt"] {
+            assert!(workspace.resolve(path).is_err());
+            assert!(
+                tool.call(json!({"path": path, "content": "escaped"}))
+                    .await
+                    .is_err()
+            );
+        }
+        assert!(!missing.exists());
+        assert!(!missing_directory.exists());
+        assert!(workspace.resolve("new-directory/new.txt").is_ok());
+    }
+
+    #[tokio::test]
+    async fn invalid_read_ranges_fail_and_ranges_past_eof_are_empty() {
+        let fixture = Fixture::new("read-ranges");
+        fixture.write("text.txt", "one\ntwo\nthree\n");
+        let tool = ReadTool::new(fixture.workspace());
+        for (start, end) in [(3, 1), (2, 0)] {
+            assert!(
+                tool.call(json!({"path": "text.txt", "start_line": start, "end_line": end}))
+                    .await
+                    .is_err()
+            );
+        }
+        let empty = tool
+            .call(json!({"path": "text.txt", "start_line": 10}))
+            .await
+            .unwrap();
+        assert_eq!(empty["lines"], json!([]));
+        let last = tool
+            .call(json!({"path": "text.txt", "start_line": 3, "end_line": 20}))
+            .await
+            .unwrap();
+        assert_eq!(last["lines"], json!([{"line": 3, "text": "three"}]));
+    }
+
+    #[tokio::test]
+    async fn writes_replace_atomically_and_keep_existing_permissions() {
+        use std::os::unix::fs::PermissionsExt;
+        let fixture = Fixture::new("atomic-write");
+        fixture.write("run.sh", "old");
+        let path = fixture.dir.join("run.sh");
+        std::fs::set_permissions(&path, std::fs::Permissions::from_mode(0o751)).unwrap();
+        let mut old_file = std::fs::File::open(&path).unwrap();
+        WriteTool::new(fixture.workspace())
+            .call(json!({"path": "run.sh", "content": "new", "expect_hash": content_hash(b"old")}))
+            .await
+            .unwrap();
+        let mut old_content = String::new();
+        old_file.read_to_string(&mut old_content).unwrap();
+        assert_eq!(old_content, "old");
+        assert_eq!(std::fs::read_to_string(&path).unwrap(), "new");
+        assert_eq!(
+            std::fs::metadata(&path).unwrap().permissions().mode() & 0o777,
+            0o751
+        );
+    }
+
+    #[test]
+    fn failed_atomic_replacements_remove_their_temporary_file() {
+        let fixture = Fixture::new("atomic-failure");
+        let directory = fixture.dir.join("directory");
+        std::fs::create_dir(&directory).unwrap();
+        assert!(write_atomically(&directory, b"new").is_err());
+        assert!(directory.is_dir());
+        assert_eq!(std::fs::read_dir(&fixture.dir).unwrap().count(), 1);
+    }
+
     #[tokio::test]
     async fn unicode_paths_work() {
         let fixture = Fixture::new("unicode");
@@ -1384,9 +1580,6 @@ mod tests {
         let workspace = fixture.workspace();
         let tool = WriteTool::new(workspace.clone());
 
-        // Read first, so the caller has the revision it is replacing.
-        let read = crate::Tool::call(&tool, json!({ "path": "src/lib.rs" })).await;
-        let _ = read;
         let original = workspace.read_text("src/lib.rs").unwrap();
         let hash = content_hash(original.as_bytes());
 

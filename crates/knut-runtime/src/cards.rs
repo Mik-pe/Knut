@@ -1,13 +1,4 @@
-//! Streaming action cards for the workbench (issue #28).
-//!
-//! A card is the UI view of one unit of work: a tool call, a plan node or
-//! a model turn. Cards carry stable identifiers, an explicit lifecycle
-//! state, elapsed time and expandable output, so a stream is readable
-//! while it runs and distinguishable afterwards.
-//!
-//! States mirror what the engine actually reports. Nothing here invents
-//! progress: a card only changes state when a session event says so, and
-//! "succeeded" is never assumed from silence.
+//! Card transitions follow session events; silence does not imply success.
 
 use serde_json::Value;
 

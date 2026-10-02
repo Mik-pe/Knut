@@ -1,24 +1,6 @@
-//! Language intelligence as tools and evidence (issue #37).
-//!
-//! Navigation and diagnostics come from a supervised language server, and
-//! are treated as *evidence*: a definition that jumps somewhere useful is
-//! navigation, not proof that a patch is correct. Compilers and tests
-//! remain separate evidence (#26).
-//!
-//! Rules carried through:
-//! - **trust is explicit.** Starting a server runs a program named by
-//!   configuration; a missing server degrades to the existing search
-//!   tools, never to a silent install or a broken session.
-//! - **nothing is inherited.** The server runs with a cleared environment
-//!   and a bounded timeout, like any other supervised process.
-//! - **versions are tracked.** A diagnostic for an older document version
-//!   can never mark the current patch as verified.
-//! - **not-ready is not "no errors".** A server that has not finished
-//!   indexing says so.
-//! - **server edits are never applied.** They become a reviewable patch.
-//!
-//! Tested protocol revision: LSP 3.18 (documented below), with the
-//! compatibility limits stated rather than implied.
+//! Language-server output is navigation evidence, not completion proof.
+//! Stale diagnostics and unfinished indexing cannot verify a patch; server edits
+//! remain proposals for review.
 
 use std::collections::BTreeMap;
 use std::time::Duration;

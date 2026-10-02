@@ -1,25 +1,6 @@
-//! Bounded subagents with isolated workspaces (issue #38).
-//!
-//! A reasoner may delegate genuinely independent work to a child, but the
-//! delegation is an explicit *contract*: goal, allowed context and tools,
-//! expected artifacts, acceptance checks and budget. Jev may choose among
-//! known contracts or decline; it never invents a subagent's instructions.
-//!
-//! Rules carried through:
-//! - **read-only first.** Investigation and review workers are the
-//!   default. A write worker exists only in its own isolated tree with a
-//!   recorded source revision, and a worktree is *not* a sandbox: #25's
-//!   execution restrictions still apply inside it.
-//! - **children cannot expand anything.** Shared parent/session limits, a
-//!   small concurrency cap, no recursive spawning, and no tool, provider
-//!   or egress permission a child was not granted.
-//! - **the parent owns integration.** A child returns evidence or a
-//!   proposed patch; completion does not merge code. Conflicting patches
-//!   need explicit reconciliation and fresh combined checks.
-//! - **cancellation reaches children.** Cancelling the parent stops queued
-//!   and active children, so no hidden background spend continues.
-//! - **cleanup is safe.** A crash does not silently delete a dirty
-//!   directory.
+//! Worker isolation does not replace sandboxing or expand parent permissions.
+//! The parent integrates returned patches and runs combined checks; dirty worker
+//! directories survive cleanup failures.
 
 use std::collections::{BTreeMap, BTreeSet};
 use std::path::{Path, PathBuf};

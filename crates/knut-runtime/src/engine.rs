@@ -1,22 +1,5 @@
-//! The workbench's live engine: the real session runtime, driven from the
-//! shell.
-//!
-//! The TUI never executes tools itself. It publishes [`SessionCommand`]s
-//! and renders [`SessionEvent`]s; this module is the thread in between,
-//! owning a [`SessionRuntime`] built over the same provider, tools, gate
-//! and checks that `knut run` uses. Anything the shell has that `run` does
-//! not — a spinner, a queue, a decision pane — is a *view* of those
-//! events, never a second implementation of the work.
-//!
-//! Two properties are load-bearing:
-//!
-//! - **Events reach the UI incrementally.** The runtime emits into its own
-//!   bounded log; this driver tails that log by index and forwards only
-//!   new events, so the shell paints a live transcript and never
-//!   duplicates one.
-//! - **Absence is honest.** With no provider configured the driver still
-//!   runs and reports exactly what is missing, as an actionable task
-//!   failure, rather than passing a scripted demo off as live work.
+//! The shell consumes session events rather than executing tools. Missing
+//! providers produce task failures rather than scripted fallback responses.
 
 use std::sync::Arc;
 use std::sync::atomic::{AtomicBool, Ordering};
@@ -80,7 +63,7 @@ pub fn build_here() -> (Engine, EngineReport) {
     match Workspace::open(".") {
         Ok(workspace) => build(workspace),
         Err(err) => (
-            minimal_engine(Some(format!("workspace unavailable: {err}"))),
+            minimal_engine(),
             EngineReport {
                 model: None,
                 base_url: None,
@@ -98,7 +81,7 @@ pub fn build_here() -> (Engine, EngineReport) {
 
 /// A runtime with no tools and no model: enough to accept commands and
 /// report why they cannot be carried out.
-fn minimal_engine(reason: Option<String>) -> Engine {
+fn minimal_engine() -> Engine {
     let gate = Arc::new(ExecutionGate::new(
         SideEffectPolicy::new().allow(crate::SideEffect::ReadOnly),
     ));
@@ -110,7 +93,6 @@ fn minimal_engine(reason: Option<String>) -> Engine {
         Arc::new(ComputeCascade::empty()),
         Arc::new(crate::AcceptAllVerifier),
     );
-    let _ = reason;
     Engine::new(runtime, None)
 }
 
@@ -144,7 +126,7 @@ pub fn build_harness(setup: crate::HarnessSetup, approve_writes: bool) -> (Engin
 
 fn unavailable_engine(reason: String) -> (Engine, EngineReport) {
     (
-        minimal_engine(Some(reason.clone())),
+        minimal_engine(),
         EngineReport {
             model: None,
             base_url: None,
@@ -411,11 +393,11 @@ impl Engine {
         let supervisor = Arc::new(Supervisor::new(workspace.clone()));
         let profile = CheckProfile::for_workspace(&workspace)?;
         let runner = CheckRunner::new(workspace, supervisor, profile);
-        let revision = runner.current_revision("workspace")?;
-        let evidence = runner.run_all(&revision).await;
-        Ok(evidence
+        let report = runner.run_report().await?;
+        Ok(report
+            .checks
             .iter()
-            .map(|check| crate::review::CheckRow::from_evidence(check, &revision.revision))
+            .map(|check| crate::review::CheckRow::from_evidence(check, &report.revision.revision))
             .collect())
     }
 
@@ -1088,7 +1070,7 @@ mod tests {
     }
     #[test]
     fn event_delivery_survives_retained_history_rollover() {
-        let mut engine = minimal_engine(None);
+        let mut engine = minimal_engine();
         let (tx, mut rx) = tokio::sync::mpsc::unbounded_channel();
         for index in 0..crate::session::EVENT_LOG_CAPACITY + 20 {
             engine.runtime.emit_runtime_error(format!("event {index}"));
@@ -1328,7 +1310,7 @@ mod tests {
     }
     #[tokio::test]
     async fn changing_models_keeps_session_ids_and_refuses_paused_tasks() {
-        let mut engine = minimal_engine(None);
+        let mut engine = minimal_engine();
         engine
             .runtime
             .command(SessionCommand::Submit {

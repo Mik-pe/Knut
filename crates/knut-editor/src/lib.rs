@@ -1,17 +1,5 @@
-//! The composer: a real multiline editor for the workbench (issue #28).
-//!
-//! Editing is grapheme-aware, so Swedish combining marks, emoji sequences
-//! and CJK text move and delete the way a person expects rather than by
-//! byte or code point. Undo/redo, history and bracketed paste are all
-//! pure state transitions, so the whole editor is testable without a
-//! terminal.
-//!
-//! Rules that keep the keyboard predictable:
-//! - Enter submits; Ctrl+J inserts a newline. A large paste never
-//!   auto-submits and never blocks rendering.
-//! - When a dialog (help, palette) is open it owns the keyboard, so an
-//!   Escape or a submit cannot both fire.
-//! - Nothing here performs I/O, clipboard commands or provider calls.
+//! Cursor positions use grapheme clusters; input limits count Unicode scalars,
+//! including newline separators.
 
 use unicode_segmentation::UnicodeSegmentation;
 
@@ -29,6 +17,9 @@ pub const MAX_COMPOSER_CHARS: usize = 200_000;
 
 /// Maximum retained history entries.
 pub const MAX_HISTORY: usize = 100;
+
+const MAX_LINES: usize = 10_000;
+const MAX_UNDO_SNAPSHOTS: usize = 200;
 
 /// The editor buffer plus its editing history.
 #[derive(Debug, Clone, PartialEq)]
@@ -130,10 +121,12 @@ impl Composer {
     /// Record the current state before a mutation, so it can be undone.
     fn checkpoint(&mut self) {
         self.undo.push(self.snapshot());
-        if self.undo.len() > 200 {
+        if self.undo.len() > MAX_UNDO_SNAPSHOTS {
             self.undo.remove(0);
         }
         self.redo.clear();
+        self.history_cursor = None;
+        self.history_draft = None;
     }
 
     /// Undo the last edit. Returns whether anything changed.
@@ -143,6 +136,8 @@ impl Composer {
         };
         self.redo.push(self.snapshot());
         self.restore(previous);
+        self.history_cursor = None;
+        self.history_draft = None;
         true
     }
 
@@ -153,34 +148,24 @@ impl Composer {
         };
         self.undo.push(self.snapshot());
         self.restore(next);
+        self.history_cursor = None;
+        self.history_draft = None;
         true
     }
 
-    /// Insert one grapheme at the cursor.
     pub fn insert(&mut self, text: &str) {
-        if self.len_chars() + text.chars().count() > MAX_COMPOSER_CHARS {
+        let normalized = text.replace("\r\n", "\n");
+        if self.len_chars() + normalized.chars().count() > MAX_COMPOSER_CHARS
+            || self.lines.len() + normalized.matches('\n').count() > MAX_LINES
+        {
             return;
         }
-        self.checkpoint();
-        let row = self.cursor_row;
-        let graphemes: Vec<&str> = self.lines[row].graphemes(true).collect();
-        let index = self.cursor_col.min(graphemes.len());
-        let mut rebuilt = String::with_capacity(self.lines[row].len() + text.len());
-        for grapheme in graphemes.iter().take(index) {
-            rebuilt.push_str(grapheme);
-        }
-        rebuilt.push_str(text);
-        for grapheme in graphemes.iter().skip(index) {
-            rebuilt.push_str(grapheme);
-        }
-        self.lines[row] = rebuilt;
-        self.cursor_col = index + text.graphemes(true).count();
-        self.history_cursor = None;
+        self.insert_text(&normalized, MAX_COMPOSER_CHARS);
     }
 
     /// Insert a newline (Ctrl+J), splitting the line at the cursor.
     pub fn insert_newline(&mut self) {
-        if self.lines.len() >= 10_000 || self.len_chars() >= MAX_COMPOSER_CHARS {
+        if self.lines.len() >= MAX_LINES || self.len_chars() >= MAX_COMPOSER_CHARS {
             return;
         }
         self.checkpoint();
@@ -226,6 +211,9 @@ impl Composer {
 
     /// Delete forward one grapheme.
     pub fn delete(&mut self) {
+        if self.cursor_col == self.current_graphemes() && self.cursor_row + 1 == self.lines.len() {
+            return;
+        }
         self.checkpoint();
         let row = self.cursor_row;
         let graphemes: Vec<&str> = self.lines[row].graphemes(true).collect();
@@ -319,7 +307,6 @@ impl Composer {
         self.lines.splice(row..=self.cursor_row, [head + &tail]);
         self.cursor_row = row;
         self.cursor_col = col;
-        self.history_cursor = None;
     }
 
     /// Move up a line, keeping the cursor in range.
@@ -374,25 +361,29 @@ impl Composer {
     /// user knows the buffer is not the whole paste.
     pub fn paste(&mut self, text: &str) {
         let normalized = text.replace("\r\n", "\n");
+        self.last_paste_truncated = self.insert_text(&normalized, MAX_PASTE_CHARS);
+    }
+
+    fn insert_text(&mut self, text: &str, limit: usize) -> bool {
         let available = MAX_COMPOSER_CHARS
             .saturating_sub(self.len_chars())
-            .min(MAX_PASTE_CHARS);
+            .min(limit);
         let mut characters = 0;
         let mut newlines = 0;
         let mut end = 0;
-        for (offset, grapheme) in normalized.grapheme_indices(true) {
+        for (offset, grapheme) in text.grapheme_indices(true) {
             let cost = grapheme.chars().count();
             let lines = usize::from(grapheme == "\n");
-            if characters + cost > available || self.lines.len() + newlines + lines > 10_000 {
+            if characters + cost > available || self.lines.len() + newlines + lines > MAX_LINES {
                 break;
             }
             characters += cost;
             newlines += lines;
             end = offset + grapheme.len();
         }
-        self.last_paste_truncated = end < normalized.len();
+        let truncated = end < text.len();
         if end == 0 {
-            return;
+            return truncated;
         }
         self.checkpoint();
         let head: String = self
@@ -405,7 +396,7 @@ impl Composer {
             .graphemes(true)
             .skip(self.cursor_col)
             .collect();
-        let mut inserted: Vec<String> = normalized[..end].split('\n').map(str::to_owned).collect();
+        let mut inserted: Vec<String> = text[..end].split('\n').map(str::to_owned).collect();
         inserted[0].insert_str(0, &head);
         let last = inserted.len() - 1;
         let col = inserted[last].graphemes(true).count();
@@ -414,15 +405,17 @@ impl Composer {
             .splice(self.cursor_row..=self.cursor_row, inserted);
         self.cursor_row += last;
         self.cursor_col = col;
-        self.history_cursor = None;
+        truncated
     }
 
     pub fn clear(&mut self) {
+        if self.len_chars() == 0 {
+            return;
+        }
         self.checkpoint();
         self.lines = vec![String::new()];
         self.cursor_row = 0;
         self.cursor_col = 0;
-        self.history_cursor = None;
     }
 
     /// Take the buffer for submission and record it in history.
@@ -442,6 +435,7 @@ impl Composer {
         self.cursor_col = 0;
         self.undo.clear();
         self.redo.clear();
+        self.last_paste_truncated = false;
         Some(text)
     }
 
@@ -490,6 +484,71 @@ mod tests {
         let mut c = Composer::new();
         c.insert(&"x".repeat(cap));
         c
+    }
+
+    #[test]
+    fn incremental_combining_marks_keep_the_cursor_on_a_grapheme_boundary() {
+        let mut composer = Composer::new();
+        composer.insert("a");
+        composer.insert("\u{030a}");
+        assert_eq!(composer.cursor(), (0, 1));
+        composer.word_left();
+        assert_eq!(composer.cursor(), (0, 0));
+        composer.end();
+        composer.backspace();
+        assert!(composer.is_empty());
+    }
+
+    #[test]
+    fn inserted_multiline_text_remains_editable_and_undoes_atomically() {
+        let mut composer = typed("head tail");
+        composer.home();
+        for _ in 0..5 {
+            composer.right();
+        }
+        composer.insert("first\r\nsecond");
+        assert_eq!(composer.lines(), &["head first", "secondtail"]);
+        assert_eq!(composer.cursor(), (1, 6));
+        composer.up();
+        assert_eq!(composer.cursor(), (0, 6));
+        assert!(composer.undo());
+        assert_eq!(composer.text(), "head tail");
+        assert_eq!(composer.cursor(), (0, 5));
+    }
+
+    #[test]
+    fn no_op_deletion_preserves_undo_and_redo() {
+        let mut composer = typed("a");
+        composer.insert("b");
+        composer.delete();
+        assert!(composer.undo());
+        assert_eq!(composer.text(), "a");
+        composer.delete();
+        assert!(composer.redo());
+        assert_eq!(composer.text(), "ab");
+    }
+
+    #[test]
+    fn editing_recalled_history_becomes_the_current_draft() {
+        for edit in [
+            Composer::backspace,
+            Composer::delete,
+            Composer::insert_newline,
+        ] {
+            let mut composer = typed("previous");
+            composer.take_submission();
+            composer.insert("draft");
+            composer.up();
+            composer.home();
+            composer.right();
+            edit(&mut composer);
+            let edited = composer.text();
+            while composer.cursor().0 + 1 < composer.lines().len() {
+                composer.down();
+            }
+            composer.down();
+            assert_eq!(composer.text(), edited);
+        }
     }
 
     #[test]

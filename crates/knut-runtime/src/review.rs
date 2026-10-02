@@ -1,20 +1,6 @@
-//! The review workspace: diffs, hunk selection, approvals and check
-//! evidence in one view (issue #29).
-//!
-//! Review is the centre of the coding loop here, so the pieces the user
-//! needs are computed and presented together: what will change, exactly
-//! what is being approved, what has actually been checked against which
-//! revision, and what remains unresolved.
-//!
-//! Two rules carry most of the weight:
-//! - **selecting a subset is a new proposal.** Rejecting a hunk produces a
-//!   different normalized patch with a different identity, so an earlier
-//!   approval — and any check evidence bound to the old revision — cannot
-//!   silently authorize the revised change.
-//! - **an approval cannot capture a keystroke.** The view tracks a
-//!   monotonic approval generation, and a prompt that appears while the
-//!   user is typing is not allowed to consume a key meant for the
-//!   composer.
+//! Selecting different hunks creates a new proposal and invalidates prior
+//! approvals. Approval generations prevent newly appearing prompts from consuming
+//! keystrokes intended for the composer.
 
 use std::collections::BTreeMap;
 

@@ -1,31 +1,13 @@
-//! The workbench shell: terminal setup, input handling and the event loop
-//! (issue #27).
-//!
-//! Kept deliberately thin. All state transitions live in
-//! [`crate::tui_state`] and all drawing in [`crate::tui_render`]; this
-//! module only turns keystrokes into updates and session commands.
-//!
-//! Terminal correctness is a requirement, not a nicety: raw mode and the
-//! alternate screen are restored on normal exit, error and panic, and
-//! nothing logs to stdout while the display is active.
-
-use std::io::Stdout;
 use std::sync::Arc;
-use std::sync::atomic::{AtomicBool, Ordering};
 use std::time::Duration;
 
 use crossterm::event::{Event, KeyCode, KeyEvent, KeyEventKind, KeyModifiers};
-use crossterm::terminal::{
-    EnterAlternateScreen, LeaveAlternateScreen, disable_raw_mode, enable_raw_mode,
-};
-use crossterm::{execute, terminal};
-use ratatui::Terminal;
-use ratatui::backend::CrosstermBackend;
 
 use crate::connection::{
     ConnectionAction, ConnectionJob, ConnectionOutcome, ConnectionPage, ConnectionPanel,
 };
 use crate::session::{SessionCommand, SessionEvent};
+use crate::terminal::{TerminalGuard, install_signal_handler, shutdown_requested};
 use crate::tui_render::Tab;
 use crate::tui_state::{Focus, WorkbenchState};
 
@@ -104,14 +86,14 @@ pub fn handle_key(state: &mut WorkbenchState, key: KeyEvent, tab: &mut Tab) -> S
     if ctrl && key.code == KeyCode::Char('c') {
         if state.help
             || state.palette_open()
-            || state.review.is_some()
+            || state.review_open
             || state.approval_open
             || *tab != Tab::Timeline
         {
             state.help = false;
             state.approval_open = false;
             state.close_palette();
-            state.review = None;
+            state.review_open = false;
             *tab = Tab::Timeline;
             state.focus = Focus::Composer;
         } else if state.queue_edit.is_some() {
@@ -175,7 +157,7 @@ pub fn handle_key(state: &mut WorkbenchState, key: KeyEvent, tab: &mut Tab) -> S
                     .get(state.palette_selection)
                     .cloned();
                 match selected {
-                    Some(command) if command.is_available() => {
+                    Some(command) => {
                         state.close_palette();
                         palette_action(state, tab, command.id)
                     }
@@ -192,7 +174,7 @@ pub fn handle_key(state: &mut WorkbenchState, key: KeyEvent, tab: &mut Tab) -> S
         || (key.code == KeyCode::Char('?')
             && !ctrl
             && !alt
-            && (state.composer.text().is_empty() || state.review.is_some()))
+            && (state.composer.text().is_empty() || state.review_open))
     {
         state.help = true;
         state.help_scroll = 0;
@@ -200,15 +182,15 @@ pub fn handle_key(state: &mut WorkbenchState, key: KeyEvent, tab: &mut Tab) -> S
     }
     if ctrl {
         return match key.code {
-            KeyCode::Left if state.review.is_none() => {
+            KeyCode::Left if !state.review_open => {
                 state.composer.word_left();
                 ShellAction::Continue
             }
-            KeyCode::Right if state.review.is_none() => {
+            KeyCode::Right if !state.review_open => {
                 state.composer.word_right();
                 ShellAction::Continue
             }
-            KeyCode::Char('w') | KeyCode::Backspace if state.review.is_none() => {
+            KeyCode::Char('w') | KeyCode::Backspace if !state.review_open => {
                 state.composer.delete_word_left();
                 ShellAction::Continue
             }
@@ -257,23 +239,23 @@ pub fn handle_key(state: &mut WorkbenchState, key: KeyEvent, tab: &mut Tab) -> S
                     ShellAction::Quit
                 }
             }
-            KeyCode::Char('a') if state.review.is_none() => {
+            KeyCode::Char('a') if !state.review_open => {
                 state.composer.home();
                 ShellAction::Continue
             }
-            KeyCode::Char('e') if state.review.is_none() => {
+            KeyCode::Char('e') if !state.review_open => {
                 state.composer.end();
                 ShellAction::Continue
             }
-            KeyCode::Char('j') if state.review.is_none() => {
+            KeyCode::Char('j') if !state.review_open => {
                 state.composer.insert_newline();
                 ShellAction::Continue
             }
-            KeyCode::Char('z') if state.review.is_none() => {
+            KeyCode::Char('z') if !state.review_open => {
                 state.composer.undo();
                 ShellAction::Continue
             }
-            KeyCode::Char('y') if state.review.is_none() => {
+            KeyCode::Char('y') if !state.review_open => {
                 state.composer.redo();
                 ShellAction::Continue
             }
@@ -285,7 +267,7 @@ pub fn handle_key(state: &mut WorkbenchState, key: KeyEvent, tab: &mut Tab) -> S
         };
     }
     if alt {
-        if state.review.is_none() {
+        if !state.review_open {
             match key.code {
                 KeyCode::Char('b') | KeyCode::Left => {
                     state.composer.word_left();
@@ -357,13 +339,15 @@ pub fn handle_key(state: &mut WorkbenchState, key: KeyEvent, tab: &mut Tab) -> S
     if key.code == KeyCode::Esc {
         state.approval_open = false;
         state.restore_draft();
-        state.review = None;
+        state.review_open = false;
         *tab = Tab::Timeline;
         state.focus = Focus::Composer;
         state.resume_follow();
         return ShellAction::Continue;
     }
-    if let Some(review) = state.review.as_mut() {
+    if state.review_open
+        && let Some(review) = state.review.as_mut()
+    {
         match key.code {
             KeyCode::PageUp => review.scroll = review.scroll.saturating_sub(10),
             KeyCode::PageDown => review.scroll = review.scroll.saturating_add(10),
@@ -559,171 +543,6 @@ fn palette_action(state: &mut WorkbenchState, tab: &mut Tab, id: &'static str) -
     }
 }
 
-/// A terminal session guard that always restores the terminal.
-///
-/// Restoration happens on normal exit, on error and on panic, because a
-/// shell that leaves a terminal in raw mode has done real damage to the
-/// user's session.
-pub struct TerminalGuard {
-    terminal: Terminal<CrosstermBackend<Stdout>>,
-    restored: bool,
-}
-
-impl TerminalGuard {
-    /// Enter the alternate screen and raw mode.
-    ///
-    /// The viewport is taken from the terminal size rather than a cursor
-    /// position query: some environments (background PTYs, recorded
-    /// sessions, CI) never answer that query, and a shell that refuses to
-    /// start there is not usable.
-    pub fn enter() -> std::io::Result<Self> {
-        let mut stdout = std::io::stdout();
-        enable_raw_mode()?;
-        execute!(
-            stdout,
-            EnterAlternateScreen,
-            crossterm::event::EnableBracketedPaste,
-            crossterm::event::PushKeyboardEnhancementFlags(
-                crossterm::event::KeyboardEnhancementFlags::DISAMBIGUATE_ESCAPE_CODES
-            )
-        )?;
-        let backend = CrosstermBackend::new(stdout);
-        // A fixed viewport means no cursor-position query is needed, and
-        // the full-screen layout still comes from the real terminal size.
-        let (cols, rows) = terminal::size()?;
-        let area = ratatui::layout::Rect::new(0, 0, cols, rows);
-        let options = ratatui::TerminalOptions {
-            viewport: ratatui::Viewport::Fixed(area),
-        };
-        let terminal = Terminal::with_options(backend, options)?;
-        // `Terminal::clear` snapshots the cursor position (a terminal
-        // query that headless/background PTYs do not answer), so the
-        // region is cleared directly instead.
-        execute!(std::io::stdout(), terminal::Clear(terminal::ClearType::All))?;
-
-        // Restore before the panic message prints, so the message is
-        // readable and the terminal is usable.
-        let previous = std::panic::take_hook();
-        std::panic::set_hook(Box::new(move |info| {
-            let _ = restore_terminal();
-            previous(info);
-        }));
-
-        Ok(Self {
-            terminal,
-            restored: false,
-        })
-    }
-
-    pub fn terminal(&mut self) -> &mut Terminal<CrosstermBackend<Stdout>> {
-        &mut self.terminal
-    }
-
-    /// Restore the terminal explicitly (also happens on drop).
-    pub fn restore(&mut self) {
-        if !self.restored {
-            let _ = restore_terminal();
-            self.restored = true;
-        }
-    }
-}
-
-impl Drop for TerminalGuard {
-    fn drop(&mut self) {
-        self.restore();
-    }
-}
-
-fn restore_terminal() -> std::io::Result<()> {
-    disable_raw_mode()?;
-    let mut stdout = std::io::stdout();
-    execute!(
-        stdout,
-        crossterm::event::PopKeyboardEnhancementFlags,
-        crossterm::event::DisableBracketedPaste,
-        LeaveAlternateScreen
-    )?;
-    terminal::disable_raw_mode()?;
-    Ok(())
-}
-
-/// Ask the process to exit on SIGINT/SIGTERM.
-///
-/// The handler only flips a process-wide atomic: nothing allocates, locks
-/// or reads a `String` in signal context, and the loop observes the flag
-/// between polls. Ctrl+C is also handled as a key event, because raw mode
-/// delivers it that way.
-fn install_signal_handler(flag: Arc<AtomicBool>) -> std::io::Result<()> {
-    static SHUTDOWN: AtomicBool = AtomicBool::new(false);
-    // A single process-wide flag keeps the signal handler trivial; the
-    // caller's own flag is folded in by the loop below.
-    INSTALLED.call_once(|| unsafe {
-        libc::signal(
-            libc::SIGINT,
-            handle_signal as *const () as libc::sighandler_t,
-        );
-        libc::signal(
-            libc::SIGTERM,
-            handle_signal as *const () as libc::sighandler_t,
-        );
-    });
-    // Mirror the shared flag into the signal-safe one so both paths agree.
-    if flag.load(Ordering::SeqCst) {
-        SHUTDOWN.store(true, Ordering::SeqCst);
-    }
-    Ok(())
-}
-
-/// Set by the signal handler when the process was asked to stop.
-pub fn shutdown_requested() -> bool {
-    SHUTDOWN.load(Ordering::SeqCst)
-}
-
-/// Reset the shutdown flag (so a later shell in the same process starts
-/// clean).
-pub fn clear_shutdown() {
-    SHUTDOWN.store(false, Ordering::SeqCst);
-}
-
-extern "C" fn handle_signal(_signal: libc::c_int) {
-    // Async-signal-safe: one relaxed store, no allocation, no locks.
-    SHUTDOWN.store(true, Ordering::SeqCst);
-}
-
-/// Set once when the handlers are installed.
-static INSTALLED: std::sync::Once = std::sync::Once::new();
-
-/// The process-wide shutdown flag, signal-safe to set.
-static SHUTDOWN: AtomicBool = AtomicBool::new(false);
-
-/// Whether an on-demand check run is in flight.
-///
-/// A tiny state machine rather than a shared `Option` behind a lock: the
-/// shell is single-threaded over its state, so a plain flag is enough and
-/// two `v` presses cannot start two check runs.
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
-struct CheckGate {
-    running: bool,
-}
-
-impl CheckGate {
-    fn idle() -> Self {
-        Self { running: false }
-    }
-
-    fn get(&self) -> Option<()> {
-        self.running.then_some(())
-    }
-
-    fn start(&mut self) {
-        self.running = true;
-    }
-
-    fn finish(&mut self) {
-        self.running = false;
-    }
-}
-
 /// The result of an on-demand check run.
 ///
 /// Deliberately a plain message rather than a shared future: the shell
@@ -742,7 +561,7 @@ pub enum CheckOutcome {
 
 /// Run the workspace's checks on a blocking thread.
 ///
-/// `run_all` is async and spawns processes; the shell is a separate
+/// `run_report` is async and spawns processes; the shell is a separate
 /// runtime task, so this hops to a blocking worker and returns a plain
 /// message.
 async fn run_checks_blocking() -> CheckOutcome {
@@ -757,19 +576,18 @@ async fn run_checks_blocking() -> CheckOutcome {
         let profile = crate::CheckProfile::for_workspace(&workspace)
             .map_err(|err| format!("checks unavailable: {err}"))?;
         let runner = crate::CheckRunner::new(workspace, supervisor, profile);
-        let revision = runner
-            .current_revision("workspace")
-            .map_err(|err| format!("cannot identify the current revision: {err}"))?;
-        let evidence = runtime.block_on(runner.run_all(&revision));
-        let current = runner
-            .current_revision("workspace")
-            .map_err(|err| format!("cannot identify the checked revision: {err}"))?;
+        let report = runtime
+            .block_on(runner.run_report())
+            .map_err(|err| format!("cannot verify the workspace: {err}"))?;
         Ok::<_, String>((
-            evidence
+            report
+                .checks
                 .iter()
-                .map(|check| crate::review::CheckRow::from_evidence(check, &current.revision))
+                .map(|check| {
+                    crate::review::CheckRow::from_evidence(check, &report.revision.revision)
+                })
                 .collect::<Vec<_>>(),
-            current.revision,
+            report.revision.revision,
         ))
     })
     .await;
@@ -794,8 +612,7 @@ pub async fn run_shell(
 ) -> std::io::Result<()> {
     // Signal-driven shutdown, so a Ctrl+C delivered as a signal (or a
     // closing terminal) still restores the display.
-    clear_shutdown();
-    install_signal_handler(Arc::new(AtomicBool::new(false)))?;
+    install_signal_handler();
 
     let mut memory = match crate::persist::EditorMemory::open(
         &crate::persist::session_store_path(),
@@ -860,7 +677,7 @@ async fn run_loop(
     // Checks run on demand and are *not* on the keystroke path: the loop
     // stays responsive, and a finished run arrives as a message.
     let (check_tx, mut check_rx) = tokio::sync::mpsc::unbounded_channel::<CheckOutcome>();
-    let mut checks = CheckGate::idle();
+    let mut checks_running = false;
     let animation_start = std::time::Instant::now();
     let mut redraw = true;
     let mut last_elapsed = 0;
@@ -873,7 +690,7 @@ async fn run_loop(
             redraw = true;
         }
         while let Ok(outcome) = check_rx.try_recv() {
-            checks.finish();
+            checks_running = false;
             state.apply_check_outcome(outcome);
             redraw = true;
         }
@@ -1000,8 +817,8 @@ async fn run_loop(
                             // The checks are the binary's real ones, run
                             // off the paint path; the result comes back as
                             // a message, never as a blocking call here.
-                            if checks.get().is_none() {
-                                checks.start();
+                            if !checks_running {
+                                checks_running = true;
                                 state.status = Some("running checks…".to_owned());
                                 let tx = check_tx.clone();
                                 tokio::spawn(async move {
@@ -1010,41 +827,14 @@ async fn run_loop(
                                 });
                             }
                         }
-                        ShellAction::Review => {
-                            // Review opens over whatever the session has
-                            // actually recorded; with nothing recorded it
-                            // says so rather than opening an empty diff.
-                            // Review shows what the session actually
-                            // recorded: its checks always, and its diff
-                            // when a change was validated. With neither,
-                            // it says so rather than opening an empty pane.
-                            match state.review.take() {
-                                Some(_) => {}
-                                None => {
-                                    let checks = state.known_checks();
-                                    let files = state.review_changes();
-                                    if checks.is_empty() && files.is_empty() {
-                                        state.status =
-                                            Some("no changes or checks to review yet".to_owned());
-                                    } else {
-                                        let mut view = crate::review::ReviewView::new(files);
-                                        view.checks = checks;
-                                        state.review = Some(view);
-                                    }
-                                }
-                            }
-                        }
-                        // The remaining palette entries are honest no-ops
-                        // in this increment: they either map to a command
-                        // the binary has (handled above) or are reported
-                        // as unavailable by the palette itself.
+                        ShellAction::Review => state.toggle_review(),
                         ShellAction::PaletteCommand(_) | ShellAction::Continue => {}
                     }
                 }
                 Event::Paste(text) => {
                     if !state.help
                         && !state.palette_open()
-                        && state.review.is_none()
+                        && !state.review_open
                         && state.connection.is_none()
                     {
                         state.composer.paste(&text);
@@ -1609,19 +1399,17 @@ mod tests {
     }
 
     #[test]
-    fn an_unavailable_palette_entry_cannot_be_selected() {
+    fn a_palette_search_without_matches_cannot_be_selected() {
         let mut state = WorkbenchState::new("/tmp/ws");
         state.focus = Focus::Timeline;
         let mut tab = Tab::Timeline;
 
-        // Search for a command that is explicitly unavailable.
         state.open_palette();
-        for c in "spawnsubagent".chars() {
+        for c in "zzzz".chars() {
             handle_key(&mut state, key(KeyCode::Char(c)), &mut tab);
         }
         assert!(state.palette_results().is_empty());
         let action = handle_key(&mut state, key(KeyCode::Enter), &mut tab);
-        // No palette command fires: the entry is honestly unavailable.
         assert_eq!(action, ShellAction::Continue);
         assert!(state.palette_open());
     }

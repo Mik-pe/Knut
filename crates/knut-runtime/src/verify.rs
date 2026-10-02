@@ -1,20 +1,5 @@
-//! Revision-bound verification evidence and substantive reasoner review
-//! (issue #26).
-//!
-//! "Valid JSON" is not "correct code". This module separates three
-//! things that are easy to blur together:
-//!
-//! 1. **artifact/schema validation** — the patch parsed and applied;
-//! 2. **check evidence** — a build/typecheck/test/lint command actually
-//!    ran against a specific source revision and reported what happened;
-//! 3. **semantic review** — the configured reasoner judged whether the
-//!    change satisfies the task, which is *additional* evidence, never a
-//!    substitute for checks.
-//!
-//! Completion requires (2) fresh for the current revision, and a check
-//! outcome is one of passed / failed / skipped / unavailable / stale /
-//! inconclusive. "No tests were discovered" is **not** passing, and a
-//! Jev judgment cannot override the evidence gate.
+//! Semantic review supplements revision-bound checks. Missing tests, stale
+//! evidence and unparsed reviews cannot become passing verification.
 
 use std::collections::BTreeMap;
 use std::sync::Arc;
@@ -24,7 +9,7 @@ use serde::{Deserialize, Serialize};
 use serde_json::{Value, json};
 
 use crate::sandbox::{CommandOutcome, CommandRequest, CommandStatus, Supervisor};
-use crate::workspace::{Workspace, content_hash};
+use crate::workspace::{Workspace, source_revision};
 use crate::{
     ArtifactRevision, CompletionRequirements, Evidence, ExpectedArtifact, KnutError, ModelRequest,
     ModelResponse, Verifier,
@@ -140,14 +125,22 @@ impl CheckProfile {
                     "build",
                     "the crate compiles",
                     "cargo",
-                    vec!["build".to_owned(), "--quiet".to_owned()],
+                    vec![
+                        "build".to_owned(),
+                        "--workspace".to_owned(),
+                        "--quiet".to_owned(),
+                    ],
                 )
                 .with_writable(vec![".".to_owned(), "target".to_owned()]),
                 CheckSpec::new(
                     "test",
                     "the test suite passes",
                     "cargo",
-                    vec!["test".to_owned(), "--quiet".to_owned()],
+                    vec![
+                        "test".to_owned(),
+                        "--workspace".to_owned(),
+                        "--quiet".to_owned(),
+                    ],
                 )
                 .with_writable(vec![".".to_owned(), "target".to_owned()])
                 // A run with no tests at all must not look like passing.
@@ -158,6 +151,7 @@ impl CheckProfile {
                     "cargo",
                     vec![
                         "clippy".to_owned(),
+                        "--workspace".to_owned(),
                         "--all-targets".to_owned(),
                         "--".to_owned(),
                         "-D".to_owned(),
@@ -211,13 +205,6 @@ impl CheckProfile {
             name: "workspace".to_owned(),
             checks,
         })
-    }
-
-    /// Whether this profile's primary toolchain is present.
-    pub fn tool_available(&self) -> bool {
-        self.checks
-            .first()
-            .is_some_and(|check| executable_exists(&check.program))
     }
 }
 
@@ -620,71 +607,28 @@ impl CheckRunner {
         evidence
     }
 
+    pub async fn run_report(&self) -> Result<EvidenceReport, KnutError> {
+        let revision = self.current_revision("workspace")?;
+        let checks = self.run_all(&revision).await;
+        let current = self.current_revision("workspace")?;
+        Ok(EvidenceReport::build(
+            &self.requirements(),
+            current,
+            checks,
+            Vec::new(),
+            None,
+        ))
+    }
+
     /// The source revision currently on disk, so evidence is bound to what
     /// is actually there.
     pub fn current_revision(
         &self,
         label: impl Into<String>,
     ) -> Result<ArtifactRevision, KnutError> {
-        // Hash the tracked project files, so the revision changes when
-        // any of them does. Ignore files are honored the same way the
-        // read/search tools honor them.
-        let mut files: Vec<(String, String)> = Vec::new();
-        let root = self.workspace.root().to_owned();
-        let rust_workspace = root.join("Cargo.toml").is_file();
-        let node_workspace = root.join("package.json").is_file();
-        let walker = ignore::WalkBuilder::new(&root)
-            .standard_filters(true)
-            .require_git(false)
-            .filter_entry(move |entry| {
-                let Ok(relative) = entry.path().strip_prefix(&root) else {
-                    return false;
-                };
-                let first = relative
-                    .components()
-                    .next()
-                    .map(|component| component.as_os_str());
-                !(rust_workspace && first == Some(std::ffi::OsStr::new("target"))
-                    || node_workspace && first == Some(std::ffi::OsStr::new("node_modules")))
-            })
-            .build();
-        for entry in walker.flatten() {
-            if !entry.file_type().is_some_and(|t| t.is_file()) {
-                continue;
-            }
-            let path = entry.path();
-            let Ok(relative) = path.strip_prefix(self.workspace.root()) else {
-                continue;
-            };
-            let relative = relative
-                .components()
-                .map(|c| c.as_os_str().to_string_lossy().into_owned())
-                .collect::<Vec<_>>()
-                .join("/");
-            if self.workspace.is_denied(&relative) {
-                continue;
-            }
-            let Ok(bytes) = std::fs::read(path) else {
-                continue;
-            };
-            // Skip oversized artifacts (build outputs) so the revision
-            // tracks source, not binaries.
-            if bytes.len() as u64 > 512 * 1024 {
-                continue;
-            }
-            files.push((relative, content_hash(&bytes)));
-        }
-        if files.is_empty() {
-            return Err(KnutError::Tool(
-                "no files to derive a revision from".to_owned(),
-            ));
-        }
-        // Paths are sorted, so the revision depends on content only.
-        files.sort();
-        let serialized = serde_json::to_vec(&files).unwrap_or_default();
         Ok(ArtifactRevision::new(
             label.into(),
-            content_hash(&serialized),
+            source_revision(&self.workspace)?,
         ))
     }
 }
@@ -873,10 +817,19 @@ impl EvidenceReport {
     pub fn build(
         requirements: &CompletionRequirements,
         revision: ArtifactRevision,
-        checks: Vec<CheckEvidence>,
+        mut checks: Vec<CheckEvidence>,
         weakened_tests: Vec<String>,
         review: Option<ReviewOutcome>,
     ) -> Self {
+        for check in &mut checks {
+            if check.revision != revision {
+                check.reason = format!(
+                    "checked revision {} differs from current revision {} ({:?}: {})",
+                    check.revision.revision, revision.revision, check.outcome, check.reason
+                );
+                check.outcome = CheckOutcome::Stale;
+            }
+        }
         let evidence: Vec<Evidence> = checks.iter().map(CheckEvidence::to_evidence).collect();
         let complete = requirements.satisfied(&evidence, &revision);
         let outstanding = requirements.missing(&evidence, &revision);
@@ -1197,6 +1150,8 @@ mod tests {
         );
         assert!(!report.complete, "stale evidence satisfied a new revision");
         assert!(!report.outstanding.is_empty());
+        assert_eq!(report.checks[0].outcome, CheckOutcome::Stale);
+        assert!(!report.checks[0].to_evidence().passed);
     }
 
     #[tokio::test]
@@ -1395,6 +1350,89 @@ mod tests {
         fixture.write("package.json", "{}\n");
         let profiles = discover_profiles(&fixture.workspace());
         assert_eq!(profiles.len(), 2);
+    }
+
+    #[test]
+    fn large_source_edits_invalidate_check_evidence() {
+        let fixture = Fixture::new("large-source");
+        fixture.write("Cargo.toml", "[package]\nname = \"x\"\n");
+        let mut source = "a".repeat(512 * 1024 + 1);
+        fixture.write("large.txt", &source);
+        let runner = runner(&fixture, CheckProfile::rust());
+        let before = runner.current_revision("workspace").unwrap();
+        source.replace_range(source.len() - 1.., "b");
+        fixture.write("large.txt", &source);
+        assert_ne!(before, runner.current_revision("workspace").unwrap());
+        std::fs::remove_file(fixture.dir.join("large.txt")).unwrap();
+        assert_ne!(before, runner.current_revision("workspace").unwrap());
+    }
+
+    #[test]
+    fn build_outputs_and_ignored_files_do_not_change_the_revision() {
+        let fixture = Fixture::new("revision-outputs");
+        fixture.write("Cargo.toml", "[package]\nname = \"x\"\n");
+        fixture.write("package.json", "{}");
+        fixture.write(".gitignore", "ignored/\n");
+        let runner = runner(&fixture, CheckProfile::rust());
+        let before = runner.current_revision("workspace").unwrap();
+        fixture.write("target/output", "build output");
+        fixture.write("node_modules/output", "dependency");
+        fixture.write("ignored/large.txt", &"a".repeat(512 * 1024 + 1));
+        assert_eq!(before, runner.current_revision("workspace").unwrap());
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn unreadable_sources_prevent_a_partial_revision() {
+        use std::os::unix::fs::PermissionsExt;
+
+        // Root can read files even when their permission bits deny access.
+        if unsafe { libc::geteuid() } == 0 {
+            return;
+        }
+        let fixture = Fixture::new("unreadable-source");
+        fixture.write("Cargo.toml", "[package]\nname = \"x\"\n");
+        fixture.write("unreadable.txt", "source");
+        let path = fixture.dir.join("unreadable.txt");
+        std::fs::set_permissions(&path, std::fs::Permissions::from_mode(0o000)).unwrap();
+        let result = runner(&fixture, CheckProfile::rust()).current_revision("workspace");
+        std::fs::set_permissions(&path, std::fs::Permissions::from_mode(0o600)).unwrap();
+        assert!(result.unwrap_err().to_string().contains("unreadable.txt"));
+    }
+
+    #[tokio::test]
+    async fn rust_checks_include_members_outside_the_default_package() {
+        let fixture = Fixture::new("workspace-members");
+        fixture.write(
+            "Cargo.toml",
+            "[package]\nname = \"root\"\nversion = \"0.1.0\"\nedition = \"2024\"\n[workspace]\nmembers = [\"member\"]\ndefault-members = [\".\"]\n",
+        );
+        fixture.write("src/lib.rs", "#[test] fn passes() {}\n");
+        fixture.write(
+            "member/Cargo.toml",
+            "[package]\nname = \"member\"\nversion = \"0.1.0\"\nedition = \"2024\"\n",
+        );
+        fixture.write(
+            "member/src/lib.rs",
+            "#[test] fn fails() { panic!(\"member failure\"); }\n",
+        );
+        let profile = CheckProfile::rust();
+        let check = profile
+            .checks
+            .iter()
+            .find(|check| check.name == "test")
+            .unwrap()
+            .clone();
+        let runner = runner(&fixture, profile);
+        let revision = runner.current_revision("workspace").unwrap();
+        let evidence = runner.run_check(&check, &revision).await.unwrap();
+        assert_eq!(
+            evidence.outcome,
+            CheckOutcome::Failed,
+            "{}",
+            evidence.output
+        );
+        assert_eq!(evidence.test_counts.failed, Some(1));
     }
 
     #[test]

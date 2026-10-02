@@ -1,16 +1,3 @@
-//! The workbench shell's UI state: a pure reducer over the shared session
-//! event stream (issue #27).
-//!
-//! The boundary is deliberate, following the Elm-style split the roadmap
-//! references: this module owns *state transitions only*. It performs no
-//! I/O, no rendering and no session work, so a slow or disconnected
-//! provider can never block typing, navigation or inspection. Rendering
-//! lives in [`crate::tui_render`]; the effects live in the binary.
-//!
-//! Timeline entries are fed from [`crate::SessionEvent`]s, so the TUI
-//! shows exactly what the engine published — it never runs its own loop
-//! or invents progress the runtime did not report.
-
 use crate::session::{SessionEvent, TaskState, WaitKind};
 use crate::theme::Theme;
 use crate::tree::NodeStatus;
@@ -77,8 +64,6 @@ pub struct WorkbenchState {
     pub workspace: String,
     /// Branch label, when known.
     pub branch: Option<String>,
-    /// Execution mode label (e.g. "quality").
-    pub mode: String,
     /// Provider/model label, when configured.
     pub model: Option<String>,
     pub chatgpt_plan: bool,
@@ -91,12 +76,6 @@ pub struct WorkbenchState {
     pub unavailable: Option<String>,
     /// How many completion checks gate this session.
     pub checks: usize,
-    /// Whether routing decisions come from a live System One rather than
-    /// the deterministic fallback. It matters to the user: live routing is
-    /// what lets a prompt reach the workspace tools.
-    pub live_routing: bool,
-    /// Model calls observed by the runtime.
-    pub model_calls: u64,
     /// Wall-clock start of the current task, for the header ticker.
     task_started: Option<std::time::Instant>,
     /// Final duration of the last task, so a finished run still shows one.
@@ -107,13 +86,9 @@ pub struct WorkbenchState {
     pub theme: Theme,
     pub task_state: Option<TaskState>,
     pub focus: Focus,
-    /// The multiline composer (issue #28): grapheme-aware editing,
-    /// undo/redo, history and bracketed paste.
     pub composer: crate::composer::Composer,
-    /// Action cards for the current session (issue #28).
     pub cards: crate::cards::CardList,
-    /// Requests queued while a task is running (issue #28): these start a
-    /// *new* task when the current one ends and never modify it.
+    /// Queued requests start a new task; they do not steer the current task.
     pub queued: Vec<crate::session::QueuedRequest>,
     pub queued_selection: usize,
     pub steer_draft: bool,
@@ -137,15 +112,9 @@ pub struct WorkbenchState {
     /// Command palette state: the query when open.
     pub palette: Option<String>,
     pub palette_selection: usize,
-    /// Attachments resolved for the current composer text.
-    pub attachments: Vec<crate::attach::Attachment>,
-    /// Attachment errors to surface to the user.
-    pub attachment_errors: Vec<crate::attach::AttachError>,
-    /// The review workspace, when the user has opened one (issue #29).
+    /// Recorded changes and check evidence retained between visits.
     pub review: Option<crate::review::ReviewView>,
-    /// The optional decision inspector (issue #30). Built from the same
-    /// events the timeline uses, so it never narrates anything the
-    /// runtime did not report.
+    pub review_open: bool,
     pub inspector: crate::inspector::DecisionInspector,
     /// Transient status message.
     pub status: Option<String>,
@@ -185,7 +154,6 @@ impl WorkbenchState {
         Self {
             workspace: workspace.into(),
             branch: None,
-            mode: "quality".to_owned(),
             model: None,
             chatgpt_plan: false,
             usage_limit: false,
@@ -194,8 +162,6 @@ impl WorkbenchState {
             endpoint: None,
             unavailable: None,
             checks: 0,
-            live_routing: false,
-            model_calls: 0,
             task_started: None,
             last_duration_secs: 0,
             tick: 0,
@@ -222,9 +188,8 @@ impl WorkbenchState {
             help_scroll: 0,
             palette: None,
             palette_selection: 0,
-            attachments: Vec::new(),
-            attachment_errors: Vec::new(),
             review: None,
+            review_open: false,
             inspector: crate::inspector::DecisionInspector::new(),
             status: None,
             stats: WorkbenchStats::default(),
@@ -252,7 +217,7 @@ impl WorkbenchState {
         !self.theme.reduced_motion
             && !self.help
             && !self.palette_open()
-            && self.review.is_none()
+            && !self.review_open
             && (self.task_state == Some(TaskState::Running)
                 || (self.timeline.is_empty() && self.tick < crate::knot::INTRO_TICKS))
     }
@@ -286,10 +251,7 @@ impl WorkbenchState {
         match &self.model {
             Some(model) => {
                 let endpoint = self.endpoint.as_deref().unwrap_or("default endpoint");
-                format!(
-                    "{model} via {endpoint}, {} checks, mode {}",
-                    self.checks, self.mode
-                )
+                format!("{model} via {endpoint}, {} checks", self.checks)
             }
             None => self
                 .unavailable
@@ -593,7 +555,7 @@ impl WorkbenchState {
                 self.approval_open = matches!(wait, WaitKind::Approval { .. });
                 self.approval_scroll = 0;
                 if self.approval_open {
-                    self.review = None;
+                    self.review_open = false;
                 }
                 self.push(TimelineKind::Wait, message.clone(), false);
             }
@@ -710,31 +672,25 @@ impl WorkbenchState {
     }
 
     /// Commands matching the current palette query.
-    pub fn palette_results(&self) -> Vec<crate::attach::PaletteCommand> {
+    pub fn palette_results(&self) -> Vec<crate::commands::PaletteCommand> {
         match &self.palette {
-            Some(query) => crate::attach::filter_catalog(query)
-                .into_iter()
-                .filter(|command| command.is_available())
-                .collect(),
+            Some(query) => crate::commands::filter_catalog(query),
             None => Vec::new(),
         }
     }
 
-    /// Resolve `@mentions` in the composer against the workspace.
-    ///
-    /// Resolving is a *local* read through the workspace tools: it grants
-    /// no egress permission, and the summary exists so the user sees what
-    /// would be attached before submitting.
-    pub fn refresh_attachments(&mut self, workspace: &crate::Workspace) {
-        let mentions = crate::attach::extract_mentions(&self.composer.text());
-        let (attachments, errors) = crate::attach::resolve_mentions(workspace, &mentions);
-        self.attachments = attachments;
-        self.attachment_errors = errors;
-    }
-
-    /// A summary of what the next submission would carry.
-    pub fn attachment_summary(&self) -> String {
-        crate::attach::attachment_summary(&self.attachments, &self.attachment_errors)
+    pub fn toggle_review(&mut self) {
+        if self.review_open {
+            self.review_open = false;
+        } else if self
+            .review
+            .as_ref()
+            .is_some_and(|view| !view.checks.is_empty() || !view.changes.is_empty())
+        {
+            self.review_open = true;
+        } else {
+            self.status = Some("no changes or checks to review yet".to_owned());
+        }
     }
 
     /// Resume following the newest output (an explicit user action).
@@ -1056,11 +1012,51 @@ mod tests {
         let summary = state.timeline.last().unwrap();
         assert!(summary.text.contains("1/2"));
         assert!(summary.text.contains("test failed"));
+        assert!(!state.review_open);
+
+        state.composer.insert("unfinished");
+        let mut tab = crate::Tab::Timeline;
+        crate::handle_key(
+            &mut state,
+            crossterm::event::KeyEvent::new(
+                crossterm::event::KeyCode::Char('!'),
+                crossterm::event::KeyModifiers::NONE,
+            ),
+            &mut tab,
+        );
+        assert_eq!(state.composer.text(), "unfinished!");
+        for dismiss in [
+            crossterm::event::KeyEvent::new(
+                crossterm::event::KeyCode::Esc,
+                crossterm::event::KeyModifiers::NONE,
+            ),
+            crossterm::event::KeyEvent::new(
+                crossterm::event::KeyCode::Char('c'),
+                crossterm::event::KeyModifiers::CONTROL,
+            ),
+        ] {
+            state.toggle_review();
+            assert!(state.review_open);
+            crate::handle_key(&mut state, dismiss, &mut tab);
+            assert!(!state.review_open);
+            assert_eq!(state.known_checks().len(), 2);
+        }
+        state.toggle_review();
+        assert!(state.review_open);
+        state.toggle_review();
+        assert!(!state.review_open);
+        assert_eq!(state.known_checks().len(), 2);
     }
 
     #[test]
     fn a_review_with_no_content_says_so_rather_than_opening_empty() {
-        let state = WorkbenchState::new("/tmp/ws");
+        let mut state = WorkbenchState::new("/tmp/ws");
+        state.toggle_review();
+        assert!(!state.review_open);
+        assert_eq!(
+            state.status.as_deref(),
+            Some("no changes or checks to review yet")
+        );
         assert!(state.known_checks().is_empty());
         assert!(state.review_changes().is_empty());
     }
@@ -1162,7 +1158,7 @@ mod tests {
     #[test]
     fn history_is_bounded_and_counts_virtualized_entries() {
         let mut state = WorkbenchState::new("/tmp/ws");
-        for i in 0..(MAX_TIMELINE + 500) {
+        for _ in 0..(MAX_TIMELINE + 500) {
             state.apply(&SessionEvent::Routed {
                 task: TaskId(1),
                 turn: TurnId(1),
@@ -1171,7 +1167,6 @@ mod tests {
                 action: Action::Generate(ModelTier::Fast),
                 confidence: 0.9,
             });
-            let _ = i;
         }
         assert!(state.timeline.len() <= MAX_TIMELINE);
         assert!(state.timeline_offset > 0);

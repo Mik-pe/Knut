@@ -1,30 +1,14 @@
-//! Reviewable patches with stale-edit protection and safe recovery
-//! (issue #24).
-//!
-//! The reasoner proposes a structured patch; Knut validates it, previews
-//! it, binds approval to the *normalized* patch plus the source revisions
-//! it depends on, revalidates immediately before applying, and records
-//! every operation in a journal so a partial failure is visible and a
-//! targeted revert is possible.
-//!
-//! Deliberate boundaries:
-//! - no filesystem-wide atomicity is claimed: multi-file apply can fail
-//!   partway and says so;
-//! - no destructive git operation is ever issued (`reset`, `clean`,
-//!   `checkout` over user content) and nothing is committed or pushed;
-//! - a patch that no longer applies is reported as stale so the caller
-//!   can fetch fresh evidence and ask for a new bounded patch, rather
-//!   than fuzzy-matching its way through the user's code.
+//! Multi-file patches can fail partway; the journal records only completed
+//! operations so recovery preserves subsequent edits by other writers.
 
 use std::collections::BTreeMap;
-use std::path::Path;
 
 use serde::{Deserialize, Serialize};
 use serde_json::Value;
 
 use crate::KnutError;
 use crate::policy::ContentPreconditions;
-use crate::workspace::{Workspace, content_hash};
+use crate::workspace::{SafePath, Workspace, content_hash, write_atomically};
 
 /// One edit operation. Paths are workspace-relative and `/`-separated.
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
@@ -168,7 +152,7 @@ impl ValidatedPatch {
         for op in &self.ops {
             match op.kind.as_str() {
                 "create" => out.push_str(&format!(
-                    "  create {} ({} bytes)\n",
+                    "  create {} ({})\n",
                     op.path,
                     op.after_hash.as_deref().unwrap_or("-")
                 )),
@@ -272,6 +256,22 @@ impl std::fmt::Display for PatchRejection {
     }
 }
 
+fn resolve_patch_path(workspace: &Workspace, path: &str) -> Result<SafePath, PatchRejection> {
+    let resolved = workspace
+        .resolve(path)
+        .map_err(|err| PatchRejection::UnsafePath {
+            path: path.to_owned(),
+            reason: err.to_string(),
+        })?;
+    if workspace.is_denied(resolved.relative()) {
+        return Err(PatchRejection::UnsafePath {
+            path: path.to_owned(),
+            reason: "path is excluded from workspace writes".to_owned(),
+        });
+    }
+    Ok(resolved)
+}
+
 /// Validate a patch against the workspace *before* asking for approval.
 ///
 /// Every rejection here happens before any write, so a bad patch never
@@ -289,16 +289,13 @@ pub fn validate_patch(
         });
     }
 
-    // Conflicting edits to one file are how a patch silently corrupts
-    // content: refuse rather than guess an order.
     let mut seen: BTreeMap<String, usize> = BTreeMap::new();
     for op in &patch.ops {
-        let target = op.path().to_owned();
-        *seen.entry(target.clone()).or_default() += 1;
-        if matches!(op, PatchOp::Rename { .. })
-            && let PatchOp::Rename { from, .. } = op
-        {
-            *seen.entry(from.clone()).or_default() += 1;
+        let target = resolve_patch_path(workspace, op.path())?;
+        *seen.entry(target.relative().to_owned()).or_default() += 1;
+        if let PatchOp::Rename { from, .. } = op {
+            let source = resolve_patch_path(workspace, from)?;
+            *seen.entry(source.relative().to_owned()).or_default() += 1;
         }
     }
     for (path, count) in &seen {
@@ -325,13 +322,7 @@ pub fn validate_patch(
 
         match op {
             PatchOp::Create { path, content } => {
-                let resolved =
-                    workspace
-                        .resolve(path)
-                        .map_err(|err| PatchRejection::UnsafePath {
-                            path: path.clone(),
-                            reason: err.to_string(),
-                        })?;
+                let resolved = resolve_patch_path(workspace, path)?;
                 if resolved.absolute().exists() {
                     return Err(PatchRejection::AlreadyExists { path: path.clone() });
                 }
@@ -350,13 +341,7 @@ pub fn validate_patch(
                 content,
                 expect_hash,
             } => {
-                let resolved =
-                    workspace
-                        .resolve(path)
-                        .map_err(|err| PatchRejection::UnsafePath {
-                            path: path.clone(),
-                            reason: err.to_string(),
-                        })?;
+                let resolved = resolve_patch_path(workspace, path)?;
                 let bytes = workspace
                     .read_bytes(path)
                     .map_err(|_| PatchRejection::MissingFile { path: path.clone() })?;
@@ -380,13 +365,7 @@ pub fn validate_patch(
                 });
             }
             PatchOp::Delete { path, expect_hash } => {
-                let resolved =
-                    workspace
-                        .resolve(path)
-                        .map_err(|err| PatchRejection::UnsafePath {
-                            path: path.clone(),
-                            reason: err.to_string(),
-                        })?;
+                let resolved = resolve_patch_path(workspace, path)?;
                 let bytes = workspace
                     .read_bytes(path)
                     .map_err(|_| PatchRejection::MissingFile { path: path.clone() })?;
@@ -415,20 +394,8 @@ pub fn validate_patch(
                 expect_hash,
                 content,
             } => {
-                let from_resolved =
-                    workspace
-                        .resolve(from)
-                        .map_err(|err| PatchRejection::UnsafePath {
-                            path: from.clone(),
-                            reason: err.to_string(),
-                        })?;
-                let to_resolved =
-                    workspace
-                        .resolve(to)
-                        .map_err(|err| PatchRejection::UnsafePath {
-                            path: to.clone(),
-                            reason: err.to_string(),
-                        })?;
+                let from_resolved = resolve_patch_path(workspace, from)?;
+                let to_resolved = resolve_patch_path(workspace, to)?;
                 let bytes = workspace
                     .read_bytes(from)
                     .map_err(|_| PatchRejection::MissingFile { path: from.clone() })?;
@@ -618,6 +585,12 @@ impl PatchApplier {
         op_identity: &str,
     ) -> Result<AppliedOp, KnutError> {
         let path = workspace.resolve(&op.path)?;
+        if matches!(op.kind.as_str(), "create" | "rename") && path.absolute().exists() {
+            return Err(KnutError::Tool(format!(
+                "target {:?} appeared after validation; refusing to overwrite it",
+                op.path
+            )));
+        }
         let before = std::fs::read(path.absolute())
             .ok()
             .map(|bytes| String::from_utf8_lossy(&bytes).into_owned());
@@ -627,7 +600,7 @@ impl PatchApplier {
                 let content = op
                     .after_hash
                     .as_ref()
-                    .and_then(|_| read_patch_content(op))
+                    .and(op.content.as_deref())
                     .ok_or_else(|| KnutError::Tool("operation has no content".to_owned()))?;
                 write_atomically(path.absolute(), content.as_bytes())?;
                 Ok(AppliedOp {
@@ -660,7 +633,7 @@ impl PatchApplier {
                 let from_before = std::fs::read(from_path.absolute())
                     .ok()
                     .map(|bytes| String::from_utf8_lossy(&bytes).into_owned());
-                match read_patch_content(op) {
+                match op.content.as_deref() {
                     Some(content) => {
                         write_atomically(path.absolute(), content.as_bytes())?;
                         std::fs::remove_file(from_path.absolute()).map_err(|err| {
@@ -668,15 +641,6 @@ impl PatchApplier {
                         })?;
                     }
                     None => {
-                        // Re-check the target immediately before moving:
-                        // a file that appeared after validation must not
-                        // be silently clobbered.
-                        if path.absolute().exists() {
-                            return Err(KnutError::Tool(format!(
-                                "rename target {:?} already exists; refusing to overwrite it",
-                                op.path
-                            )));
-                        }
                         std::fs::rename(from_path.absolute(), path.absolute()).map_err(|err| {
                             KnutError::Tool(format!("rename {from:?} -> {:?}: {err}", op.path))
                         })?;
@@ -805,16 +769,6 @@ impl PatchApplier {
     }
 }
 
-/// Content for an operation, recovered from the validated op's after-hash.
-///
-/// The validated op stores hashes rather than content so approval
-/// identities stay small; the content itself travels in the patch that
-/// produced it. This lookup is intentionally explicit: an operation
-/// without recoverable content fails rather than writing an empty file.
-fn read_patch_content(op: &ValidatedOp) -> Option<String> {
-    op.content.clone()
-}
-
 /// Revert summary.
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub struct RevertOutcome {
@@ -826,34 +780,6 @@ pub struct RevertOutcome {
 pub struct SkippedRevert {
     pub path: String,
     pub reason: String,
-}
-
-/// Write a file safely: temp file in the same directory, then rename.
-///
-/// Per-file replacement is atomic on POSIX; a multi-file patch is not,
-/// and the caller must treat a partial failure as exactly that.
-fn write_atomically(path: &Path, bytes: &[u8]) -> Result<(), KnutError> {
-    let directory = path
-        .parent()
-        .ok_or_else(|| KnutError::Tool("target has no parent directory".to_owned()))?;
-    std::fs::create_dir_all(directory)
-        .map_err(|err| KnutError::Tool(format!("create {}: {err}", directory.display())))?;
-
-    let temp = directory.join(format!(
-        ".knut-tmp-{}-{}",
-        std::process::id(),
-        std::time::SystemTime::now()
-            .duration_since(std::time::UNIX_EPOCH)
-            .map(|d| d.as_nanos())
-            .unwrap_or(0)
-    ));
-    std::fs::write(&temp, bytes)
-        .map_err(|err| KnutError::Tool(format!("write temp file: {err}")))?;
-    std::fs::rename(&temp, path).map_err(|err| {
-        let _ = std::fs::remove_file(&temp);
-        KnutError::Tool(format!("replace {}: {err}", path.display()))
-    })?;
-    Ok(())
 }
 
 /// The `files.apply_patch` tool: the only way a patch reaches disk.
@@ -1057,6 +983,31 @@ mod tests {
         assert_eq!(applier.journal()[2].from.as_deref(), Some("src/old.rs"));
     }
 
+    #[test]
+    fn replacing_an_executable_keeps_its_permissions() {
+        use std::os::unix::fs::PermissionsExt;
+        let fixture = Fixture::new("executable");
+        let hash = fixture.write("run.sh", "#!/bin/sh\necho old\n");
+        let path = fixture.dir.join("run.sh");
+        std::fs::set_permissions(&path, std::fs::Permissions::from_mode(0o755)).unwrap();
+        let workspace = fixture.workspace();
+        let patch = Patch::new(
+            "edit script",
+            vec![PatchOp::Replace {
+                path: "run.sh".to_owned(),
+                content: "#!/bin/sh\necho new\n".to_owned(),
+                expect_hash: hash,
+            }],
+        );
+        let validated = validate_patch(&workspace, &patch).unwrap();
+        let outcome = PatchApplier::new().apply(&workspace, &validated).unwrap();
+        assert!(!outcome.is_partial());
+        assert_eq!(
+            std::fs::metadata(path).unwrap().permissions().mode() & 0o777,
+            0o755
+        );
+    }
+
     fn fixture_old_hash(fixture: &Fixture) -> String {
         content_hash(fixture.read("src/old.rs").as_bytes())
     }
@@ -1241,6 +1192,80 @@ mod tests {
 
         // Nothing changed.
         assert_eq!(fixture.read("a.txt"), "one\n");
+    }
+
+    #[test]
+    fn conflicting_path_aliases_and_denied_targets_are_rejected() {
+        let fixture = Fixture::new("alias-conflict");
+        let hash = fixture.write("a.txt", "original");
+        let workspace = fixture.workspace();
+        let conflict = Patch::new(
+            "conflict",
+            vec![
+                PatchOp::Replace {
+                    path: "a.txt".into(),
+                    content: "new".into(),
+                    expect_hash: hash.clone(),
+                },
+                PatchOp::Delete {
+                    path: "./a.txt".into(),
+                    expect_hash: hash.clone(),
+                },
+            ],
+        );
+        assert!(matches!(
+            validate_patch(&workspace, &conflict),
+            Err(PatchRejection::ConflictingOps { .. })
+        ));
+        for op in [
+            PatchOp::Create {
+                path: ".env".into(),
+                content: "secret".into(),
+            },
+            PatchOp::Rename {
+                from: "a.txt".into(),
+                to: "credentials.json".into(),
+                expect_hash: hash.clone(),
+                content: None,
+            },
+        ] {
+            assert!(matches!(
+                validate_patch(&workspace, &Patch::new("denied", vec![op])),
+                Err(PatchRejection::UnsafePath { .. })
+            ));
+        }
+        assert_eq!(fixture.read("a.txt"), "original");
+    }
+
+    #[test]
+    fn create_and_rename_do_not_clobber_targets_that_appear_after_validation() {
+        for content in [None, Some("edited".to_owned())] {
+            let fixture = Fixture::new("appeared-target");
+            let hash = fixture.write("source.txt", "original");
+            let workspace = fixture.workspace();
+            for op in [
+                PatchOp::Create {
+                    path: "target.txt".into(),
+                    content: "new".into(),
+                },
+                PatchOp::Rename {
+                    from: "source.txt".into(),
+                    to: "target.txt".into(),
+                    expect_hash: hash.clone(),
+                    content: content.clone(),
+                },
+            ] {
+                let patch =
+                    validate_patch(&workspace, &Patch::new("create or move", vec![op])).unwrap();
+                fixture.write("target.txt", "someone else's file");
+                let outcome = PatchApplier::new().apply(&workspace, &patch).unwrap();
+                assert!(outcome.failure.is_some());
+                assert!(outcome.applied.is_empty());
+                assert_eq!(fixture.read("target.txt"), "someone else's file");
+                assert_eq!(fixture.read("source.txt"), "original");
+                std::fs::remove_file(fixture.dir.join("target.txt")).unwrap();
+            }
+        }
     }
 
     #[test]

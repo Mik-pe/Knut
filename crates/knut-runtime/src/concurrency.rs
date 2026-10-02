@@ -1,23 +1,5 @@
-//! Dependency-aware concurrency under shared budgets (issue #33).
-//!
-//! Independent work runs concurrently with separate bounded capacity for
-//! local I/O, processes and provider calls; work with data dependencies or
-//! conflicting writes is serialized. Cancellation propagates to every
-//! child, and each child is accounted for in the task outcome.
-//!
-//! Rules carried through:
-//! - **dependencies come from data, not from a model's hint.** A node that
-//!   consumes another's artifact waits for it; the `parallelizable` flag
-//!   only ever *narrows* concurrency.
-//! - **conflicting writes are serialized**, and reads used as patch
-//!   preconditions stay revision-bound, so concurrency cannot weaken
-//!   stale-edit checks.
-//! - **budget is reserved before dispatch**, includes failed and
-//!   speculative work, and an unknown billed amount is never presented as
-//!   an enforced estimate.
-//! - **results are deterministic** even when completion order is not.
-//! - **a cancelled sibling is not left running** merely because nobody
-//!   awaits its result.
+//! Data dependencies and conflicting writes restrict concurrency regardless
+//! of model hints. Budget reservations include failed and speculative work.
 
 use std::collections::{BTreeMap, BTreeSet, VecDeque};
 use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
@@ -697,7 +679,6 @@ impl Scheduler {
 
             // Dispatch in this wave, honoring capacity, conflicts and
             // budget. In sequential mode only one item is dispatched.
-            let mut dispatched: Vec<(String, ItemOutcome)> = Vec::new();
             let mut handles = Vec::new();
 
             for id in &ready {
@@ -829,7 +810,6 @@ impl Scheduler {
                 let started_ms = started.elapsed().as_millis() as u64;
 
                 pending.retain(|existing| existing != id);
-                dispatched.push((id.clone(), ItemOutcome::Succeeded));
 
                 handles.push(tokio::spawn(async move {
                     let item_started = Instant::now();
@@ -942,7 +922,6 @@ impl Scheduler {
             for handle in handles {
                 let _ = handle.await;
             }
-            let _ = dispatched;
         }
 
         // Drain anything left (a cancelled wave).
@@ -967,9 +946,6 @@ impl Scheduler {
             .iter()
             .map(|item| results_map.remove(&item.id).expect("recorded above"))
             .collect();
-
-        let overlapped = results_map.values().any(|result| result.overlapped);
-        let _ = overlapped;
 
         let any_failed = ordered.iter().any(|result| {
             matches!(
@@ -1154,12 +1130,10 @@ mod tests {
 
     #[tokio::test]
     async fn sequential_mode_runs_one_at_a_time_for_comparison() {
-        let barrier = Barrier::new(2);
         let observed = Arc::new(Mutex::new(Vec::new()));
         let active = Arc::new(AtomicUsize::new(0));
         let max_active = Arc::new(AtomicUsize::new(0));
 
-        let _unused_barrier: Option<Arc<Barrier>> = None;
         let scheduler = Scheduler::new(PoolCapacity::default(), Arc::new(Budget::default_task()))
             .sequential(true);
         let items = vec![
@@ -1187,7 +1161,6 @@ mod tests {
             observed.lock().unwrap().clone(),
             vec!["a".to_owned(), "b".to_owned()]
         );
-        let _ = barrier;
     }
 
     #[tokio::test]
@@ -1382,10 +1355,6 @@ mod tests {
 
     #[tokio::test]
     async fn results_are_ordered_deterministically_regardless_of_completion() {
-        let active = Arc::new(AtomicUsize::new(0));
-        let max_active = Arc::new(AtomicUsize::new(0));
-        let observed: Arc<Mutex<Vec<String>>> = Arc::new(Mutex::new(Vec::new()));
-
         // Completion order is the reverse of declaration order.
         let runner: ItemRunner = Arc::new(move |item: WorkItem, _cancel| {
             Box::pin(async move {
@@ -1413,7 +1382,6 @@ mod tests {
             .map(|result| result.id.as_str())
             .collect();
         assert_eq!(ids, vec!["first", "second", "third"]);
-        let _ = (observed, active, max_active);
     }
 
     #[tokio::test]

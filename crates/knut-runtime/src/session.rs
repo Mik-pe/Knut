@@ -1,24 +1,10 @@
-//! One event-driven session runtime: commands in, ordered events out
-//! (issue #18).
-//!
-//! A single `SessionRuntime` owns task state. CLI, TUI and future editor
-//! adapters submit [`SessionCommand`]s and consume [`SessionEvent`]s;
-//! none of them implements its own execution loop. The runtime wires the
-//! model turns, tool observations, the mandatory `ExecutionGate` and
-//! evidence-gated completion.
-//!
-//! Invariants:
-//! - every tool invocation passes through the gate; nothing the model
-//!   controls can bypass policy, approval or replay semantics;
-//! - `Done` is only ever emitted when deterministic completion
-//!   requirements are satisfied by evidence bound to the current
-//!   revision (#16); uncertainty never becomes completion;
-//! - events are published before awaiting more work; the bounded event
-//!   log drops cosmetic stream updates before it ever drops approval
-//!   requests, terminal state or artifact events;
-//! - steering bumps the task revision, invalidating stale decisions;
-//!   pause stops dispatch of new work; cancel propagates to in-flight
-//!   work and produces exactly one terminal outcome.
+//! Steering invalidates task revisions. The bounded event log discards cosmetic
+//! updates before approvals or terminal outcomes; completion requires current
+//! verification evidence.
+
+mod writes;
+
+use writes::WriteFailures;
 
 use std::collections::VecDeque;
 use std::sync::Arc;
@@ -572,7 +558,7 @@ struct ActiveTask {
     preferred_capability: Option<String>,
     final_answer: Option<String>,
     pending_question: bool,
-    write_failures: std::collections::BTreeMap<String, String>,
+    write_failures: WriteFailures,
     initial_artifact: Option<crate::ArtifactRevision>,
 }
 
@@ -1997,16 +1983,16 @@ where
                         .as_mut()
                         .unwrap()
                         .write_failures
-                        .remove(&metadata.id);
+                        .resolved(&metadata.id, &call.arguments);
                     self.record_tool_result(turn, &call, NodeStatus::Succeeded, outcome.output)
                 }
                 Err(error) => {
                     if metadata.side_effect != crate::SideEffect::ReadOnly {
-                        self.task
-                            .as_mut()
-                            .unwrap()
-                            .write_failures
-                            .insert(metadata.id, error.to_string());
+                        self.task.as_mut().unwrap().write_failures.record(
+                            &metadata.id,
+                            &call.arguments,
+                            &error,
+                        );
                     }
                     self.record_tool_result(
                         turn,
@@ -2521,6 +2507,98 @@ mod tests {
             SessionRuntime::new(router, registry(), gate, cascade, Arc::new(AcceptAll)),
             reasoner,
         )
+    }
+
+    struct ScopedWrite;
+
+    #[async_trait]
+    impl Tool for ScopedWrite {
+        fn metadata(&self) -> ToolMetadata {
+            ToolMetadata {
+                id: "scoped-write".into(),
+                tool_version: "1".into(),
+                capability: "files".into(),
+                description: "write one file".into(),
+                input_schema: json!({"type":"object", "properties":{"path":{"type":"string"}, "fail":{"type":"boolean"}}, "required":["path"]}),
+                side_effect: SideEffect::IdempotentWrite,
+            }
+        }
+
+        async fn call(&self, input: Value) -> Result<Value, KnutError> {
+            if input["fail"] == true {
+                Err(KnutError::Tool("write failed".into()))
+            } else {
+                Ok(json!({"written": true}))
+            }
+        }
+    }
+
+    #[tokio::test]
+    async fn another_file_write_cannot_complete_a_task_with_an_unresolved_failure() {
+        for repair_same_file in [false, true] {
+            let mut runtime = runtime_with(
+                Arc::new(AlwaysGenerate),
+                vec!["done".into()],
+                crate::SideEffectPolicy::new().allow(SideEffect::IdempotentWrite),
+            );
+            let mut registry = ToolRegistry::default();
+            registry.register(ScopedWrite).unwrap();
+            runtime.available_tools = Arc::new(registry);
+            runtime
+                .command(SessionCommand::Submit {
+                    prompt: "update two files".into(),
+                    options: Default::default(),
+                })
+                .await
+                .unwrap();
+            let mut calls = vec![
+                crate::ToolCall {
+                    id: "failed".into(),
+                    name: ScopedWrite.metadata().function_name(),
+                    arguments: json!({"path":"a.txt", "fail":true}),
+                },
+                crate::ToolCall {
+                    id: "unrelated".into(),
+                    name: ScopedWrite.metadata().function_name(),
+                    arguments: json!({"path":"b.txt"}),
+                },
+            ];
+            if repair_same_file {
+                calls.push(crate::ToolCall {
+                    id: "repair".into(),
+                    name: ScopedWrite.metadata().function_name(),
+                    arguments: json!({"path":"./a.txt"}),
+                });
+            }
+            let active = runtime.task.as_mut().unwrap();
+            let (task, revision) = (active.id, active.revision);
+            active.native_tier = Some(ModelTier::Reasoner);
+            active.pending_calls = calls.clone().into();
+            active.exchanges.push(crate::ModelExchange {
+                identity: ModelIdentity {
+                    provider: "fake".into(),
+                    model: "scripted".into(),
+                    tier: ModelTier::Reasoner,
+                },
+                content: String::new(),
+                tool_calls: calls,
+                continuation: crate::Continuation::new(),
+                results: Vec::new(),
+            });
+            assert!(matches!(
+                runtime.dispatch_calls(task, TurnId(1), revision).await,
+                Tick::Continue
+            ));
+            let state = drive_until_stable(&mut runtime, 10).await.unwrap();
+            assert_eq!(
+                state,
+                if repair_same_file {
+                    TaskState::Completed
+                } else {
+                    TaskState::Failed
+                }
+            );
+        }
     }
 
     #[test]
