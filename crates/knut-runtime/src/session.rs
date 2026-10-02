@@ -570,6 +570,7 @@ struct ActiveTask {
     pending_calls: VecDeque<crate::ToolCall>,
     native_tier: Option<ModelTier>,
     preferred_capability: Option<String>,
+    context_priority: Option<(String, usize)>,
     final_answer: Option<String>,
     pending_question: bool,
     write_failures: std::collections::BTreeMap<String, String>,
@@ -893,6 +894,7 @@ where
             pending_calls: VecDeque::new(),
             native_tier: None,
             preferred_capability: None,
+            context_priority: None,
             final_answer: None,
             pending_question: false,
             write_failures: Default::default(),
@@ -985,6 +987,8 @@ where
                     task.routed = None;
                     task.repair_feedback = None;
                     task.exchanges.clear();
+                    task.context_priority = None;
+                    task.preferred_capability = None;
                     task.pending_calls.clear();
                     task.native_tier = None;
                     task.final_answer = None;
@@ -1082,6 +1086,8 @@ where
                             task.prompt = format!("{}\nuser: {value}", task.prompt);
                             task.revision = TaskRevision(task.revision.0 + 1);
                             task.exchanges.clear();
+                            task.context_priority = None;
+                            task.preferred_capability = None;
                             task.pending_calls.clear();
                             task.native_tier = None;
                         }
@@ -1643,8 +1649,20 @@ where
             return;
         };
         if records.len() < 2 {
+            self.task.as_mut().expect("active task").context_priority = None;
             return;
         }
+        // Reads still run on every turn; only the advisory priority is reused.
+        let fingerprint = crate::workspace::content_hash(
+            &serde_json::to_vec(records).expect("context records serialize"),
+        );
+        if let Some((cached, index)) = &self.task.as_ref().expect("active task").context_priority
+            && *cached == fingerprint
+        {
+            records.swap(0, *index);
+            return;
+        }
+        self.task.as_mut().expect("active task").context_priority = None;
         let frame = crate::DecisionFrame::new(
             crate::FrameKind::ContextSelection,
             task.0,
@@ -1666,6 +1684,7 @@ where
             .and_then(|id| id.parse::<usize>().ok())
             .filter(|index| *index < records.len());
         if let Some(index) = chosen {
+            self.task.as_mut().expect("active task").context_priority = Some((fingerprint, index));
             records.swap(0, index);
         }
         self.emit(SessionEvent::FrameDecided {
@@ -1919,12 +1938,7 @@ where
             else {
                 return Tick::Continue;
             };
-            let metadata = self
-                .registry
-                .capabilities()
-                .iter()
-                .flat_map(|capability| self.registry.tools_for_capability(capability))
-                .find(|metadata| metadata.function_name() == call.name);
+            let metadata = self.registry.find_function(&call.name).cloned();
             let Some(metadata) = metadata else {
                 self.record_tool_result(
                     turn,
