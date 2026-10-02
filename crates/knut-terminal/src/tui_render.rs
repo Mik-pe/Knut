@@ -2,7 +2,9 @@ use ratatui::Frame;
 use ratatui::layout::{Constraint, Layout, Rect};
 use ratatui::style::{Modifier, Style};
 use ratatui::text::{Line, Span};
-use ratatui::widgets::{Block, BorderType, Borders, Clear, Paragraph, Wrap};
+use ratatui::widgets::{
+    Block, BorderType, Borders, Clear, List, ListItem, ListState, Paragraph, Wrap,
+};
 use unicode_segmentation::UnicodeSegmentation;
 use unicode_width::UnicodeWidthStr;
 
@@ -82,48 +84,13 @@ pub fn render_themed(frame: &mut Frame, state: &WorkbenchState, tab: Tab, theme:
     let plan = plan_layout(area, rows);
 
     render_header(frame, state, plan.header, theme);
-    if let Some(connection) = &state.connection {
-        let body = Rect::new(
-            plan.timeline.x,
-            plan.timeline.y,
-            plan.timeline.width,
-            plan.timeline.height + plan.composer.height,
-        );
-        render_connection(frame, connection, body, theme);
-        let hint = if connection.busy {
-            if connection.cancellable {
-                " Esc cancel"
-            } else {
-                " Finishing connection update…"
-            }
-        } else {
-            " Up/Down choose   Enter continue   Esc back"
-        };
-        frame.render_widget(
-            Paragraph::new(vec![
-                Line::from(hint),
-                Line::from(if state.chatgpt_plan {
-                    format!(
-                        " Using ChatGPT plan: {}",
-                        crate::cards::sanitize_for_display(
-                            state.account.as_deref().unwrap_or("ChatGPT account")
-                        )
-                    )
-                } else {
-                    " Draft preserved".to_owned()
-                }),
-            ])
-            .style(theme.dim())
-            .wrap(Wrap { trim: false }),
-            plan.footer,
-        );
-        return;
-    }
     if state.review_open
         && let Some(review) = &state.review
     {
         render_review_themed(frame, review, theme);
-        if state.help {
+        if let Some(connection) = &state.connection {
+            render_connection(frame, connection, area, theme);
+        } else if state.help {
             render_help(frame, state, area, theme);
         } else if state.palette_open() {
             render_palette(frame, state, area, theme);
@@ -159,6 +126,11 @@ pub fn render_themed(frame: &mut Frame, state: &WorkbenchState, tab: Tab, theme:
     }
     render_composer(frame, state, plan.composer, theme);
     render_footer(frame, state, plan.footer, theme);
+
+    if let Some(connection) = &state.connection {
+        render_connection(frame, connection, area, theme);
+        return;
+    }
 
     if state.help {
         render_help(frame, state, area, theme);
@@ -350,7 +322,14 @@ fn render_header(frame: &mut Frame, state: &WorkbenchState, area: Rect, theme: &
         status.push(Span::styled(format!("  {elapsed}"), theme.faint()));
     }
     if state.chatgpt_plan && text_area.width >= 55 {
-        status.push(Span::styled(" · Using ChatGPT plan", theme.dim()));
+        status.push(Span::styled(
+            if theme.glyphs.unicode {
+                " · Using ChatGPT plan"
+            } else {
+                " | Using ChatGPT plan"
+            },
+            theme.dim(),
+        ));
     }
     if !state.queued.is_empty() {
         status.push(Span::styled(
@@ -567,74 +546,218 @@ fn render_connection(
     area: Rect,
     theme: &Theme,
 ) {
-    use crate::connection::ConnectionPage;
+    use crate::connection::{ConnectionAction, ConnectionPage, ModelSource};
+    let models = connection.page == ConnectionPage::Models;
+    let choices = connection.choices();
     let title = match connection.page {
         ConnectionPage::Settings => " Settings ",
         ConnectionPage::Account => " ChatGPT account ",
         ConnectionPage::Models => " Choose a model ",
-        ConnectionPage::Welcome => " You're using your ChatGPT plan ",
+        ConnectionPage::Welcome => " Your ChatGPT plan ",
     };
-    let block = panel(title, theme.border_focused(), theme);
-    let inner = block.inner(area);
-    frame.render_widget(block, area);
-    let width = inner.width.saturating_sub(2).max(1) as usize;
-    let mut lines = Vec::new();
-    let description = if connection.page == ConnectionPage::Welcome {
-        "Your ChatGPT plan covers model usage in Knut. Usage limits apply. Manage usage opens ChatGPT settings. Knut keeps its own renewable sign-in on this computer."
-    } else {
-        &connection.status
-    };
-    for line in wrap_text(description, width) {
-        lines.push(Line::from(Span::styled(format!(" {line}"), theme.text())));
-    }
-    if connection.page != ConnectionPage::Welcome
-        && let Some(account) = connection.accounts.iter().find(|a| a.active && a.signed_in)
-    {
+    let width = area
+        .width
+        .saturating_sub(if area.width >= 40 { 6 } else { 0 })
+        .min(if models { 78 } else { 68 });
+    let text_width = width.saturating_sub(6).max(1) as usize;
+    let mut summary = Vec::new();
+    if connection.page == ConnectionPage::Welcome {
         for line in wrap_text(
-            &format!(
-                "Account: {}",
-                crate::cards::sanitize_for_display(&account.label)
-            ),
-            width,
-        ) {
-            lines.push(Line::from(Span::styled(format!(" {line}"), theme.dim())));
+            "Your ChatGPT plan covers model usage in Knut. Usage limits apply. Manage usage opens ChatGPT settings. Your sign-in is saved on this computer.",
+            text_width,
+        ).into_iter().take(4) {
+            summary.push(Line::from(Span::styled(line, theme.text())));
         }
-    }
-    if connection.page != ConnectionPage::Welcome
-        && let Some(error) = &connection.error
-    {
-        for line in wrap_text(error, width) {
-            lines.push(Line::from(Span::styled(format!(" {line}"), theme.danger())));
-        }
-    }
-    lines.push(Line::from(""));
-    // Reserve selectable rows when long errors or account names fill a small terminal.
-    let budget = inner.height.saturating_sub(2) as usize;
-    lines.truncate(budget.saturating_sub(3));
-    let available = (inner.height as usize).saturating_sub(lines.len()).max(1);
-    let choices = connection.choices();
-    let start = connection
-        .selection
-        .saturating_sub(available.saturating_sub(1));
-    for (index, (label, _)) in choices.iter().enumerate().skip(start).take(available) {
-        let selected = index == connection.selection;
-        let marker = if selected { "> " } else { "  " };
-        let style = if connection.busy {
-            theme.dim()
-        } else if selected {
-            theme.accent().add_modifier(Modifier::BOLD)
-        } else {
-            theme.text()
+    } else {
+        let source_context = match connection.page {
+            ConnectionPage::Settings => connection.current_source,
+            ConnectionPage::Account => ModelSource::ChatGpt,
+            _ => connection.model_source,
         };
-        lines.push(Line::from(Span::styled(
-            format!(" {marker}{}", crate::cards::sanitize_for_display(label)),
-            style,
-        )));
+        let provider = match source_context {
+            ModelSource::ChatGpt => "ChatGPT plan",
+            ModelSource::Environment => "API connection",
+        };
+        let mut source = vec![Span::styled(provider, theme.accent())];
+        if models && !connection.models.is_empty() {
+            source.push(Span::styled(
+                format!("  {} / {} models", choices.len(), connection.models.len()),
+                theme.faint(),
+            ));
+        }
+        summary.push(Line::from(source));
+        if let Some(model) = connection
+            .current_model
+            .as_deref()
+            .filter(|_| connection.current_source == source_context)
+        {
+            summary.push(Line::from(vec![
+                Span::styled("Current  ", theme.dim()),
+                Span::styled(clipped(model, text_width.saturating_sub(9)), theme.text()),
+            ]));
+        }
+        if let Some(account) = connection.accounts.iter().find(|a| a.active && a.signed_in)
+            && source_context == ModelSource::ChatGpt
+        {
+            summary.push(Line::from(Span::styled(
+                clipped(
+                    &crate::cards::sanitize_for_display(&account.label),
+                    text_width,
+                ),
+                theme.dim(),
+            )));
+        }
+        if connection.busy || !models {
+            for line in wrap_text(
+                &crate::cards::sanitize_for_display(&connection.status),
+                text_width,
+            )
+            .into_iter()
+            .take(if connection.busy { 3 } else { 2 })
+            {
+                summary.push(Line::from(Span::styled(line, theme.dim())));
+            }
+        }
     }
-    frame.render_widget(
-        Paragraph::new(lines).style(theme.bg(theme.palette.bg)),
-        inner,
+    if let Some(error) = &connection.error {
+        for line in wrap_text(&crate::cards::sanitize_for_display(error), text_width)
+            .into_iter()
+            .take(2)
+        {
+            summary.push(Line::from(Span::styled(line, theme.danger())));
+        }
+    }
+    let list_rows = choices.len().clamp(2, if models { 10 } else { 8 });
+    let desired = summary.len() + list_rows + if models { 6 } else { 5 };
+    let height = (desired as u16).min(area.height.saturating_sub(2).max(1));
+    let popup = Rect::new(
+        area.x + area.width.saturating_sub(width) / 2,
+        area.y + area.height.saturating_sub(height) / 2,
+        width,
+        height,
     );
+    frame.render_widget(Block::default().style(theme.faint()), area);
+    frame.render_widget(Clear, popup);
+    let block = panel(title, theme.border_focused(), theme).style(theme.bg(theme.palette.bg_raise));
+    let inner = block.inner(popup);
+    frame.render_widget(block, popup);
+    let content = inner.inner(ratatui::layout::Margin::new(1, 0));
+    let summary_rows = summary
+        .len()
+        .min(content.height.saturating_sub(if models { 5 } else { 4 }) as usize);
+    summary.truncate(summary_rows);
+    let regions = Layout::vertical([
+        Constraint::Length(summary_rows as u16),
+        Constraint::Length(u16::from(models)),
+        Constraint::Length(1),
+        Constraint::Min(1),
+        Constraint::Length(2),
+    ])
+    .split(content);
+    frame.render_widget(Paragraph::new(summary), regions[0]);
+    if models {
+        let mut query = vec![Span::styled("Search  ", theme.dim())];
+        if connection.query.is_empty() {
+            query.push(Span::styled("Type to filter models", theme.faint()));
+        } else {
+            query.push(Span::styled(
+                clipped(&connection.query, text_width.saturating_sub(8)),
+                theme.text(),
+            ));
+        }
+        frame.render_widget(Paragraph::new(Line::from(query)), regions[1]);
+    }
+    if choices.is_empty() {
+        let message = if connection.busy {
+            "Loading models..."
+        } else if !connection.query.is_empty() {
+            "No matching models. Try another search."
+        } else {
+            "No models available. Ctrl+R to refresh."
+        };
+        frame.render_widget(
+            Paragraph::new(message)
+                .style(theme.dim())
+                .wrap(Wrap { trim: false }),
+            regions[3],
+        );
+    } else {
+        let items: Vec<_> = choices
+            .iter()
+            .map(|(label, action)| {
+                let current = match action {
+                    ConnectionAction::SelectModel(model)
+                    | ConnectionAction::SelectEnvironmentModel(model) => {
+                        connection.current_model_for_source() == Some(model.as_str())
+                    }
+                    _ => false,
+                };
+                let mut spans = vec![Span::styled(
+                    clipped(
+                        &crate::cards::sanitize_for_display(label),
+                        text_width.saturating_sub(if current { 11 } else { 2 }),
+                    ),
+                    if connection.busy {
+                        theme.dim()
+                    } else {
+                        theme.text()
+                    },
+                )];
+                if current {
+                    spans.push(Span::styled("  current", theme.accent()));
+                }
+                ListItem::new(Line::from(spans))
+            })
+            .collect();
+        let list = List::new(items)
+            .highlight_symbol(format!("{} ", theme.glyphs.prompt()))
+            .highlight_style(if connection.busy {
+                theme.dim()
+            } else {
+                theme.selection()
+            });
+        let selected = connection.selection.min(choices.len() - 1);
+        let visible = regions[3].height as usize;
+        let offset = selected
+            .saturating_sub(visible / 2)
+            .min(choices.len().saturating_sub(visible));
+        let mut selection = ListState::default()
+            .with_selected(Some(selected))
+            .with_offset(offset);
+        frame.render_stateful_widget(list, regions[3], &mut selection);
+    }
+    let hint = if connection.busy {
+        if connection.cancellable {
+            "Esc cancel"
+        } else {
+            "Finishing update..."
+        }
+    } else if text_width < 40 {
+        if models {
+            "Enter select  Esc back"
+        } else {
+            "Enter continue  Esc back"
+        }
+    } else if models {
+        "Up/Down choose  Enter select  Esc back"
+    } else {
+        "Up/Down choose  Enter continue  Esc back"
+    };
+    let mut footer = vec![Line::from(Span::styled(hint, theme.dim()))];
+    if models && !connection.busy {
+        let usage = if connection.model_source == ModelSource::ChatGpt {
+            "  Alt+U usage"
+        } else {
+            ""
+        };
+        footer.push(Line::from(Span::styled(
+            format!("Ctrl+R refresh{usage}"),
+            theme.faint(),
+        )));
+    } else {
+        footer.push(Line::from(Span::styled("Draft preserved", theme.faint())));
+    }
+    frame.render_widget(Paragraph::new(footer), regions[4]);
 }
 
 fn render_welcome(frame: &mut Frame, state: &WorkbenchState, area: Rect, theme: &Theme) {
@@ -706,7 +829,7 @@ fn render_welcome(frame: &mut Frame, state: &WorkbenchState, area: Rect, theme: 
     let message = if let Some(reason) = &state.unavailable {
         Some(reason.clone())
     } else if state.model.is_none() {
-        Some("Offline. F2 settings > Continue with ChatGPT, or configure an API key.".to_owned())
+        Some("Connect a model in F2 settings to get started.".to_owned())
     } else if !rich {
         Some("Describe a change or ask about this codebase.".to_owned())
     } else {
@@ -1180,7 +1303,10 @@ fn render_composer(frame: &mut Frame, state: &WorkbenchState, area: Rect, theme:
     if area.height == 0 || area.width == 0 {
         return;
     }
-    let focused = state.focus == Focus::Composer;
+    let focused = state.focus == Focus::Composer
+        && state.connection.is_none()
+        && !state.help
+        && !state.palette_open();
     let style = if focused { theme.text() } else { theme.dim() };
     let border = if focused {
         theme.border_focused()
@@ -1275,7 +1401,11 @@ fn render_composer(frame: &mut Frame, state: &WorkbenchState, area: Rect, theme:
                 border,
                 theme,
             ))
-            .style(theme.bg(theme.palette.bg_raise))
+            .style(theme.bg(if focused {
+                theme.palette.bg_raise
+            } else {
+                theme.palette.bg_panel
+            }))
             .wrap(Wrap { trim: false }),
         area,
     );
@@ -1283,7 +1413,7 @@ fn render_composer(frame: &mut Frame, state: &WorkbenchState, area: Rect, theme:
 
 fn render_footer(frame: &mut Frame, state: &WorkbenchState, area: Rect, theme: &Theme) {
     let hints: Vec<(&str, &str)> = if state.usage_limit {
-        vec![("Ctrl+U", "Manage usage"), ("/ account", "change account")]
+        vec![("Alt+U", "usage"), ("F2", "account")]
     } else if state.queue_edit.is_some() {
         vec![("Enter", "save edit"), ("Esc", "restore draft")]
     } else if state
@@ -1296,6 +1426,12 @@ fn render_footer(frame: &mut Frame, state: &WorkbenchState, area: Rect, theme: &
             ("Alt+D", "deny"),
             ("Alt+V", "full action"),
         ]
+    } else if state.focus == Focus::Timeline {
+        vec![
+            ("Enter", "input"),
+            ("Up/Down", "select"),
+            ("Ctrl+L", "latest"),
+        ]
     } else if state.task_state.is_some_and(|s| !s.is_terminal()) && state.pending.is_none() {
         if state.steer_draft {
             vec![("Enter", "steer"), ("Alt+S", "queue"), ("Ctrl+C", "stop")]
@@ -1303,16 +1439,19 @@ fn render_footer(frame: &mut Frame, state: &WorkbenchState, area: Rect, theme: &
             vec![("Enter", "queue"), ("Alt+S", "steer"), ("Ctrl+C", "stop")]
         }
     } else if !state.follow {
-        vec![("PgUp/PgDn", "scroll"), ("Esc", "latest")]
-    } else if area.width < 40 {
-        vec![("Enter", "send"), ("F1", "help")]
+        vec![
+            ("PgUp/PgDn", "scroll"),
+            ("Ctrl+L", "latest"),
+            ("F1", "help"),
+        ]
+    } else if area.width < 60 {
+        vec![("Enter", "send"), ("F1", "help"), ("Ctrl+P", "commands")]
     } else {
         vec![
             ("Enter", "send"),
-            ("/", "commands"),
-            ("F1", "help"),
-            ("F2", "settings"),
             ("Shift+Enter", "newline"),
+            ("Ctrl+P", "commands"),
+            ("F1", "help"),
         ]
     };
     let mut line = vec![Span::raw(" ")];
@@ -1322,48 +1461,48 @@ fn render_footer(frame: &mut Frame, state: &WorkbenchState, area: Rect, theme: &
         if used + size > area.width as usize {
             continue;
         }
-        line.push(Span::styled(key, theme.text()));
-        line.push(Span::styled(format!(" {label}  "), theme.faint()));
+        line.push(Span::styled(key, theme.text().add_modifier(Modifier::BOLD)));
+        line.push(Span::styled(format!(" {label}  "), theme.dim()));
         used += size;
     }
-    let detail = state.status.clone().unwrap_or_else(|| {
-        if state.approval_open {
-            " PgUp/PgDn scroll action · Esc conversation · draft kept".to_owned()
-        } else if state.task_state.is_some_and(|s| !s.is_terminal()) {
-            if area.width < 45 {
-                " Ctrl+O jobs · F1 help"
+    let detail = if let Some(status) = &state.status {
+        Line::from(Span::styled(
+            format!(
+                " {}",
+                clipped(
+                    &crate::cards::sanitize_for_display(status),
+                    area.width.saturating_sub(1) as usize
+                )
+            ),
+            if state.usage_limit || state.pending.is_some() {
+                theme.warn()
             } else {
-                " Ctrl+O manage queue · Shift+Enter newline"
-            }
-            .to_owned()
+                theme.accent()
+            },
+        ))
+    } else {
+        let text = if state.approval_open {
+            " PgUp/PgDn scroll action  Esc conversation  Draft kept".to_owned()
+        } else if state.task_state.is_some_and(|s| !s.is_terminal()) {
+            " Ctrl+O jobs  F4 models  Shift+Enter newline".to_owned()
+        } else if area.width < 45 {
+            " F2 settings  F4 models".to_owned()
         } else if state.chatgpt_plan {
             format!(
-                " ChatGPT: {} · / account · / usage",
+                " F2 settings  F4 models  {}",
                 crate::cards::sanitize_for_display(
                     state.account.as_deref().unwrap_or("ChatGPT account")
                 )
             )
         } else {
-            if area.width < 45 {
-                " / commands · Ctrl+Q save & quit"
-            } else {
-                " Ctrl+R changes   Ctrl+O jobs   Ctrl+Q save & quit"
-            }
-            .to_owned()
-        }
-    });
-    let detail = if theme.glyphs.unicode {
-        detail
-    } else {
-        detail.replace('·', "|")
+            " F2 settings  F4 models  Ctrl+R changes  Ctrl+O jobs".to_owned()
+        };
+        Line::from(Span::styled(
+            clipped(&text, area.width as usize),
+            theme.faint(),
+        ))
     };
-    frame.render_widget(
-        Paragraph::new(vec![
-            Line::from(line),
-            Line::from(Span::styled(detail, theme.faint())),
-        ]),
-        area,
-    );
+    frame.render_widget(Paragraph::new(vec![Line::from(line), detail]), area);
 }
 
 pub fn render_review(frame: &mut Frame, view: &crate::review::ReviewView) {
@@ -1530,69 +1669,93 @@ fn render_review_checks(
 }
 
 fn render_palette(frame: &mut Frame, state: &WorkbenchState, area: Rect, theme: &Theme) {
-    let width = area.width.saturating_sub(4).min(80);
     let results = state.palette_results();
-    let height = (results.len() as u16 + 5).min(area.height.saturating_sub(2));
-    let popup = Rect::new(area.x + (area.width - width) / 2, area.y + 1, width, height);
-    let visible = height.saturating_sub(5).max(1) as usize;
-    let start = state.palette_selection.saturating_sub(visible - 1);
-    let mut lines = vec![
-        Line::from(Span::styled(
-            format!(" /{}_", state.palette.as_deref().unwrap_or("")),
-            theme.text(),
-        )),
-        Line::from(""),
-    ];
-    if results.is_empty() {
-        lines.push(Line::from("  No matching command"));
-    }
-    for (index, command) in results.iter().enumerate().skip(start).take(visible) {
-        let selected = index == state.palette_selection;
-        let style = if selected {
-            theme
-                .text()
-                .patch(theme.bg(theme.palette.bg_sel))
-                .add_modifier(Modifier::BOLD)
-        } else {
-            theme.text()
-        };
-        lines.push(Line::from(Span::styled(
-            format!(
-                " {} {:<12} {}",
-                if selected { ">" } else { " " },
-                command.id,
-                command.title
-            ),
-            style,
-        )));
-    }
-    lines.push(Line::from(Span::styled(
-        " Up/Down select  Enter run  Esc close",
-        theme.dim(),
-    )));
-    frame.render_widget(Clear, popup);
-    frame.render_widget(
-        Paragraph::new(lines)
-            .block(panel(" commands ", theme.border_focused(), theme))
-            .style(theme.bg(theme.palette.bg_raise)),
-        popup,
+    let width = area
+        .width
+        .saturating_sub(if area.width >= 40 { 6 } else { 0 })
+        .min(76);
+    let height = (results.len() as u16 + 7).min(area.height.saturating_sub(2).max(1));
+    let popup = Rect::new(
+        area.x + area.width.saturating_sub(width) / 2,
+        area.y + area.height.saturating_sub(height) / 2,
+        width,
+        height,
     );
+    frame.render_widget(Block::default().style(theme.faint()), area);
+    frame.render_widget(Clear, popup);
+    let block =
+        panel(" commands ", theme.border_focused(), theme).style(theme.bg(theme.palette.bg_raise));
+    let inner = block.inner(popup).inner(ratatui::layout::Margin::new(1, 0));
+    frame.render_widget(block, popup);
+    let rows = Layout::vertical([
+        Constraint::Length(2),
+        Constraint::Min(1),
+        Constraint::Length(2),
+        Constraint::Length(1),
+    ])
+    .split(inner);
+    frame.render_widget(
+        Paragraph::new(Line::from(vec![
+            Span::styled("/ ", theme.accent()),
+            Span::styled(state.palette.as_deref().unwrap_or(""), theme.text()),
+        ])),
+        rows[0],
+    );
+    if results.is_empty() {
+        frame.render_widget(
+            Paragraph::new("No matching command").style(theme.dim()),
+            rows[1],
+        );
+    } else {
+        let items = results.iter().map(|command| ListItem::new(command.title));
+        let list = List::new(items)
+            .highlight_symbol(format!("{} ", theme.glyphs.prompt()))
+            .highlight_style(theme.selection());
+        let selected = state.palette_selection.min(results.len() - 1);
+        let visible = rows[1].height as usize;
+        let offset = selected
+            .saturating_sub(visible / 2)
+            .min(results.len().saturating_sub(visible));
+        let mut selection = ListState::default()
+            .with_selected(Some(selected))
+            .with_offset(offset);
+        frame.render_stateful_widget(list, rows[1], &mut selection);
+        frame.render_widget(
+            Paragraph::new(results[selected].description)
+                .style(theme.dim())
+                .wrap(Wrap { trim: false }),
+            rows[2],
+        );
+    }
+    let hint = if inner.width < 40 {
+        "Enter run  Esc close"
+    } else {
+        "Up/Down select  Enter run  Esc close"
+    };
+    frame.render_widget(Paragraph::new(hint).style(theme.faint()), rows[3]);
 }
 
 pub(crate) fn shortcuts(state: &WorkbenchState) -> Vec<&'static str> {
     let mut lines = vec![
-        " F2             Settings",
         " Enter          Send message",
-        " Shift+Enter    Newline (Ctrl+J fallback)",
+        " Shift/Alt+Enter Newline (Ctrl+J fallback)",
+        " Ctrl+, / F2    Settings",
+        " F4             Choose model",
         " Ctrl+P /       Commands",
         " Ctrl+R         Review changes",
-        " Ctrl+O / B     Jobs / decisions",
+        " Ctrl+O / F3    Jobs / decisions",
         " Alt+S          Switch queue / steer",
-        " PgUp / PgDn    Scroll",
+        " PgUp / PgDn    Scroll transcript",
         " Ctrl+Z / Y     Undo / redo",
         " Alt+B / F      Move by word",
         " Ctrl+W         Delete previous word",
-        " /motion        Toggle animations",
+        " Ctrl+Delete    Delete next word",
+        " Ctrl+B / F     Move by character",
+        " Ctrl+A / E     Start / end of line",
+        " Ctrl+U / K     Erase to start / end",
+        " Ctrl+Shift+Z   Redo",
+        " Ctrl+L         Input and latest output",
+        " Tab            Switch input / transcript",
         " Ctrl+C         Stop / clear / quit",
         " Ctrl+Q         Save draft and quit when idle",
     ];
@@ -2305,6 +2468,81 @@ mod tests {
         assert!(start.contains("answer line 0"), "{start}");
     }
     #[test]
+    fn settings_stay_compact_and_leave_the_draft_visible() {
+        let mut state = WorkbenchState::new("/workspace");
+        state.composer.insert("unfinished draft");
+        let mut settings = crate::connection::ConnectionPanel::settings(
+            false,
+            Some("fixture"),
+            &Theme::for_level(ColorLevel::TrueColor),
+        );
+        settings.accounts.clear();
+        settings.error = None;
+        state.connection = Some(settings);
+        let text = snapshot(&state, 100, 32, Tab::Timeline);
+        assert!(text.contains("unfinished draft"));
+        assert!(text.contains("Settings"));
+        assert!(text.contains("Current  fixture"));
+        let settings_row = text
+            .lines()
+            .position(|line| line.contains("Settings"))
+            .unwrap();
+        assert!(settings_row > 3);
+    }
+
+    #[test]
+    fn account_page_uses_the_chatgpt_context_from_api_settings() {
+        let mut state = WorkbenchState::new("/workspace");
+        let mut panel = crate::connection::ConnectionPanel::settings(
+            false,
+            Some("api-model"),
+            &Theme::for_level(ColorLevel::TrueColor),
+        );
+        panel.page = crate::connection::ConnectionPage::Account;
+        panel.accounts.clear();
+        panel.error = None;
+        state.connection = Some(panel);
+        let text = snapshot(&state, 100, 32, Tab::Timeline);
+        assert!(text.contains("ChatGPT plan"));
+        assert!(!text.contains("Current  api-model"));
+        assert!(!text.contains("API connection"));
+    }
+
+    #[test]
+    fn model_selection_scrolls_and_current_is_distinct_from_focus() {
+        use crate::connection::{ConnectionPage, ConnectionPanel};
+        let mut state = WorkbenchState::new("/workspace");
+        let mut connection = ConnectionPanel::open();
+        connection.page = ConnectionPage::Models;
+        connection.accounts.clear();
+        connection.error = None;
+        connection.models = (0..30)
+            .map(|index| {
+                let model = format!("model-{index}");
+                (model.clone(), model)
+            })
+            .collect();
+        connection.current_model = Some("model-29".to_owned());
+        connection.selection = 28;
+        state.connection = Some(connection.clone());
+        let text = snapshot(&state, 60, 18, Tab::Timeline);
+        let focused = text.lines().find(|line| line.contains("model-28")).unwrap();
+        assert!(focused.contains('❯'));
+        assert!(!focused.contains("current"));
+        let current = text
+            .lines()
+            .find(|line| line.contains("model-29") && line.contains("current"))
+            .unwrap();
+        assert!(!current.contains('❯'));
+        connection.set_query("not-a-model");
+        state.connection = Some(connection);
+        let filtered = snapshot(&state, 60, 18, Tab::Timeline);
+        assert!(filtered.contains("No matching models"));
+        assert!(filtered.contains("not-a-model"));
+        assert!(filtered.contains("Esc back"));
+    }
+
+    #[test]
     fn connection_flow_is_readable_at_supported_sizes_and_without_color() {
         use crate::connection::{ConnectionPage, ConnectionPanel};
         let mut state = WorkbenchState::new("/fixture");
@@ -2329,7 +2567,8 @@ mod tests {
                         0
                     };
                     state.connection = Some(if page == ConnectionPage::Settings {
-                        let mut settings = ConnectionPanel::settings(false, None);
+                        let mut settings =
+                            ConnectionPanel::settings(false, None, &Theme::for_level(level));
                         settings.accounts.clear();
                         settings.error = None;
                         settings
@@ -2369,8 +2608,8 @@ mod tests {
         connection.error = Some("Could not load models. Retry or manage usage.".to_owned());
         state.connection = Some(connection.clone());
         let failed = snapshot(&state, 60, 18, Tab::Timeline);
-        assert!(failed.contains("Refresh available models"));
-        assert!(failed.contains("Manage usage"));
+        assert!(failed.contains("Ctrl+R refresh"));
+        assert!(failed.contains("Alt+U usage"));
         connection.error = None;
         connection.busy = true;
         connection.status =

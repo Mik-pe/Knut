@@ -10,7 +10,7 @@ Escape cancels sign-in and preserves the draft.
 
 Settings can select or add an account, sign out, and open **Manage usage**.
 Choose **Use environment configuration** to return to API settings while keeping
-the account signed in. A usage-limit error exposes **Ctrl+U** to open usage.
+the account signed in. A usage-limit error exposes **Alt+U** to open usage.
 
 The terminal commands provide the same account operations:
 
@@ -74,7 +74,10 @@ knut
 ```
 
 Use **Use environment configuration** in Settings if a saved ChatGPT selection
-is active. `doctor` checks configuration offline; `doctor --live` makes one real
+is active. **F4** opens the current provider's searchable model catalog. API
+selections are saved for that provider and endpoint; **Use environment
+configuration** clears saved model choices and restores environment defaults.
+`doctor` checks configuration offline; `doctor --live` makes one real
 call per configured provider and may incur charges.
 
 ## Environment reference
@@ -92,7 +95,7 @@ Defaults below come from Knut's provider adapters.
 | `KNUT_PROVIDER_TIMEOUT_SECONDS` | Positive request timeout; default 120 seconds |
 | `KNUT_PROFILE` | `auto` (default), `general`, or `coding` |
 | `KNUT_LOAD_ENV` | Set to `0` to skip the working directory's `.env` |
-| `KNUT_CONFIG_DIR` | Override account and connection settings storage |
+| `KNUT_CONFIG_DIR` | Override account, model and appearance settings storage |
 | `KNUT_SESSION_STORE` | Override the SQLite session/input store |
 | `KNUT_TUI_COLORS` | Override detection with `truecolor`, `256`, `16`, or `none` |
 | `KNUT_TUI_MOTION` | Set to `off` for reduced motion |

@@ -63,7 +63,7 @@ try {
     CARGO_NET_OFFLINE: 'true',
     NO_COLOR: '1',
     KNUT_TUI_COLORS: 'truecolor',
-    KNUT_TUI_MOTION: 'on',
+    KNUT_TUI_MOTION: undefined,
     KNUT_SESSION_STORE: path.join(artifacts, 'sessions.db'),
   };
   terminal = await launchTerminal({
@@ -98,7 +98,9 @@ try {
   await press(['ctrl', 'c'], 'clear-draft');
   await terminal.type('/motion');
   await snapshot('motion-palette', true);
-  assert((await press('enter', 'motion-off')).includes('Reduced motion on'));
+  assert((await press('enter', 'motion-off')).includes('Appearance saved'));
+  const preferences = JSON.parse(fs.readFileSync(path.join(env.KNUT_CONFIG_DIR, 'terminal-preferences.json'), 'utf8'));
+  assert.equal(preferences.reduced_motion, true);
   await terminal.type('Fix value() to return seven; preserve the test.');
   await snapshot('task-draft');
   await press('enter', 'submit');

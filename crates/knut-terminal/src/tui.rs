@@ -2,9 +2,11 @@ use std::sync::Arc;
 use std::time::Duration;
 
 use crossterm::event::{Event, KeyCode, KeyEvent, KeyEventKind, KeyModifiers};
+use unicode_segmentation::UnicodeSegmentation;
 
 use crate::connection::{
     ConnectionAction, ConnectionJob, ConnectionOutcome, ConnectionPage, ConnectionPanel,
+    ModelSource,
 };
 use crate::session::{SessionCommand, SessionEvent};
 use crate::terminal::{TerminalGuard, install_signal_handler, shutdown_requested};
@@ -55,21 +57,40 @@ pub fn handle_key(state: &mut WorkbenchState, key: KeyEvent, tab: &mut Tab) -> S
             if panel.page != panel.home && panel.page != ConnectionPage::Welcome {
                 panel.page = panel.home;
                 panel.selection = 0;
-                panel.status =
-                    "Choose your connection and model. Changes are saved for the next start."
-                        .to_owned();
+                panel.clear_query();
+                panel.status = "Changes apply now and are saved on this device.".to_owned();
             } else {
                 state.connection = None;
             }
             return ShellAction::Continue;
         }
         if !panel.busy {
-            match key.code {
-                KeyCode::Up => panel.selection = panel.selection.saturating_sub(1),
-                KeyCode::Down => {
-                    panel.selection =
-                        (panel.selection + 1).min(panel.choices().len().saturating_sub(1))
+            if panel.page == ConnectionPage::Models {
+                match key.code {
+                    KeyCode::Char('r') if ctrl => {
+                        return ShellAction::Connection(panel.refresh_action());
+                    }
+                    KeyCode::Char('u') if alt && panel.model_source == ModelSource::ChatGpt => {
+                        return ShellAction::Connection(ConnectionAction::ManageUsage);
+                    }
+                    KeyCode::Char('u') if ctrl => panel.clear_query(),
+                    KeyCode::Backspace => panel.pop_query(),
+                    KeyCode::Char(character) if !ctrl && !alt => panel.push_query(character),
+                    _ => {}
                 }
+            }
+            match key.code {
+                KeyCode::Up | KeyCode::BackTab => panel.move_selection(-1),
+                KeyCode::Tab if key.modifiers.contains(KeyModifiers::SHIFT) => {
+                    panel.move_selection(-1)
+                }
+                KeyCode::Down | KeyCode::Tab => panel.move_selection(1),
+                KeyCode::Char('p') if ctrl => panel.move_selection(-1),
+                KeyCode::Char('n') if ctrl => panel.move_selection(1),
+                KeyCode::PageUp => panel.move_selection(-8),
+                KeyCode::PageDown => panel.move_selection(8),
+                KeyCode::Home => panel.selection = 0,
+                KeyCode::End => panel.selection = panel.choices().len().saturating_sub(1),
                 KeyCode::Enter => {
                     if let Some((_, action)) = panel.choices().get(panel.selection) {
                         return ShellAction::Connection(action.clone());
@@ -80,8 +101,18 @@ pub fn handle_key(state: &mut WorkbenchState, key: KeyEvent, tab: &mut Tab) -> S
         }
         return ShellAction::Continue;
     }
-    if ctrl && key.code == KeyCode::Char('u') && state.usage_limit {
+    if alt && key.code == KeyCode::Char('u') && state.usage_limit {
         return ShellAction::PaletteCommand("usage");
+    }
+    if key.code == KeyCode::F(2) || (ctrl && key.code == KeyCode::Char(',')) {
+        state.help = false;
+        state.close_palette();
+        return ShellAction::PaletteCommand("settings");
+    }
+    if key.code == KeyCode::F(4) {
+        state.help = false;
+        state.close_palette();
+        return ShellAction::PaletteCommand("model");
     }
     if ctrl && key.code == KeyCode::Char('c') {
         if state.help
@@ -128,24 +159,65 @@ pub fn handle_key(state: &mut WorkbenchState, key: KeyEvent, tab: &mut Tab) -> S
                 state.close_palette();
                 ShellAction::Continue
             }
-            KeyCode::Up => {
+            KeyCode::Tab if key.modifiers.contains(KeyModifiers::SHIFT) => {
                 state.palette_selection = state.palette_selection.saturating_sub(1);
                 ShellAction::Continue
             }
-            KeyCode::Down => {
+            KeyCode::Up | KeyCode::BackTab => {
+                state.palette_selection = state.palette_selection.saturating_sub(1);
+                ShellAction::Continue
+            }
+            KeyCode::Down | KeyCode::Tab => {
                 state.palette_selection = (state.palette_selection + 1)
                     .min(state.palette_results().len().saturating_sub(1));
                 ShellAction::Continue
             }
-            KeyCode::Backspace => {
+            KeyCode::Char('p') if ctrl => {
+                state.palette_selection = state.palette_selection.saturating_sub(1);
+                ShellAction::Continue
+            }
+            KeyCode::Char('n') if ctrl => {
+                state.palette_selection = (state.palette_selection + 1)
+                    .min(state.palette_results().len().saturating_sub(1));
+                ShellAction::Continue
+            }
+            KeyCode::Home => {
+                state.palette_selection = 0;
+                ShellAction::Continue
+            }
+            KeyCode::End => {
+                state.palette_selection = state.palette_results().len().saturating_sub(1);
+                ShellAction::Continue
+            }
+            KeyCode::PageUp => {
+                state.palette_selection = state.palette_selection.saturating_sub(5);
+                ShellAction::Continue
+            }
+            KeyCode::PageDown => {
+                state.palette_selection = (state.palette_selection + 5)
+                    .min(state.palette_results().len().saturating_sub(1));
+                ShellAction::Continue
+            }
+            KeyCode::Char('u') if ctrl => {
                 if let Some(query) = state.palette.as_mut() {
-                    query.pop();
+                    query.clear();
+                }
+                state.palette_selection = 0;
+                ShellAction::Continue
+            }
+            KeyCode::Backspace => {
+                if let Some(query) = state.palette.as_mut()
+                    && let Some((index, _)) = query.grapheme_indices(true).next_back()
+                {
+                    query.truncate(index);
                 }
                 state.palette_selection = 0;
                 ShellAction::Continue
             }
             KeyCode::Char(c) if !ctrl && !alt => {
-                if let Some(query) = state.palette.as_mut() {
+                if let Some(query) = state.palette.as_mut()
+                    && query.chars().count() < 256
+                {
                     query.push(c);
                 }
                 state.palette_selection = 0;
@@ -167,8 +239,15 @@ pub fn handle_key(state: &mut WorkbenchState, key: KeyEvent, tab: &mut Tab) -> S
             _ => ShellAction::Continue,
         };
     }
-    if key.code == KeyCode::F(2) {
-        return ShellAction::PaletteCommand("settings");
+    if key.code == KeyCode::F(3) {
+        state.approval_open = false;
+        state.detail_scroll = 0;
+        *tab = if *tab == Tab::Inspector {
+            Tab::Timeline
+        } else {
+            Tab::Inspector
+        };
+        return ShellAction::Continue;
     }
     if key.code == KeyCode::F(1)
         || (key.code == KeyCode::Char('?')
@@ -182,19 +261,33 @@ pub fn handle_key(state: &mut WorkbenchState, key: KeyEvent, tab: &mut Tab) -> S
     }
     if ctrl {
         return match key.code {
-            KeyCode::Left if !state.review_open => {
+            KeyCode::Left if !state.review_open && state.focus == Focus::Composer => {
                 state.composer.word_left();
                 ShellAction::Continue
             }
-            KeyCode::Right if !state.review_open => {
+            KeyCode::Right if !state.review_open && state.focus == Focus::Composer => {
                 state.composer.word_right();
                 ShellAction::Continue
             }
-            KeyCode::Char('w') | KeyCode::Backspace if !state.review_open => {
+            KeyCode::Char('w') | KeyCode::Backspace
+                if !state.review_open && state.focus == Focus::Composer =>
+            {
                 state.composer.delete_word_left();
                 ShellAction::Continue
             }
-            KeyCode::Char('p') | KeyCode::Char('k') => {
+            KeyCode::Delete if !state.review_open && state.focus == Focus::Composer => {
+                state.composer.delete_word_right();
+                ShellAction::Continue
+            }
+            KeyCode::Char('u') if !state.review_open && state.focus == Focus::Composer => {
+                state.composer.delete_to_line_start();
+                ShellAction::Continue
+            }
+            KeyCode::Char('k') if !state.review_open && state.focus == Focus::Composer => {
+                state.composer.delete_to_line_end();
+                ShellAction::Continue
+            }
+            KeyCode::Char('p') => {
                 state.open_palette();
                 ShellAction::Continue
             }
@@ -210,15 +303,12 @@ pub fn handle_key(state: &mut WorkbenchState, key: KeyEvent, tab: &mut Tab) -> S
                 state.focus = Focus::Composer;
                 ShellAction::Continue
             }
-            KeyCode::Char('b') => {
-                state.approval_open = false;
-                state.detail_scroll = 0;
-                *tab = if *tab == Tab::Inspector {
-                    Tab::Timeline
-                } else {
-                    Tab::Inspector
-                };
-                state.focus = Focus::Composer;
+            KeyCode::Char('b') if !state.review_open && state.focus == Focus::Composer => {
+                state.composer.left();
+                ShellAction::Continue
+            }
+            KeyCode::Char('f') if !state.review_open && state.focus == Focus::Composer => {
+                state.composer.right();
                 ShellAction::Continue
             }
             KeyCode::Char('d')
@@ -239,23 +329,31 @@ pub fn handle_key(state: &mut WorkbenchState, key: KeyEvent, tab: &mut Tab) -> S
                     ShellAction::Quit
                 }
             }
-            KeyCode::Char('a') if !state.review_open => {
+            KeyCode::Char('a') if !state.review_open && state.focus == Focus::Composer => {
                 state.composer.home();
                 ShellAction::Continue
             }
-            KeyCode::Char('e') if !state.review_open => {
+            KeyCode::Char('e') if !state.review_open && state.focus == Focus::Composer => {
                 state.composer.end();
                 ShellAction::Continue
             }
-            KeyCode::Char('j') if !state.review_open => {
+            KeyCode::Char('j') if !state.review_open && state.focus == Focus::Composer => {
                 state.composer.insert_newline();
                 ShellAction::Continue
             }
-            KeyCode::Char('z') if !state.review_open => {
+            KeyCode::Char('z' | 'Z')
+                if !state.review_open
+                    && state.focus == Focus::Composer
+                    && key.modifiers.contains(KeyModifiers::SHIFT) =>
+            {
+                state.composer.redo();
+                ShellAction::Continue
+            }
+            KeyCode::Char('z') if !state.review_open && state.focus == Focus::Composer => {
                 state.composer.undo();
                 ShellAction::Continue
             }
-            KeyCode::Char('y') if !state.review_open => {
+            KeyCode::Char('y') if !state.review_open && state.focus == Focus::Composer => {
                 state.composer.redo();
                 ShellAction::Continue
             }
@@ -263,11 +361,23 @@ pub fn handle_key(state: &mut WorkbenchState, key: KeyEvent, tab: &mut Tab) -> S
                 state.resume_follow();
                 ShellAction::Continue
             }
+            KeyCode::Char('l') => {
+                state.review_open = false;
+                state.approval_open = false;
+                state.focus = Focus::Composer;
+                state.resume_follow();
+                *tab = Tab::Timeline;
+                ShellAction::Continue
+            }
             _ => ShellAction::Continue,
         };
     }
     if alt {
-        if !state.review_open {
+        if key.code == KeyCode::Enter && !state.review_open && state.focus == Focus::Composer {
+            state.composer.insert_newline();
+            return ShellAction::Continue;
+        }
+        if !state.review_open && state.focus == Focus::Composer {
             match key.code {
                 KeyCode::Char('b') | KeyCode::Left => {
                     state.composer.word_left();
@@ -407,6 +517,17 @@ pub fn handle_key(state: &mut WorkbenchState, key: KeyEvent, tab: &mut Tab) -> S
             state.selection = (state.selection + 1).min(state.timeline.len().saturating_sub(1));
             state.follow = state.selection + 1 >= state.timeline.len();
         }
+        KeyCode::Home if state.focus != Focus::Composer => {
+            state.follow = false;
+            state.selection = 0;
+        }
+        KeyCode::End if state.focus != Focus::Composer => state.resume_follow(),
+        KeyCode::Enter if state.focus != Focus::Composer => {
+            state.focus = Focus::Composer;
+            *tab = Tab::Timeline;
+        }
+        KeyCode::Left | KeyCode::Right | KeyCode::Delete | KeyCode::Backspace
+            if state.focus != Focus::Composer => {}
         KeyCode::Up => state.composer.up(),
         KeyCode::Down => state.composer.down(),
         KeyCode::Left => state.composer.left(),
@@ -494,15 +615,7 @@ fn submit_composer(state: &mut WorkbenchState) -> ShellAction {
 
 fn palette_action(state: &mut WorkbenchState, tab: &mut Tab, id: &'static str) -> ShellAction {
     match id {
-        "motion" => {
-            state.theme.reduced_motion = !state.theme.reduced_motion;
-            state.status = Some(if state.theme.reduced_motion {
-                "Reduced motion on".to_owned()
-            } else {
-                "Animations on".to_owned()
-            });
-            ShellAction::Continue
-        }
+        "motion" => ShellAction::Connection(ConnectionAction::ToggleMotion),
         "steer" | "queue" => {
             state.steer_draft =
                 id == "steer" && state.task_state.is_some_and(|state| !state.is_terminal());
@@ -614,6 +727,15 @@ pub async fn run_shell(
     // closing terminal) still restores the display.
     install_signal_handler();
 
+    let mut preferences = match crate::TerminalPreferences::load() {
+        Ok(preferences) => preferences,
+        Err(error) => {
+            state.status = Some(format!("Appearance settings unavailable: {error}"));
+            crate::TerminalPreferences::default()
+        }
+    };
+    state.theme = preferences.apply(state.theme);
+
     let mut memory = match crate::persist::EditorMemory::open(
         &crate::persist::session_store_path(),
         std::path::Path::new(&state.workspace),
@@ -641,6 +763,7 @@ pub async fn run_shell(
         connections,
         &mut guard,
         memory.as_mut(),
+        &mut preferences,
     )
     .await;
     guard.restore();
@@ -664,6 +787,7 @@ async fn run_loop(
     connections: tokio::sync::mpsc::UnboundedSender<crate::ConnectionRequest>,
     guard: &mut TerminalGuard,
     mut memory: Option<&mut crate::persist::EditorMemory>,
+    preferences: &mut crate::TerminalPreferences,
 ) -> std::io::Result<()> {
     let mut tab = Tab::Timeline;
     if state.chatgpt_plan && crate::openai_auth::needs_plan_notice().unwrap_or(false) {
@@ -770,10 +894,30 @@ async fn run_loop(
                             state.connection = Some(ConnectionPanel::settings(
                                 state.chatgpt_plan,
                                 state.model.as_deref(),
+                                &state.theme,
                             ));
                         }
-                        ShellAction::PaletteCommand("account" | "model") => {
+                        ShellAction::PaletteCommand("account") => {
                             state.connection = Some(ConnectionPanel::open());
+                        }
+                        ShellAction::PaletteCommand("model") => {
+                            let mut panel = ConnectionPanel::settings(
+                                state.chatgpt_plan,
+                                state.model.as_deref(),
+                                &state.theme,
+                            );
+                            panel.home = ConnectionPage::Models;
+                            let source = panel.current_source;
+                            state.connection = Some(panel);
+                            start_connection(
+                                state,
+                                match source {
+                                    ModelSource::ChatGpt => ConnectionAction::Models,
+                                    ModelSource::Environment => ConnectionAction::EnvironmentModels,
+                                },
+                                &connections,
+                                &mut connection_job,
+                            );
                         }
                         ShellAction::PaletteCommand("usage") => {
                             state.connection = Some(ConnectionPanel::open());
@@ -785,7 +929,14 @@ async fn run_loop(
                             );
                         }
                         ShellAction::Connection(action) => {
-                            start_connection(state, action, &connections, &mut connection_job);
+                            if matches!(
+                                action,
+                                ConnectionAction::ToggleMotion | ConnectionAction::ToggleBackground
+                            ) {
+                                apply_appearance(state, &action, preferences);
+                            } else {
+                                start_connection(state, action, &connections, &mut connection_job);
+                            }
                         }
                         ShellAction::CancelConnection => {
                             connection_job = None;
@@ -796,7 +947,9 @@ async fn run_loop(
                                     Err(error) => panel.error = Some(error.to_string()),
                                 }
                                 panel.selection = 0;
-                                panel.status = if panel.status.starts_with("Signed in.")
+                                panel.status = if panel.page == ConnectionPage::Models {
+                                    "Model loading cancelled. Press Ctrl+R to retry."
+                                } else if panel.status.starts_with("Signed in.")
                                     || panel.status.starts_with("Account selected.")
                                 {
                                     "Stopped loading models. Open Choose model to continue."
@@ -832,11 +985,18 @@ async fn run_loop(
                     }
                 }
                 Event::Paste(text) => {
-                    if !state.help
-                        && !state.palette_open()
-                        && !state.review_open
-                        && state.connection.is_none()
-                    {
+                    if let Some(panel) = &mut state.connection {
+                        if panel.page == ConnectionPage::Models && !panel.busy {
+                            panel.set_query(format!("{}{}", panel.query, text.trim()));
+                        }
+                    } else if let Some(query) = state.palette.as_mut() {
+                        query.extend(
+                            text.trim()
+                                .chars()
+                                .take(256usize.saturating_sub(query.chars().count())),
+                        );
+                        state.palette_selection = 0;
+                    } else if !state.help && !state.review_open {
                         state.composer.paste(&text);
                         if state.composer.last_paste_truncated {
                             state.status = Some(
@@ -865,6 +1025,40 @@ async fn run_loop(
     Ok(())
 }
 
+fn apply_appearance(
+    state: &mut WorkbenchState,
+    action: &ConnectionAction,
+    preferences: &mut crate::TerminalPreferences,
+) {
+    let result = match action {
+        ConnectionAction::ToggleMotion => preferences.toggled_motion(&state.theme),
+        ConnectionAction::ToggleBackground => preferences.toggled_background(&state.theme),
+        _ => return,
+    }
+    .and_then(|updated| {
+        updated.save()?;
+        Ok(updated)
+    });
+    match result {
+        Ok(updated) => {
+            state.theme = updated.apply(state.theme);
+            *preferences = updated;
+            state.status = Some("Appearance saved".to_owned());
+            if let Some(panel) = &mut state.connection {
+                panel.sync_from_theme(&state.theme);
+                panel.error = None;
+                panel.status = "Appearance saved for future sessions.".to_owned();
+            }
+        }
+        Err(error) => {
+            state.status = Some(error.to_string());
+            if let Some(panel) = &mut state.connection {
+                panel.error = Some(error.to_string());
+            }
+        }
+    }
+}
+
 fn start_connection(
     state: &mut WorkbenchState,
     action: ConnectionAction,
@@ -885,11 +1079,27 @@ fn start_connection(
         return;
     }
     if state.task_state.is_some_and(|state| !state.is_terminal())
-        && action != ConnectionAction::ManageUsage
+        && !matches!(
+            action,
+            ConnectionAction::ManageUsage
+                | ConnectionAction::Models
+                | ConnectionAction::EnvironmentModels
+                | ConnectionAction::Acknowledge
+        )
     {
         panel.error =
             Some("Finish or cancel the current task before changing the connection.".to_owned());
         return;
+    }
+    match action {
+        ConnectionAction::Models => panel.begin_models(ModelSource::ChatGpt),
+        ConnectionAction::EnvironmentModels => panel.begin_models(ModelSource::Environment),
+        ConnectionAction::Login(_) | ConnectionAction::SelectAccount(_) => {
+            panel.models.clear();
+            panel.clear_query();
+            panel.model_source = ModelSource::ChatGpt;
+        }
+        _ => {}
     }
     panel.busy = true;
     panel.error = None;
@@ -898,6 +1108,7 @@ fn start_connection(
         ConnectionAction::Login(_)
             | ConnectionAction::SelectAccount(_)
             | ConnectionAction::Models
+            | ConnectionAction::EnvironmentModels
             | ConnectionAction::ManageUsage
     );
     panel.status = match &action {
@@ -905,12 +1116,18 @@ fn start_connection(
         ConnectionAction::Models | ConnectionAction::SelectAccount(_) => {
             "Loading models available to this account…"
         }
-        ConnectionAction::SelectModel(_) => "Connecting the model…",
+        ConnectionAction::EnvironmentModels => "Loading models from your API provider…",
+        ConnectionAction::SelectModel(_) | ConnectionAction::SelectEnvironmentModel(_) => {
+            "Connecting the model…"
+        }
         ConnectionAction::Logout => "Signing out…",
         ConnectionAction::ManageUsage => "Opening ChatGPT usage…",
         ConnectionAction::Acknowledge => "Saving…",
         ConnectionAction::Environment => "Saving environment configuration…",
         ConnectionAction::OpenAccount => unreachable!("navigation was handled above"),
+        ConnectionAction::ToggleMotion | ConnectionAction::ToggleBackground => {
+            unreachable!("appearance changes are handled locally")
+        }
     }
     .to_owned();
     let connections = connections.clone();
@@ -941,16 +1158,21 @@ fn finish_connection(
     match outcome {
         Ok(ConnectionOutcome::Models {
             models,
+            source,
             notice,
             error,
         }) => {
-            panel.models = models;
+            panel.begin_models(source);
+            if let Some(models) = models {
+                panel.models = models;
+                panel.select_current();
+            }
             panel.page = if notice {
                 ConnectionPage::Welcome
             } else {
                 ConnectionPage::Models
             };
-            panel.selection = 0;
+            panel.clamp_selection();
             panel.error = error;
             panel.status = "Choose a model. Access is checked when a task runs.".to_owned();
         }
@@ -965,16 +1187,12 @@ fn finish_connection(
             state.chatgpt_plan = plan;
             state.usage_limit = false;
             state.account = account;
-            state.unavailable = if state.checks == 0 {
-                Some("Connected. Configure repository checks before tasks can complete.".to_owned())
-            } else {
-                None
-            };
+            state.unavailable = None;
             state.status = Some(
                 if plan {
                     "Using ChatGPT plan · F2 settings"
                 } else {
-                    "Using environment configuration · F2 settings"
+                    "Using API connection · F2 settings"
                 }
                 .to_owned(),
             );
@@ -1029,12 +1247,10 @@ mod tests {
         let mut state = WorkbenchState::new("/workspace");
         state.composer.paste("unfinished 👩‍💻 draft");
         let mut tab = Tab::Timeline;
-        let previous = state.theme.reduced_motion;
         assert_eq!(
             palette_action(&mut state, &mut tab, "motion"),
-            ShellAction::Continue
+            ShellAction::Connection(ConnectionAction::ToggleMotion)
         );
-        assert_ne!(state.theme.reduced_motion, previous);
         handle_key(&mut state, key(KeyCode::F(1)), &mut tab);
         handle_key(&mut state, key(KeyCode::PageDown), &mut tab);
         assert_eq!(state.help_scroll, 4);
@@ -1075,6 +1291,98 @@ mod tests {
         );
         // The composer is cleared after submitting.
         assert!(state.is_composer_empty());
+    }
+
+    #[test]
+    fn familiar_line_editing_shortcuts_do_not_open_overlays() {
+        let mut state = WorkbenchState::new("/workspace");
+        let mut tab = Tab::Timeline;
+        state.composer.insert("a\u{030a} tail");
+        handle_key(&mut state, ctrl('a'), &mut tab);
+        handle_key(&mut state, ctrl('f'), &mut tab);
+        assert_eq!(state.composer.cursor(), (0, 1));
+        handle_key(&mut state, ctrl('b'), &mut tab);
+        assert_eq!(state.composer.cursor(), (0, 0));
+        assert_eq!(tab, Tab::Timeline);
+        handle_key(&mut state, ctrl('f'), &mut tab);
+        handle_key(&mut state, ctrl('k'), &mut tab);
+        assert_eq!(state.composer.text(), "a\u{030a}");
+        assert!(!state.palette_open());
+        handle_key(&mut state, ctrl('z'), &mut tab);
+        handle_key(&mut state, ctrl('u'), &mut tab);
+        assert_eq!(state.composer.text(), " tail");
+        handle_key(&mut state, ctrl('z'), &mut tab);
+        handle_key(
+            &mut state,
+            KeyEvent::new(
+                KeyCode::Char('Z'),
+                KeyModifiers::CONTROL | KeyModifiers::SHIFT,
+            ),
+            &mut tab,
+        );
+        assert_eq!(state.composer.text(), " tail");
+    }
+
+    #[test]
+    fn focused_transcript_navigation_never_edits_or_sends_the_draft() {
+        let mut state = WorkbenchState::new("/workspace");
+        state.composer.insert("keep this draft");
+        state.focus = Focus::Timeline;
+        let before = state.composer.clone();
+        let mut tab = Tab::Timeline;
+        for code in [
+            KeyCode::Left,
+            KeyCode::Right,
+            KeyCode::Delete,
+            KeyCode::Backspace,
+        ] {
+            assert_eq!(
+                handle_key(&mut state, key(code), &mut tab),
+                ShellAction::Continue
+            );
+        }
+        for shortcut in ['a', 'e', 'b', 'f', 'k', 'u', 'w', 'z', 'y', 'j'] {
+            assert_eq!(
+                handle_key(&mut state, ctrl(shortcut), &mut tab),
+                ShellAction::Continue
+            );
+        }
+        assert_eq!(state.composer, before);
+        assert_eq!(
+            handle_key(&mut state, key(KeyCode::Enter), &mut tab),
+            ShellAction::Continue
+        );
+        assert_eq!(state.focus, Focus::Composer);
+        assert_eq!(state.composer, before);
+    }
+
+    #[test]
+    fn alternate_enter_adds_a_newline_and_settings_are_global() {
+        let mut state = WorkbenchState::new("/workspace");
+        state.composer.insert("first");
+        let mut tab = Tab::Timeline;
+        assert_eq!(
+            handle_key(
+                &mut state,
+                KeyEvent::new(KeyCode::Enter, KeyModifiers::ALT),
+                &mut tab
+            ),
+            ShellAction::Continue
+        );
+        assert_eq!(state.composer.text(), "first\n");
+        state.open_palette();
+        assert_eq!(
+            handle_key(&mut state, ctrl(','), &mut tab),
+            ShellAction::PaletteCommand("settings")
+        );
+        assert!(!state.palette_open());
+        state.help = true;
+        assert_eq!(
+            handle_key(&mut state, key(KeyCode::F(4)), &mut tab),
+            ShellAction::PaletteCommand("model")
+        );
+        assert!(!state.help);
+        assert_eq!(state.composer.text(), "first\n");
     }
 
     #[test]
@@ -1324,7 +1632,7 @@ mod tests {
         let mut tab = Tab::Timeline;
         handle_key(&mut state, ctrl('o'), &mut tab);
         assert_eq!(tab, Tab::Tasks);
-        handle_key(&mut state, ctrl('b'), &mut tab);
+        handle_key(&mut state, key(KeyCode::F(3)), &mut tab);
         assert_eq!(tab, Tab::Inspector);
         handle_key(&mut state, key(KeyCode::Esc), &mut tab);
         assert_eq!(tab, Tab::Timeline);
@@ -1482,7 +1790,11 @@ mod tests {
         assert!(state.usage_limit);
         let mut tab = Tab::Timeline;
         assert_eq!(
-            handle_key(&mut state, ctrl('u'), &mut tab),
+            handle_key(
+                &mut state,
+                KeyEvent::new(KeyCode::Char('u'), KeyModifiers::ALT),
+                &mut tab
+            ),
             ShellAction::PaletteCommand("usage")
         );
         state.chatgpt_plan = false;
@@ -1500,7 +1812,7 @@ mod tests {
             handle_key(&mut state, key(KeyCode::F(2)), &mut tab),
             ShellAction::PaletteCommand("settings")
         );
-        state.connection = Some(ConnectionPanel::settings(false, None));
+        state.connection = Some(ConnectionPanel::settings(false, None, &state.theme));
         let (connections, _) = tokio::sync::mpsc::unbounded_channel();
         let mut job = None;
         start_connection(

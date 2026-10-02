@@ -52,7 +52,8 @@ knut
 ```
 
 Type a task and press **Enter**. Use **Alt+A** to approve an exact pending action
-or **Alt+D** to deny it. **Ctrl+R** opens changes and checks; **F1** shows help.
+or **Alt+D** to deny it. **Ctrl+P** searches commands, **F2** opens settings,
+**F4** searches models, **Ctrl+R** opens changes and checks, and **F1** shows help.
 During work, Enter queues another task and **Alt+S** switches the draft to
 steering the current task. **Ctrl+C** stops work or closes the current overlay.
 See the [terminal guide](docs/terminal.md) for shortcuts and saved drafts.

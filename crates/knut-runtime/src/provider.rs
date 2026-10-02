@@ -84,10 +84,12 @@ pub struct ProviderConfig {
     supports_reasoning_effort: bool,
     /// Requested effort, sent only when supported.
     reasoning_effort: Option<ReasoningEffort>,
+    explicit_reasoning_effort: bool,
     /// Whether this provider accepts `stream_options.include_usage`.
     supports_usage_in_stream: bool,
     transport: ProviderTransport,
     chatgpt_client: Option<String>,
+    environment_provider: String,
 }
 
 impl std::fmt::Debug for ProviderConfig {
@@ -119,6 +121,12 @@ impl ProviderConfig {
                 base_url.as_str(),
                 "https://api.z.ai/api/coding/paas/v4" | "https://api.z.ai/api/paas/v4"
             );
+        let environment_provider = if base_url.starts_with("https://api.z.ai/") {
+            "zai"
+        } else {
+            "chat-completions"
+        }
+        .to_owned();
         Self {
             api_key: api_key.into(),
             base_url,
@@ -132,9 +140,11 @@ impl ProviderConfig {
             reasoning_field: "reasoning_content".to_owned(),
             supports_reasoning_effort,
             reasoning_effort: supports_reasoning_effort.then_some(ReasoningEffort::Max),
+            explicit_reasoning_effort: false,
             supports_usage_in_stream: true,
             transport: ProviderTransport::ChatCompletions,
             chatgpt_client: None,
+            environment_provider,
         }
     }
 
@@ -164,9 +174,11 @@ impl ProviderConfig {
 
     /// OpenAI Responses API, including Codex reasoning models.
     pub fn openai(api_key: impl Into<String>, model: impl Into<String>) -> Self {
-        Self::new(api_key, "https://api.openai.com/v1", model)
+        let mut config = Self::new(api_key, "https://api.openai.com/v1", model)
             .with_transport(ProviderTransport::Responses)
-            .with_billing(BillingPath::Metered)
+            .with_billing(BillingPath::Metered);
+        config.environment_provider = "openai".to_owned();
+        config
     }
 
     pub fn with_transport(mut self, transport: ProviderTransport) -> Self {
@@ -205,7 +217,24 @@ impl ProviderConfig {
     /// documents support; the capability report reflects the truth.
     pub fn with_reasoning_effort(mut self, effort: ReasoningEffort) -> Self {
         self.reasoning_effort = Some(effort);
+        self.explicit_reasoning_effort = true;
         self
+    }
+
+    /// Inferred reasoning defaults follow the model; explicit effort must remain supported.
+    pub fn with_model(mut self, model: impl Into<String>) -> Result<Self, KnutError> {
+        let model = model.into();
+        if model.trim().is_empty() || model.len() > 1024 || model.chars().any(char::is_control) {
+            return Err(KnutError::Model("Invalid provider model ID".to_owned()));
+        }
+        let defaults = Self::new("", &self.base_url, &model).with_transport(self.transport);
+        self.model = model;
+        self.supports_reasoning_effort = defaults.supports_reasoning_effort;
+        if !self.explicit_reasoning_effort {
+            self.reasoning_effort = defaults.reasoning_effort;
+        }
+        self.validate_reasoning()?;
+        Ok(self)
     }
 
     pub fn with_usage_in_stream(mut self, supported: bool) -> Self {
@@ -231,8 +260,37 @@ impl ProviderConfig {
         Self::from_environment()
     }
 
+    /// API model preferences apply only to the same provider, endpoint and transport.
     pub fn from_environment() -> Result<Self, KnutError> {
+        let config = Self::environment_default()?;
+        if !config.uses_chatgpt_plan()
+            && let Some(model) = crate::openai_auth::saved_api_model(&config.preference_identity())?
+        {
+            return config.with_model(model);
+        }
+        Ok(config)
+    }
+
+    /// Ignore saved model choices when explicitly restoring environment configuration.
+    pub fn environment_default() -> Result<Self, KnutError> {
         Self::from_settings(|key| std::env::var(key).ok())
+    }
+
+    pub(crate) fn preference_identity(&self) -> String {
+        use sha2::{Digest, Sha256};
+        let mut digest = Sha256::new();
+        for part in [
+            self.environment_provider.as_str(),
+            self.base_url.as_str(),
+            match self.transport {
+                ProviderTransport::ChatCompletions => "chat-completions",
+                ProviderTransport::Responses => "responses",
+            },
+        ] {
+            digest.update((part.len() as u64).to_be_bytes());
+            digest.update(part.as_bytes());
+        }
+        format!("{:x}", digest.finalize())
     }
 
     pub fn chatgpt(model: impl Into<String>) -> Result<Self, KnutError> {
@@ -313,6 +371,7 @@ impl ProviderConfig {
             .to_owned()
         });
         let mut config = Self::new(api_key, base_url, model);
+        config.environment_provider = provider;
         if openai {
             config = config
                 .with_transport(ProviderTransport::Responses)
@@ -336,6 +395,7 @@ impl ProviderConfig {
             config.timeout = Duration::from_secs(seconds);
         }
         if let Some(effort) = get("KNUT_PROVIDER_REASONING_EFFORT") {
+            config.explicit_reasoning_effort = true;
             config.reasoning_effort = Some(match effort.as_str() {
                 "low" => ReasoningEffort::Low,
                 "medium" => ReasoningEffort::Medium,
@@ -1832,6 +1892,70 @@ mod tests {
             model: "glm-5.3-flash".to_owned(),
             tier: ModelTier::Reasoner,
         }
+    }
+
+    #[test]
+    fn model_changes_recompute_capabilities_and_preserve_explicit_effort() {
+        let changed = ProviderConfig::glm_coding("secret")
+            .with_model("glm-5.3")
+            .unwrap();
+        assert_eq!(changed.reasoning_effort(), Some("max"));
+        let ordinary = changed.with_model("ordinary-chat-model").unwrap();
+        assert!(!ordinary.supports_reasoning_effort);
+        assert_eq!(ordinary.reasoning_effort(), None);
+        assert_eq!(ordinary.api_key, "secret");
+        assert_eq!(ordinary.billing, BillingPath::Plan);
+
+        let explicit = ProviderConfig::openai("secret", "gpt-6.1-sol")
+            .with_reasoning_effort(ReasoningEffort::Max);
+        assert!(explicit.clone().with_model("gpt-5").is_err());
+        assert!(explicit.clone().with_model("gpt-4.1").is_err());
+        assert_eq!(
+            explicit.with_model("gpt-6-sol").unwrap().reasoning_effort(),
+            Some("max")
+        );
+        let reasoning = ProviderConfig::openai("secret", "gpt-4.1")
+            .with_model("gpt-6.1-sol")
+            .unwrap();
+        assert!(reasoning.supports_reasoning_effort);
+        assert!(
+            ProviderConfig::glm_coding("secret")
+                .with_model("\n")
+                .is_err()
+        );
+    }
+
+    #[test]
+    fn model_preference_identity_tracks_provider_endpoint_and_transport_only() {
+        let config = ProviderConfig::openai("first-secret", "first-model");
+        let identity = config.preference_identity();
+        assert_eq!(identity.len(), 64);
+        assert!(identity.bytes().all(|byte| byte.is_ascii_hexdigit()));
+        assert_eq!(
+            identity,
+            ProviderConfig::openai("different-secret", "different-model").preference_identity()
+        );
+        assert_ne!(
+            identity,
+            config
+                .clone()
+                .with_transport(ProviderTransport::ChatCompletions)
+                .preference_identity()
+        );
+        let mut other = config.clone();
+        other.base_url = "https://api.openai.com/other/v1".to_owned();
+        assert_ne!(identity, other.preference_identity());
+        other = config;
+        other.environment_provider = "chat-completions".to_owned();
+        assert_ne!(identity, other.preference_identity());
+
+        let env = ProviderConfig::from_settings(|key| match key {
+            "KNUT_PROVIDER" => Some("openai".to_owned()),
+            "OPENAI_API_KEY" => Some("secret".to_owned()),
+            _ => None,
+        })
+        .unwrap();
+        assert_eq!(identity, env.preference_identity());
     }
 
     #[test]

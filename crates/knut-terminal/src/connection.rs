@@ -1,16 +1,28 @@
 use crate::openai_auth::{self, AccountInfo};
+use crate::theme::Theme;
 use crate::{ConnectionChange, ConnectionRequest, KnutError, ProviderConfig, ProviderModel};
+use unicode_segmentation::UnicodeSegmentation;
 
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub enum ConnectionAction {
     Login(bool),
     Models,
+    EnvironmentModels,
     SelectAccount(String),
     SelectModel(String),
+    SelectEnvironmentModel(String),
     Logout,
     ManageUsage,
     Acknowledge,
     OpenAccount,
+    Environment,
+    ToggleMotion,
+    ToggleBackground,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(crate) enum ModelSource {
+    ChatGpt,
     Environment,
 }
 
@@ -27,6 +39,11 @@ pub(crate) struct ConnectionPanel {
     pub page: ConnectionPage,
     pub accounts: Vec<AccountInfo>,
     pub models: Vec<(String, String)>,
+    pub query: String,
+    pub current_model: Option<String>,
+    pub current_source: ModelSource,
+    pub model_source: ModelSource,
+    pub theme: Theme,
     pub selection: usize,
     pub busy: bool,
     pub cancellable: bool,
@@ -43,6 +60,11 @@ impl ConnectionPanel {
             page: ConnectionPage::Account,
             accounts: accounts.as_ref().ok().cloned().unwrap_or_default(),
             models: Vec::new(),
+            query: String::new(),
+            current_model: None,
+            current_source: ModelSource::ChatGpt,
+            model_source: ModelSource::ChatGpt,
+            theme: Theme::detect(),
             selection: 0,
             busy: false,
             cancellable: true,
@@ -53,20 +75,113 @@ impl ConnectionPanel {
         }
     }
 
-    pub fn settings(using_plan: bool, model: Option<&str>) -> Self {
+    pub fn settings(using_plan: bool, model: Option<&str>, theme: &Theme) -> Self {
         let mut panel = Self::open();
         panel.page = ConnectionPage::Settings;
         panel.home = ConnectionPage::Settings;
-        panel.status = format!(
-            "Connection: {}. Model: {}. Changes are saved for the next start.",
-            if using_plan {
-                "ChatGPT plan"
-            } else {
-                "environment configuration"
-            },
-            model.unwrap_or("not connected")
-        );
+        panel.current_model = model.map(str::to_owned);
+        panel.current_source = if using_plan {
+            ModelSource::ChatGpt
+        } else {
+            ModelSource::Environment
+        };
+        panel.model_source = panel.current_source;
+        panel.sync_from_theme(theme);
+        panel.status = "Changes apply now and are saved on this device.".to_owned();
+        if !using_plan && model.is_some() {
+            panel.selection = panel
+                .choices()
+                .iter()
+                .position(|(_, action)| *action == ConnectionAction::EnvironmentModels)
+                .unwrap_or(0);
+        }
         panel
+    }
+
+    pub fn sync_from_theme(&mut self, theme: &Theme) {
+        self.theme = *theme;
+    }
+
+    pub fn current_model_for_source(&self) -> Option<&str> {
+        (self.current_source == self.model_source)
+            .then_some(self.current_model.as_deref())
+            .flatten()
+    }
+
+    pub fn refresh_action(&self) -> ConnectionAction {
+        match self.model_source {
+            ModelSource::ChatGpt => ConnectionAction::Models,
+            ModelSource::Environment => ConnectionAction::EnvironmentModels,
+        }
+    }
+
+    pub fn begin_models(&mut self, source: ModelSource) {
+        if self.model_source != source {
+            self.models.clear();
+            self.clear_query();
+        }
+        self.model_source = source;
+        self.page = ConnectionPage::Models;
+        self.clamp_selection();
+    }
+
+    pub fn set_query(&mut self, query: impl Into<String>) {
+        self.query = query.into().chars().take(128).collect();
+        self.selection = 0;
+    }
+
+    pub fn push_query(&mut self, character: char) {
+        if self.query.chars().count() < 128 {
+            self.query.push(character);
+            self.selection = 0;
+        }
+    }
+
+    pub fn pop_query(&mut self) {
+        if let Some((start, _)) = self.query.grapheme_indices(true).next_back() {
+            self.query.truncate(start);
+            self.selection = 0;
+        }
+    }
+
+    pub fn clear_query(&mut self) {
+        self.query.clear();
+        self.selection = 0;
+    }
+
+    pub fn clamp_selection(&mut self) {
+        self.selection = self.selection.min(self.choices().len().saturating_sub(1));
+    }
+
+    pub fn move_selection(&mut self, delta: isize) {
+        self.selection = self.selection.saturating_add_signed(delta);
+        self.clamp_selection();
+    }
+
+    pub fn select_current(&mut self) {
+        self.selection = self
+            .current_model_for_source()
+            .and_then(|current| {
+                self.filtered_models()
+                    .iter()
+                    .position(|(id, _)| id == current)
+            })
+            .unwrap_or(0);
+    }
+
+    fn filtered_models(&self) -> Vec<&(String, String)> {
+        let terms: Vec<_> = self
+            .query
+            .split_whitespace()
+            .map(str::to_lowercase)
+            .collect();
+        self.models
+            .iter()
+            .filter(|(id, name)| {
+                let text = format!("{id} {name}").to_lowercase();
+                terms.iter().all(|term| text.contains(term))
+            })
+            .collect()
     }
 
     pub fn choices(&self) -> Vec<(String, ConnectionAction)> {
@@ -92,35 +207,62 @@ impl ConnectionPanel {
                     ConnectionAction::OpenAccount,
                 ));
                 choices.push((
+                    "Choose API model".to_owned(),
+                    ConnectionAction::EnvironmentModels,
+                ));
+                choices.push((
                     "Use environment configuration".to_owned(),
                     ConnectionAction::Environment,
                 ));
-                choices.push(("Manage usage".to_owned(), ConnectionAction::ManageUsage));
+                if self.current_source == ModelSource::ChatGpt
+                    || self.accounts.iter().any(|account| account.signed_in)
+                {
+                    choices.push(("Manage usage".to_owned(), ConnectionAction::ManageUsage));
+                }
+                choices.push((
+                    format!(
+                        "Motion: {}",
+                        if self.theme.reduced_motion {
+                            "reduced"
+                        } else {
+                            "animated"
+                        }
+                    ),
+                    ConnectionAction::ToggleMotion,
+                ));
+                choices.push((
+                    format!(
+                        "Background: {}",
+                        if self.theme.paint_background {
+                            "Knut"
+                        } else {
+                            "terminal"
+                        }
+                    ),
+                    ConnectionAction::ToggleBackground,
+                ));
                 choices
             }
             ConnectionPage::Welcome => vec![("Got it".to_owned(), ConnectionAction::Acknowledge)],
-            ConnectionPage::Models => {
-                let mut choices: Vec<_> = self
-                    .models
-                    .iter()
-                    .map(|(id, name)| {
-                        (
-                            if id == name {
-                                id.clone()
-                            } else {
-                                format!("{id} — {name}")
-                            },
-                            ConnectionAction::SelectModel(id.clone()),
-                        )
-                    })
-                    .collect();
-                choices.push((
-                    "Refresh available models".to_owned(),
-                    ConnectionAction::Models,
-                ));
-                choices.push(("Manage usage".to_owned(), ConnectionAction::ManageUsage));
-                choices
-            }
+            ConnectionPage::Models => self
+                .filtered_models()
+                .iter()
+                .map(|(id, name)| {
+                    (
+                        if id == name {
+                            id.clone()
+                        } else {
+                            format!("{id} — {name}")
+                        },
+                        match self.model_source {
+                            ModelSource::ChatGpt => ConnectionAction::SelectModel(id.clone()),
+                            ModelSource::Environment => {
+                                ConnectionAction::SelectEnvironmentModel(id.clone())
+                            }
+                        },
+                    )
+                })
+                .collect(),
             ConnectionPage::Account => {
                 let mut choices = vec![(
                     "Continue with ChatGPT".to_owned(),
@@ -153,7 +295,8 @@ impl ConnectionPanel {
 
 pub(crate) enum ConnectionOutcome {
     Models {
-        models: Vec<(String, String)>,
+        source: ModelSource,
+        models: Option<Vec<(String, String)>>,
         notice: bool,
         error: Option<String>,
     },
@@ -168,45 +311,46 @@ pub(crate) enum ConnectionOutcome {
     BrowserOpened,
 }
 
-fn model_options(mut catalog: Vec<(String, String)>) -> Vec<(String, String)> {
-    // The account catalog can omit models that accept this same account's token.
-    let mut models = Vec::new();
-    for (id, name) in [
-        ("gpt-6.1-sol", "GPT-6.1 Sol"),
-        ("gpt-6-astra", "GPT-6 Astra"),
-        ("gpt-6-luna", "GPT-6 Luna"),
-    ] {
-        let entry = match catalog.iter().position(|(slug, _)| slug == id) {
-            Some(index) => catalog.remove(index),
-            None => (id.to_owned(), name.to_owned()),
-        };
-        models.push(entry);
-    }
-    models.extend(catalog);
-    models
+fn model_options(catalog: Vec<(String, String)>) -> Vec<(String, String)> {
+    let mut seen = std::collections::BTreeSet::new();
+    catalog
+        .into_iter()
+        .filter(|(id, _)| !id.trim().is_empty() && seen.insert(id.clone()))
+        .collect()
 }
 
-async fn catalog() -> Result<ConnectionOutcome, KnutError> {
-    let notice = openai_auth::needs_plan_notice()?;
-    let result = ProviderModel::new(ProviderConfig::chatgpt("gpt-6.1-sol")?)?
-        .list_models()
-        .await;
+async fn catalog(source: ModelSource) -> Result<ConnectionOutcome, KnutError> {
+    let notice = source == ModelSource::ChatGpt && openai_auth::needs_plan_notice()?;
+    let config = match source {
+        // Catalog requests do not use a model ID, but the adapter requires one.
+        ModelSource::ChatGpt => ProviderConfig::chatgpt("catalog")?,
+        ModelSource::Environment => {
+            let config = ProviderConfig::from_environment()?;
+            if config.uses_chatgpt_plan() {
+                return Err(KnutError::Model(
+                    "The configured connection uses ChatGPT. Choose ChatGPT models instead."
+                        .to_owned(),
+                ));
+            }
+            config
+        }
+    };
+    let result = ProviderModel::new(config)?.list_models().await;
     let (models, error) = match result {
-        Ok(models) if !models.is_empty() => (model_options(models), None),
+        Ok(models) if !models.is_empty() => (Some(model_options(models)), None),
         Ok(_) => (
-            Vec::new(),
-            Some("No models are available for this account. Manage usage or retry.".to_owned()),
+            Some(Vec::new()),
+            Some("The provider returned no available models. Refresh to retry.".to_owned()),
         ),
         Err(error) => (
-            Vec::new(),
-            Some(format!(
-                "Could not load models: {error}. Retry or manage usage."
-            )),
+            None,
+            Some(format!("Could not load models: {error}. Refresh to retry.")),
         ),
     };
     Ok(ConnectionOutcome::Models {
+        source,
+        notice: notice && models.as_ref().is_some_and(|models| !models.is_empty()),
         models,
-        notice,
         error,
     })
 }
@@ -227,14 +371,15 @@ pub(crate) async fn execute(
         ConnectionAction::Login(new) => {
             openai_auth::login_in_tui(new).await?;
             let _ = progress.send("Signed in. Loading available models…");
-            catalog().await
+            catalog(ModelSource::ChatGpt).await
         }
         ConnectionAction::SelectAccount(id) => {
             openai_auth::select_account(&id).await?;
             let _ = progress.send("Account selected. Loading available models…");
-            catalog().await
+            catalog(ModelSource::ChatGpt).await
         }
-        ConnectionAction::Models => catalog().await,
+        ConnectionAction::Models => catalog(ModelSource::ChatGpt).await,
+        ConnectionAction::EnvironmentModels => catalog(ModelSource::Environment).await,
         ConnectionAction::SelectModel(model) => {
             let config = ProviderConfig::chatgpt(model.clone())?;
             let account = config.chatgpt_client().and_then(openai_auth::account_label);
@@ -246,8 +391,27 @@ pub(crate) async fn execute(
                 account,
             })
         }
+        ConnectionAction::SelectEnvironmentModel(model) => {
+            let config = ProviderConfig::from_environment()?.with_model(model.clone())?;
+            if config.uses_chatgpt_plan() {
+                return Err(KnutError::Model(
+                    "Choose this model through the ChatGPT connection.".to_owned(),
+                ));
+            }
+            let endpoint = reqwest::Url::parse(config.base_url())
+                .ok()
+                .and_then(|url| url.host_str().map(str::to_owned))
+                .unwrap_or_default();
+            update_engine(&connections, ConnectionChange::Use(Some(config))).await?;
+            Ok(ConnectionOutcome::Connected {
+                model,
+                endpoint,
+                plan: false,
+                account: None,
+            })
+        }
         ConnectionAction::Environment => {
-            let config = ProviderConfig::from_environment()?;
+            let config = ProviderConfig::environment_default()?;
             let model = config.model().to_owned();
             let endpoint = reqwest::Url::parse(config.base_url())
                 .ok()
@@ -263,7 +427,11 @@ pub(crate) async fn execute(
                 account,
             })
         }
-        ConnectionAction::OpenAccount => unreachable!("navigation is handled by the shell"),
+        ConnectionAction::OpenAccount
+        | ConnectionAction::ToggleMotion
+        | ConnectionAction::ToggleBackground => {
+            unreachable!("local settings are handled by the shell")
+        }
         ConnectionAction::Logout => {
             let revoked = openai_auth::logout().await?;
             if using_plan {
@@ -312,32 +480,69 @@ mod tests {
     use super::*;
 
     #[test]
-    fn incomplete_catalog_still_offers_current_models_without_duplicates() {
+    fn catalog_keeps_only_returned_models_and_deduplicates_ids() {
         let catalog = vec![
-            ("gpt-6-astra".to_owned(), "Account Astra".to_owned()),
-            ("gpt-5.6-sol".to_owned(), "GPT-5.6 Sol".to_owned()),
+            ("alpha".to_owned(), "Provider Alpha".to_owned()),
+            ("beta".to_owned(), "Provider Beta".to_owned()),
         ];
         let models = model_options(catalog.clone());
         assert_eq!(model_options(models.clone()), models);
-        assert_eq!(models.len(), 4);
-        assert_eq!(models[1], catalog[0]);
-        assert_eq!(models[3], catalog[1]);
+        assert_eq!(models, catalog);
+        assert_eq!(
+            model_options(vec![catalog[0].clone(), catalog[0].clone()]),
+            vec![catalog[0].clone()]
+        );
+        assert!(model_options(Vec::new()).is_empty());
+    }
 
+    #[test]
+    fn model_search_matches_ids_and_names_without_selectable_fallback_actions() {
         let mut panel = ConnectionPanel::open();
         panel.page = ConnectionPage::Models;
-        panel.models = models;
-        let choices = panel.choices();
+        panel.models = vec![
+            ("alpha".into(), "Fast Model".into()),
+            ("beta".into(), "Deep Model".into()),
+        ];
+        panel.set_query("BETA deep");
         assert_eq!(
-            choices[0],
-            (
-                "gpt-6.1-sol — GPT-6.1 Sol".to_owned(),
-                ConnectionAction::SelectModel("gpt-6.1-sol".to_owned()),
-            )
+            panel.choices(),
+            vec![(
+                "beta — Deep Model".to_owned(),
+                ConnectionAction::SelectModel("beta".to_owned())
+            )]
         );
+        panel.set_query("unavailable");
+        assert!(panel.choices().is_empty());
+        panel.move_selection(10);
+        assert_eq!(panel.selection, 0);
+        panel.set_query("e\u{301}");
+        panel.pop_query();
+        assert!(panel.query.is_empty());
+    }
+
+    #[test]
+    fn model_current_marker_and_actions_follow_the_provider_source() {
+        let mut panel = ConnectionPanel::settings(false, Some("beta"), &Theme::plain());
+        panel.models = vec![
+            ("alpha".into(), "Alpha".into()),
+            ("beta".into(), "Beta".into()),
+        ];
+        panel.page = ConnectionPage::Models;
+        panel.select_current();
+        assert_eq!(panel.selection, 1);
+        assert_eq!(panel.current_model_for_source(), Some("beta"));
         assert_eq!(
-            choices[2].1,
-            ConnectionAction::SelectModel("gpt-6-luna".to_owned())
+            panel.choices()[1].1,
+            ConnectionAction::SelectEnvironmentModel("beta".into())
         );
-        assert_eq!(choices[4].1, ConnectionAction::Models);
+        assert_eq!(panel.refresh_action(), ConnectionAction::EnvironmentModels);
+        panel.move_selection(-100);
+        assert_eq!(panel.selection, 0);
+        panel.move_selection(100);
+        assert_eq!(panel.selection, 1);
+        panel.begin_models(ModelSource::ChatGpt);
+        assert!(panel.models.is_empty());
+        assert!(panel.current_model_for_source().is_none());
+        assert_eq!(panel.refresh_action(), ConnectionAction::Models);
     }
 }

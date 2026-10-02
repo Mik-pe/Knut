@@ -34,12 +34,17 @@ For terminal checks, install `tuistory` where Node can resolve it, then run:
 
 ```sh
 node scripts/smoke-tui.mjs --screenshots
+node scripts/smoke-settings.mjs
 ```
 
 For an existing external installation, set `KNUT_TUISTORY_MODULE` to its absolute
 `dist/index.js` path. The smoke uses a local provider and checks four terminal
 sizes, editing, help, connection settings, approvals, repair, saved drafts and
 color/motion fallbacks. Snapshots are written to a temporary directory.
+
+The settings smoke uses a GET-only catalog fixture to check model search,
+scrolling, failed refreshes, saved API selections, appearance preferences and
+environment reset across restarts. It preserves an unfinished draft throughout.
 
 Smoke scripts locate the debug binary through Cargo metadata. Set `KNUT_BINARY`
 to use another built executable.

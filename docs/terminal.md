@@ -28,30 +28,35 @@ diagnostics, pause, resume and cancel.
 | Key | Action |
 | --- | --- |
 | Enter | Send a task, answer a question or queue during work |
-| Shift+Enter / Ctrl+J | New line |
+| Shift+Enter / Alt+Enter / Ctrl+J | New line |
 | Up / Down | Move through input lines; recall history at its edges |
 | Ctrl+A / Ctrl+E | Start / end of the input line |
+| Ctrl+B / Ctrl+F | Move left / right by one character |
+| Ctrl+U / Ctrl+K | Erase to the start / end of the line |
 | Ctrl+Left / Right or Alt+B / F | Move by word |
 | Ctrl+W or Alt+Backspace | Delete the previous word |
-| Ctrl+Z / Ctrl+Y | Undo / redo |
-| `/` at empty input, Ctrl+P or Ctrl+K | Search commands; arrows select, Enter runs |
-| F2 | Connection settings |
+| Ctrl+Delete | Delete the next word |
+| Ctrl+Z / Ctrl+Y or Ctrl+Shift+Z | Undo / redo |
+| `/` at empty input or Ctrl+P | Search commands; arrows select, Enter runs |
+| F2 / Ctrl+, | Connection and appearance settings |
+| F4 | Search models from the connected provider |
 | Ctrl+R | Changes and checks |
 | Ctrl+O | Jobs and queued requests |
 | Alt+S | Switch the draft between queue and steer during work |
 | Up / Down in jobs | Select a queued request |
 | Alt+E / Alt+X in jobs | Edit / remove the selected request |
 | Alt+R in jobs | Start the selected request when idle |
-| Ctrl+B | Decision details |
+| F3 | Decision details |
+| Ctrl+L | Focus input and return to the latest output |
 | PgUp / PgDn | Scroll the conversation or current detail view |
-| Tab / Shift+Tab | Switch input and conversation navigation |
+| Tab / Shift+Tab | Switch input and conversation navigation; Enter focuses input without sending |
 | Esc | Close a detail view or return to the latest output |
 | Alt+A / Alt+D | Allow / deny the exact pending approval |
 | Alt+V | Toggle the pending-action preview |
 | Ctrl+C | Close an overlay, stop work, clear an idle draft or exit |
 | Ctrl+D | Exit when idle with an empty draft |
 | Ctrl+Q | Save the draft and exit when idle |
-| `?` at empty input / F1 anytime | Shortcut help |
+| `?` at empty input / F1 | Shortcut help |
 
 ## Drafts and history
 
@@ -69,10 +74,28 @@ terminal are reported. Input memory does not resume tasks, queue edits or approv
 
 ## Appearance
 
+Settings saves motion and background preferences for future starts. Choose Knut's
+dark background or inherit your terminal's colors. Changes apply immediately;
+the draft stays behind the settings panel.
+
 Color detection supports truecolor, 256 colors, 16 colors and `NO_COLOR`.
 `KNUT_TUI_COLORS=truecolor|256|16|none` overrides detection, including `NO_COLOR`.
 Use `/motion` or `KNUT_TUI_MOTION=off` for reduced motion; `TERM=dumb` uses a
-static ASCII mark. The knot animation settles while waiting for approval or
+static ASCII mark. An explicit motion environment setting takes priority over
+saved preferences. The knot animation settles while waiting for approval or
 after the introduction. The terminal is restored on exit.
 
 See [development checks](development.md#checks) for repeatable terminal smoke runs.
+
+## Model selection
+
+Press **F4** to search the connected provider's catalog. Type a model ID or name,
+use arrows, Tab, Home/End or PgUp/PgDn to navigate, then Enter to select. The current
+model is marked separately from the highlighted row. Ctrl+U clears the search;
+Ctrl+R refreshes the catalog. Esc closes the picker, or returns to settings when
+opened there, without changing the model.
+
+Settings also lets you browse ChatGPT or configured API models. Only models
+returned by that provider are listed. Choices are saved for the configured
+connection; **Use environment configuration** resets saved model choices.
+You can browse during work; finish or cancel the task before switching models.

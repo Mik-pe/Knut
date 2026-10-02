@@ -625,6 +625,8 @@ pub async fn run_engine_with_connections(
                                 crate::openai_auth::use_environment().await?;
                             } else if let Some(config) = config && let Some(client_id) = config.chatgpt_client() {
                                 crate::openai_auth::save_model(config.model(), client_id).await?;
+                            } else if let Some(config) = config {
+                                crate::openai_auth::save_api_model(&config.preference_identity(), config.model()).await?;
                             }
                             engine.runtime.replace_models(cascade)
                         }.await;

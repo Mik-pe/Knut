@@ -1,3 +1,4 @@
+use std::collections::BTreeMap;
 use std::fs::{File, OpenOptions};
 use std::io::{Read, Write};
 use std::os::fd::AsRawFd;
@@ -35,6 +36,8 @@ pub(crate) struct Accounts {
     pub(crate) registrations: Vec<Registration>,
     #[serde(default)]
     pub(crate) preferred_model: Option<String>,
+    #[serde(default)]
+    pub(crate) api_models: BTreeMap<String, String>,
     #[serde(default)]
     pub(crate) plan_notice_seen: bool,
 }

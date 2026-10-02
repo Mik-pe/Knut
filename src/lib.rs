@@ -16,4 +16,4 @@ pub use knut_terminal::{
     LayoutPlan, Tab, plan_layout, render, render_review, render_review_themed, render_themed,
 };
 pub use knut_terminal::{PaletteCommand, command_catalog, filter_catalog};
-pub use knut_terminal::{ShellAction, TerminalGuard, handle_key, run_shell};
+pub use knut_terminal::{ShellAction, TerminalGuard, TerminalPreferences, handle_key, run_shell};

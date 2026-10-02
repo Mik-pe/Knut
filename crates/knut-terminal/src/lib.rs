@@ -4,6 +4,7 @@ mod connection;
 mod equivalence;
 mod inspector;
 mod knot;
+mod preferences;
 mod replay;
 mod terminal;
 mod theme;
@@ -19,6 +20,7 @@ pub use inspector::{
     LatencyPhase, OutstandingWork, RequirementStatus, SelectedContext, TaskNode, UsageView,
 };
 pub use knot::logo_lines;
+pub use preferences::TerminalPreferences;
 pub use replay::replay_state;
 pub use terminal::TerminalGuard;
 pub use theme::{ColorLevel, Glyphs, Palette, Rgb, Theme};

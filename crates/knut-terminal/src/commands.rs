@@ -15,7 +15,7 @@ pub fn command_catalog() -> Vec<PaletteCommand> {
         PaletteCommand {
             id: "steer",
             title: "Steer task",
-            description: "Redirect the running task (bumps its revision)",
+            description: "Change direction of the active task",
         },
         PaletteCommand {
             id: "queue",
@@ -45,7 +45,7 @@ pub fn command_catalog() -> Vec<PaletteCommand> {
         PaletteCommand {
             id: "settings",
             title: "Settings",
-            description: "Save your connection and model without launch arguments · F2",
+            description: "Connection, models and appearance · Ctrl+, / F2",
         },
         PaletteCommand {
             id: "account",
@@ -85,12 +85,12 @@ pub fn command_catalog() -> Vec<PaletteCommand> {
         PaletteCommand {
             id: "decisions",
             title: "Show decisions",
-            description: "Session evidence and routing · Ctrl+B",
+            description: "Session evidence and routing · F3",
         },
         PaletteCommand {
             id: "model",
             title: "Switch model",
-            description: "Choose an available ChatGPT model",
+            description: "Search models from your connected provider · F4",
         },
     ]
 }

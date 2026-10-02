@@ -275,21 +275,24 @@ impl Composer {
     }
 
     pub fn word_right(&mut self) {
-        if self.cursor_col == self.current_graphemes() && self.cursor_row + 1 < self.lines.len() {
-            self.cursor_row += 1;
-            self.cursor_col = 0;
+        (self.cursor_row, self.cursor_col) = self.word_right_target();
+    }
+
+    fn word_right_target(&self) -> (usize, usize) {
+        let mut row = self.cursor_row;
+        let mut col = self.cursor_col;
+        if col == self.current_graphemes() && row + 1 < self.lines.len() {
+            row += 1;
+            col = 0;
         }
-        let graphemes: Vec<_> = self.lines[self.cursor_row].graphemes(true).collect();
-        while self.cursor_col < graphemes.len()
-            && graphemes[self.cursor_col].chars().all(char::is_whitespace)
-        {
-            self.cursor_col += 1;
+        let graphemes: Vec<_> = self.lines[row].graphemes(true).collect();
+        while col < graphemes.len() && graphemes[col].chars().all(char::is_whitespace) {
+            col += 1;
         }
-        while self.cursor_col < graphemes.len()
-            && !graphemes[self.cursor_col].chars().all(char::is_whitespace)
-        {
-            self.cursor_col += 1;
+        while col < graphemes.len() && !graphemes[col].chars().all(char::is_whitespace) {
+            col += 1;
         }
+        (row, col)
     }
 
     pub fn delete_word_left(&mut self) {
@@ -307,6 +310,47 @@ impl Composer {
         self.lines.splice(row..=self.cursor_row, [head + &tail]);
         self.cursor_row = row;
         self.cursor_col = col;
+    }
+
+    pub fn delete_word_right(&mut self) {
+        let (row, col) = self.word_right_target();
+        if (row, col) == self.cursor() {
+            return;
+        }
+        self.checkpoint();
+        let head: String = self
+            .current_line()
+            .graphemes(true)
+            .take(self.cursor_col)
+            .collect();
+        let tail: String = self.lines[row].graphemes(true).skip(col).collect();
+        self.lines.splice(self.cursor_row..=row, [head + &tail]);
+    }
+
+    pub fn delete_to_line_start(&mut self) {
+        if self.cursor_col == 0 {
+            return;
+        }
+        self.checkpoint();
+        self.lines[self.cursor_row] = self
+            .current_line()
+            .graphemes(true)
+            .skip(self.cursor_col)
+            .collect();
+        self.cursor_col = 0;
+    }
+
+    pub fn delete_to_line_end(&mut self) {
+        if self.cursor_col == self.current_graphemes() {
+            self.delete();
+            return;
+        }
+        self.checkpoint();
+        self.lines[self.cursor_row] = self
+            .current_line()
+            .graphemes(true)
+            .take(self.cursor_col)
+            .collect();
     }
 
     /// Move up a line, keeping the cursor in range.
@@ -526,6 +570,54 @@ mod tests {
         composer.delete();
         assert!(composer.redo());
         assert_eq!(composer.text(), "ab");
+    }
+
+    #[test]
+    fn line_kills_preserve_graphemes_and_undo_without_crossing_the_start() {
+        let mut composer = typed("before\na\u{030a} tail");
+        composer.home();
+        composer.right();
+        composer.delete_to_line_start();
+        assert_eq!(composer.text(), "before\n tail");
+        assert_eq!(composer.cursor(), (1, 0));
+        composer.delete_to_line_start();
+        assert!(composer.undo());
+        assert_eq!(composer.text(), "before\na\u{030a} tail");
+        assert_eq!(composer.cursor(), (1, 1));
+        composer.delete_to_line_end();
+        assert_eq!(composer.text(), "before\na\u{030a}");
+        assert!(composer.undo());
+        assert_eq!(composer.text(), "before\na\u{030a} tail");
+    }
+
+    #[test]
+    fn killing_at_line_end_joins_lines_and_no_op_keeps_redo() {
+        let mut composer = typed("first\nsecond");
+        composer.home();
+        composer.up();
+        composer.end();
+        composer.delete_to_line_end();
+        assert_eq!(composer.text(), "firstsecond");
+        assert_eq!(composer.cursor(), (0, 5));
+        assert!(composer.undo());
+        composer.down();
+        composer.end();
+        composer.delete_to_line_end();
+        assert!(composer.redo());
+        assert_eq!(composer.text(), "firstsecond");
+    }
+
+    #[test]
+    fn forward_word_deletion_crosses_lines_and_undoes_once() {
+        let mut composer = typed("first\na\u{030a} word");
+        composer.home();
+        composer.up();
+        composer.end();
+        composer.delete_word_right();
+        assert_eq!(composer.text(), "first word");
+        assert_eq!(composer.cursor(), (0, 5));
+        assert!(composer.undo());
+        assert_eq!(composer.text(), "first\na\u{030a} word");
     }
 
     #[test]

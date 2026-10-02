@@ -10,7 +10,7 @@ use base64::{Engine as _, engine::general_purpose::URL_SAFE_NO_PAD};
 
 pub use accounts::{
     AccountInfo, account_label, account_list, accounts, acknowledge_plan_notice, needs_plan_notice,
-    save_model, saved_model, select_account, use_environment,
+    save_api_model, save_model, saved_api_model, saved_model, select_account, use_environment,
 };
 pub use oauth::{access_token, login, login_in_tui, logout, open_browser, signed_in_client};
 
