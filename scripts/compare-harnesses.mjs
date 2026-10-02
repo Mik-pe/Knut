@@ -152,7 +152,7 @@ if (operation === 'prepare') {
   } else {
     command('git', ['add', '-N', '--', '.'], work);
     const changedPaths = command('git', ['diff', '--name-only', 'HEAD'], work).trim().split('\n').filter(Boolean);
-    const scopeOk = changedPaths.length > 0 && changedPaths.every(file => file === 'src/composer.rs' || file.startsWith('tests/') || file.startsWith('src/composer/'));
+    const scopeOk = changedPaths.length > 0 && changedPaths.every(file => file === 'crates/knut-editor/src/lib.rs' || file.startsWith('tests/') || file.startsWith('crates/knut-editor/src/'));
     const hidden = path.join(work, 'tests', 'evaluation_composer_budget.rs');
     fs.mkdirSync(path.dirname(hidden), { recursive: true });
     save(hidden, `use knut::{Composer, MAX_COMPOSER_CHARS};

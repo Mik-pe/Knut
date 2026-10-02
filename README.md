@@ -1,5 +1,7 @@
 # Knut
 
+![Knut — Your code, untangled.](assets/knut-cover.webp)
+
 Knut is an experimental general-purpose agent harness in Rust. Coding is its
 first workspace profile; the runtime also supports custom tools, document work,
 lookups and conversation without requiring a repository.
@@ -75,6 +77,40 @@ These hold across every client (TUI, headless JSONL, ACP) and every phase:
 - **honest unknowns.** Unreported usage is unknown, not zero; a stale
   revision says so; an unavailable capability is reported, never silently
   substituted.
+
+## Workspace layout
+
+| Crate | Responsibility |
+| --- | --- |
+| `knut` | CLI entry point and compatibility exports |
+| `knut-runtime` | Sessions, providers, tools, checks, persistence and headless protocols |
+| `knut-terminal` | Terminal UI, connection screens and event replay |
+| `knut-auth` | Account storage, authentication and token refresh |
+| `knut-editor` | Composer state and edit memory, independent of the runtime/UI |
+
+The terminal depends on the runtime. Runtime and terminal share auth/editor
+primitives; the runtime does not depend on the terminal. All adapters keep using
+one session engine. `cargo test --workspace` validates every crate.
+
+## Updating a running installation
+
+An operator can enable self-update by setting `KNUT_UPDATE_TARGET` to a fixed,
+absolute installed binary path and opening Knut's source checkout as the
+workspace. Credentials and service configuration stay outside the checkout.
+Ask Knut to implement the change, inspect its installation and request an update.
+
+`self/inspect_installation` reports the installed binary hash and source revision.
+`self/install_update` requires those exact identities and a normal write approval.
+It runs offline sandboxed formatting, workspace tests, Clippy and a release build,
+then checks the identities again before atomically activating the new executable.
+Missing dependencies, unsupported sandboxing, failed checks or changed inputs
+refuse activation. No network or unsandboxed fallback is used during installation.
+
+Existing sessions keep their original executable; new sessions use the update.
+The previous executable is kept as `knut.previous` beside the installation.
+Updating the binary does not restart its host service or publish the source.
+Process-crash recovery belongs to the hosting adapter; installation itself never
+replays tools or restores approvals.
 
 ## Getting started
 

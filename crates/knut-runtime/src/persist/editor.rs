@@ -81,7 +81,7 @@ impl EditorWriter {
     }
 }
 
-pub(crate) struct EditorMemory {
+pub struct EditorMemory {
     sender: watch::Sender<ComposerMemory>,
     worker: tokio::task::JoinHandle<()>,
     errors: mpsc::UnboundedReceiver<String>,
@@ -90,7 +90,7 @@ pub(crate) struct EditorMemory {
 }
 
 impl EditorMemory {
-    pub(crate) fn open(path: &Path, workspace: &Path) -> Result<(Self, Composer), KnutError> {
+    pub fn open(path: &Path, workspace: &Path) -> Result<(Self, Composer), KnutError> {
         let (mut writer, last) = EditorWriter::open(path, workspace)?;
         let composer =
             Composer::from_memory(last.clone()).map_err(|err| KnutError::Tool(err.to_owned()))?;
@@ -129,7 +129,7 @@ impl EditorMemory {
         ))
     }
 
-    pub(crate) fn checkpoint(&mut self, composer: &Composer, force: bool) {
+    pub fn checkpoint(&mut self, composer: &Composer, force: bool) {
         if self.worker.is_finished() || (!force && Instant::now() < self.next_save) {
             return;
         }
@@ -141,11 +141,11 @@ impl EditorMemory {
         }
     }
 
-    pub(crate) fn error(&mut self) -> Option<String> {
+    pub fn error(&mut self) -> Option<String> {
         self.errors.try_recv().ok()
     }
 
-    pub(crate) async fn finish(mut self) -> Option<String> {
+    pub async fn finish(mut self) -> Option<String> {
         drop(self.sender);
         let result = self.worker.await;
         result

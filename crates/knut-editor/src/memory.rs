@@ -6,14 +6,14 @@ use super::{Composer, MAX_COMPOSER_CHARS, MAX_HISTORY, Snapshot};
 const MAX_HISTORY_CHARS: usize = 1_000_000;
 
 #[derive(Debug, Clone, Default, PartialEq, Eq, Serialize, Deserialize)]
-pub(crate) struct ComposerMemory {
+pub struct ComposerMemory {
     draft: String,
     cursor: (usize, usize),
     history: Vec<String>,
 }
 
 impl Composer {
-    pub(crate) fn memory(&self) -> ComposerMemory {
+    pub fn memory(&self) -> ComposerMemory {
         // Browsing old prompts must not replace the unfinished draft on disk.
         let text = self.text();
         let draft = self.history_draft.as_ref().filter(|_| {
@@ -42,7 +42,7 @@ impl Composer {
         }
     }
 
-    pub(crate) fn from_memory(memory: ComposerMemory) -> Result<Self, &'static str> {
+    pub fn from_memory(memory: ComposerMemory) -> Result<Self, &'static str> {
         if memory.draft.chars().count() > MAX_COMPOSER_CHARS
             || memory.history.len() > MAX_HISTORY
             || memory

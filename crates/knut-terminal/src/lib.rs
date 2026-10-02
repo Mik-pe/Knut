@@ -1,0 +1,34 @@
+pub use knut_runtime::*;
+mod attach;
+mod connection;
+mod equivalence;
+mod inspector;
+mod knot;
+mod replay;
+mod theme;
+mod tui;
+mod tui_render;
+mod tui_state;
+
+pub use attach::{
+    AttachError, Attachment, CommandAvailability, MAX_ATTACHMENTS, PaletteCommand,
+    attachment_payload, attachment_summary, command_catalog, extract_mentions, filter_catalog,
+    resolve_mention, resolve_mentions,
+};
+pub use connection::ConnectionAction;
+pub use equivalence::AdapterEquivalence;
+pub use inspector::{
+    ContextInspection, DecisionInspector, DecisionProvenance, DecisionRecord, LatencyBreakdown,
+    LatencyPhase, OutstandingWork, RequirementStatus, SelectedContext, TaskNode, UsageView,
+};
+pub use knot::logo_lines;
+pub use replay::replay_state;
+pub use theme::{ColorLevel, Glyphs, Palette, Rgb, Theme};
+pub use tui::{ShellAction, TerminalGuard, handle_key, run_shell};
+pub use tui_render::{
+    LayoutPlan, Tab, plan_layout, render, render_review, render_review_themed, render_themed,
+};
+pub use tui_state::{
+    Focus, MAX_ENTRY_CHARS, MAX_TIMELINE, PendingPrompt, TimelineEntry, TimelineKind,
+    WorkbenchState, WorkbenchStats,
+};

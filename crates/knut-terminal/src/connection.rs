@@ -168,14 +168,6 @@ pub(crate) enum ConnectionOutcome {
     BrowserOpened,
 }
 
-pub(crate) fn account_label(client_id: &str) -> Option<String> {
-    openai_auth::account_list()
-        .ok()?
-        .into_iter()
-        .find(|account| account.id == client_id && account.signed_in)
-        .map(|account| account.label)
-}
-
 fn model_options(mut catalog: Vec<(String, String)>) -> Vec<(String, String)> {
     // The account catalog can omit models that accept this same account's token.
     let mut models = Vec::new();
@@ -245,7 +237,7 @@ pub(crate) async fn execute(
         ConnectionAction::Models => catalog().await,
         ConnectionAction::SelectModel(model) => {
             let config = ProviderConfig::chatgpt(model.clone())?;
-            let account = config.chatgpt_client().and_then(account_label);
+            let account = config.chatgpt_client().and_then(openai_auth::account_label);
             update_engine(&connections, ConnectionChange::Use(Some(config))).await?;
             Ok(ConnectionOutcome::Connected {
                 model,
@@ -262,7 +254,7 @@ pub(crate) async fn execute(
                 .and_then(|url| url.host_str().map(str::to_owned))
                 .unwrap_or_default();
             let plan = config.uses_chatgpt_plan();
-            let account = config.chatgpt_client().and_then(account_label);
+            let account = config.chatgpt_client().and_then(openai_auth::account_label);
             update_engine(&connections, ConnectionChange::Environment(config)).await?;
             Ok(ConnectionOutcome::Connected {
                 model,

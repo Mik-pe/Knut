@@ -121,3 +121,11 @@ pub enum KnutError {
     )]
     ReplayKeyConflict { key: String, expected: String },
 }
+
+impl From<knut_auth::AuthError> for KnutError {
+    fn from(error: knut_auth::AuthError) -> Self {
+        match error {
+            knut_auth::AuthError::ModelAuth(message) => Self::ModelAuth(message),
+        }
+    }
+}

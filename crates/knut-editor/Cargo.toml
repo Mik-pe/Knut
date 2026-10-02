@@ -1,0 +1,10 @@
+[package]
+name = "knut-editor"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+description = "Pure multiline editor and serializable draft state"
+
+[dependencies]
+serde.workspace = true
+unicode-segmentation.workspace = true

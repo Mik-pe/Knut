@@ -5,7 +5,17 @@ edition = "2024"
 description = "Experimental agentic harness with System One routing"
 license = "MIT"
 
-[dependencies]
+[workspace]
+members = ["crates/*"]
+default-members = [".", "crates/*"]
+resolver = "2"
+
+[workspace.package]
+version = "0.1.0"
+edition = "2024"
+license = "MIT"
+
+[workspace.dependencies]
 async-trait = "0.1"
 base64 = "0.22"
 crossterm = "0.29.0"
@@ -26,3 +36,10 @@ tokio = { version = "1", features = ["macros", "net", "rt", "rt-multi-thread", "
 tracing = "0.1"
 unicode-segmentation = "1.13.3"
 unicode-width = "0.2"
+
+[dependencies]
+knut-runtime = { path = "crates/knut-runtime" }
+knut-terminal = { path = "crates/knut-terminal" }
+async-trait.workspace = true
+serde_json.workspace = true
+tokio.workspace = true

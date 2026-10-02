@@ -232,7 +232,7 @@ impl ProviderConfig {
         Self::from_environment()
     }
 
-    pub(crate) fn from_environment() -> Result<Self, KnutError> {
+    pub fn from_environment() -> Result<Self, KnutError> {
         Self::from_settings(|key| std::env::var(key).ok())
     }
 
@@ -247,7 +247,7 @@ impl ProviderConfig {
         self.chatgpt_client.is_some()
     }
 
-    pub(crate) fn chatgpt_client(&self) -> Option<&str> {
+    pub fn chatgpt_client(&self) -> Option<&str> {
         self.chatgpt_client.as_deref()
     }
 

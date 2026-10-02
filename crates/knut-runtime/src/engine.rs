@@ -212,7 +212,7 @@ fn build_setup(
             report.chatgpt_plan = config.uses_chatgpt_plan();
             report.account = config
                 .chatgpt_client()
-                .and_then(crate::connection::account_label);
+                .and_then(crate::openai_auth::account_label);
             report.base_url = Some(config.base_url().to_owned());
         }
         _ => {

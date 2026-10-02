@@ -16,7 +16,7 @@
 use unicode_segmentation::UnicodeSegmentation;
 
 mod memory;
-pub(crate) use memory::ComposerMemory;
+pub use memory::ComposerMemory;
 
 /// Maximum characters accepted from one paste.
 ///

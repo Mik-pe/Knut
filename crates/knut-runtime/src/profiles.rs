@@ -41,6 +41,7 @@ pub fn workspace_setup(
     };
     let mut setup = HarnessSetup::default();
     register_workspace_tools(&mut setup.tools, workspace.clone())?;
+    crate::register_self_update_tools(&mut setup.tools, workspace.clone())?;
     let supervisor = Arc::new(Supervisor::new(workspace.clone()));
     register_command_tools(&mut setup.tools, supervisor.clone())?;
     setup.context = Some(Arc::new(WorkspaceContext(workspace.clone())));

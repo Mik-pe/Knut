@@ -4,3 +4,5 @@
 !.env.example
 /TASKS.md
 /HARNESS_COMPARISON.md
+
+.knut-update/

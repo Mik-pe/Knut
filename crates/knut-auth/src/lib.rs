@@ -13,7 +13,11 @@ use serde::{Deserialize, Serialize};
 use sha2::{Digest, Sha256};
 use tokio::io::{AsyncReadExt, AsyncWriteExt};
 
-use crate::KnutError;
+#[derive(Debug, thiserror::Error)]
+pub enum AuthError {
+    #[error("model provider authentication failed: {0}")]
+    ModelAuth(String),
+}
 
 const ISSUER: &str = "https://auth.openai.com";
 const RESOURCE: &str = "https://api.openai.com/v1";
@@ -53,7 +57,7 @@ struct Accounts {
 }
 
 impl Accounts {
-    fn selected(&self) -> Result<&Registration, KnutError> {
+    fn selected(&self) -> Result<&Registration, AuthError> {
         self.registrations
             .iter()
             .find(|r| Some(&r.client_id) == self.active.as_ref())
@@ -70,8 +74,8 @@ struct LockedStore {
     accounts: Accounts,
 }
 
-fn auth_error(message: &str) -> KnutError {
-    KnutError::ModelAuth(message.to_owned())
+fn auth_error(message: &str) -> AuthError {
+    AuthError::ModelAuth(message.to_owned())
 }
 
 fn now() -> u64 {
@@ -81,7 +85,7 @@ fn now() -> u64 {
         .as_secs()
 }
 
-fn random_bytes<const N: usize>() -> Result<[u8; N], KnutError> {
+fn random_bytes<const N: usize>() -> Result<[u8; N], AuthError> {
     let mut bytes = [0; N];
     File::open("/dev/urandom")
         .and_then(|mut f| f.read_exact(&mut bytes))
@@ -89,11 +93,11 @@ fn random_bytes<const N: usize>() -> Result<[u8; N], KnutError> {
     Ok(bytes)
 }
 
-fn random_value() -> Result<String, KnutError> {
+fn random_value() -> Result<String, AuthError> {
     Ok(URL_SAFE_NO_PAD.encode(random_bytes::<32>()?))
 }
 
-fn host_id() -> Result<String, KnutError> {
+fn host_id() -> Result<String, AuthError> {
     let mut b = random_bytes::<16>()?;
     b[6] = (b[6] & 0x0f) | 0x40;
     b[8] = (b[8] & 0x3f) | 0x80;
@@ -114,7 +118,7 @@ fn private_metadata(metadata: &std::fs::Metadata) -> bool {
 }
 
 impl Store {
-    fn configured() -> Result<Self, KnutError> {
+    fn configured() -> Result<Self, AuthError> {
         let dir = if let Some(dir) = std::env::var_os("KNUT_CONFIG_DIR") {
             PathBuf::from(dir)
         } else if let Some(dir) = std::env::var_os("XDG_CONFIG_HOME") {
@@ -126,7 +130,7 @@ impl Store {
         Ok(Self { dir })
     }
 
-    fn prepare(&self) -> Result<(), KnutError> {
+    fn prepare(&self) -> Result<(), AuthError> {
         std::fs::DirBuilder::new()
             .recursive(true)
             .mode(0o700)
@@ -142,7 +146,7 @@ impl Store {
         Ok(())
     }
 
-    fn read(&self) -> Result<Accounts, KnutError> {
+    fn read(&self) -> Result<Accounts, AuthError> {
         self.prepare()?;
         let file = match OpenOptions::new()
             .read(true)
@@ -166,7 +170,7 @@ impl Store {
         })
     }
 
-    fn lock(self) -> Result<LockedStore, KnutError> {
+    fn lock(self) -> Result<LockedStore, AuthError> {
         self.prepare()?;
         let lock = OpenOptions::new()
             .read(true)
@@ -198,7 +202,7 @@ impl Store {
 }
 
 impl LockedStore {
-    fn save(&self) -> Result<(), KnutError> {
+    fn save(&self) -> Result<(), AuthError> {
         let path = self
             .store
             .dir
@@ -228,14 +232,14 @@ impl LockedStore {
     }
 }
 
-async fn lock_store() -> Result<LockedStore, KnutError> {
+async fn lock_store() -> Result<LockedStore, AuthError> {
     let store = Store::configured()?;
     tokio::task::spawn_blocking(move || store.lock())
         .await
         .map_err(|_| auth_error("Credential lock task failed"))?
 }
 
-fn client() -> Result<reqwest::Client, KnutError> {
+fn client() -> Result<reqwest::Client, AuthError> {
     reqwest::Client::builder()
         .timeout(Duration::from_secs(30))
         .redirect(reqwest::redirect::Policy::none())
@@ -257,7 +261,7 @@ struct TokenReply {
 }
 
 impl TokenReply {
-    fn tokens(self, previous: Option<&Tokens>) -> Result<Tokens, KnutError> {
+    fn tokens(self, previous: Option<&Tokens>) -> Result<Tokens, AuthError> {
         if !self.token_type.eq_ignore_ascii_case("bearer")
             || self.access_token.is_empty()
             || self.expires_in == 0
@@ -300,7 +304,7 @@ async fn token_request(
     http: &reqwest::Client,
     endpoint: &str,
     form: &[(&str, &str)],
-) -> Result<TokenReply, KnutError> {
+) -> Result<TokenReply, AuthError> {
     let response = http
         .post(endpoint)
         .form(form)
@@ -320,7 +324,7 @@ async fn token_request(
 }
 
 /// Confirm an active account has consented to ChatGPT plan usage, without network requests.
-pub(crate) fn signed_in_client() -> Result<String, KnutError> {
+pub fn signed_in_client() -> Result<String, AuthError> {
     let accounts = Store::configured()?.read()?;
     let tokens = accounts
         .selected()?
@@ -335,7 +339,7 @@ pub(crate) fn signed_in_client() -> Result<String, KnutError> {
     Ok(accounts.selected()?.client_id.clone())
 }
 
-pub(crate) async fn access_token(client_id: &str) -> Result<String, KnutError> {
+pub async fn access_token(client_id: &str) -> Result<String, AuthError> {
     let mut store = lock_store().await?;
     refresh_account(&mut store, &client()?, TOKEN, client_id).await
 }
@@ -345,7 +349,7 @@ async fn refresh_account(
     http: &reqwest::Client,
     endpoint: &str,
     client_id: &str,
-) -> Result<String, KnutError> {
+) -> Result<String, AuthError> {
     let selected = store
         .accounts
         .registrations
@@ -407,7 +411,7 @@ struct Discovery {
     revocation_endpoint: String,
 }
 
-async fn discovery(http: &reqwest::Client) -> Result<Discovery, KnutError> {
+async fn discovery(http: &reqwest::Client) -> Result<Discovery, AuthError> {
     let response = http
         .get(format!("{ISSUER}/.well-known/openid-configuration"))
         .send()
@@ -438,7 +442,7 @@ async fn discovery(http: &reqwest::Client) -> Result<Discovery, KnutError> {
     Ok(document)
 }
 
-async fn signing_keys(http: &reqwest::Client) -> Result<JwkSet, KnutError> {
+async fn signing_keys(http: &reqwest::Client) -> Result<JwkSet, AuthError> {
     let discovery = discovery(http).await?;
     let keys = http
         .get(discovery.jwks_uri)
@@ -468,7 +472,7 @@ fn validate_identity(
     client_id: &str,
     nonce: Option<&str>,
     keys: &JwkSet,
-) -> Result<Claims, KnutError> {
+) -> Result<Claims, AuthError> {
     let header = decode_header(token).map_err(|_| auth_error("Invalid OpenAI ID token"))?;
     if header.alg != Algorithm::RS256 {
         return Err(auth_error("Unsupported OpenAI ID token algorithm"));
@@ -509,7 +513,7 @@ impl Attempt {
         &self,
         host: &str,
         previous: Option<&Registration>,
-    ) -> Result<reqwest::Url, KnutError> {
+    ) -> Result<reqwest::Url, AuthError> {
         let mut url = reqwest::Url::parse(AUTHORIZE).unwrap();
         let mut params = url.query_pairs_mut();
         params.extend_pairs([
@@ -540,14 +544,14 @@ impl Attempt {
         Ok(url)
     }
 
-    fn callback(&self, target: &str) -> Result<(String, String), KnutError> {
+    fn callback(&self, target: &str) -> Result<(String, String), AuthError> {
         let url = reqwest::Url::parse(&format!("http://127.0.0.1{target}"))
             .map_err(|_| auth_error("Invalid sign-in callback"))?;
         if url.path() != "/auth/callback" || url.fragment().is_some() {
             return Err(auth_error("Invalid sign-in callback path"));
         }
         let pairs = url.query_pairs().collect::<Vec<_>>();
-        let get = |name: &str| -> Result<Option<String>, KnutError> {
+        let get = |name: &str| -> Result<Option<String>, AuthError> {
             let values = pairs.iter().filter(|(k, _)| k == name).collect::<Vec<_>>();
             if values.len() > 1 {
                 return Err(auth_error("Duplicate sign-in callback field"));
@@ -582,7 +586,7 @@ impl Attempt {
 async fn wait_callback(
     listener: tokio::net::TcpListener,
     attempt: &Attempt,
-) -> Result<(String, String), KnutError> {
+) -> Result<(String, String), AuthError> {
     tokio::time::timeout(Duration::from_secs(600),async {
         loop {
             let (mut socket,_)=listener.accept().await.map_err(|_|auth_error("Sign-in callback listener failed"))?;
@@ -612,15 +616,15 @@ async fn wait_callback(
 }
 
 /// Register or reauthorize ChatGPT plan usage in the system browser.
-pub async fn login(new_account: bool) -> Result<String, KnutError> {
+pub async fn login(new_account: bool) -> Result<String, AuthError> {
     login_with_output(new_account, true).await
 }
 
-pub(crate) async fn login_in_tui(new_account: bool) -> Result<String, KnutError> {
+pub async fn login_in_tui(new_account: bool) -> Result<String, AuthError> {
     login_with_output(new_account, false).await
 }
 
-async fn login_with_output(new_account: bool, console: bool) -> Result<String, KnutError> {
+async fn login_with_output(new_account: bool, console: bool) -> Result<String, AuthError> {
     let (host, previous) = {
         let mut store = lock_store().await?;
         if store.accounts.host_id.is_empty() {
@@ -723,7 +727,7 @@ async fn login_with_output(new_account: bool, console: bool) -> Result<String, K
     })
 }
 
-pub(crate) async fn open_browser(url: &str) -> Result<(), KnutError> {
+pub async fn open_browser(url: &str) -> Result<(), AuthError> {
     let opener = if cfg!(target_os = "macos") {
         "open"
     } else {
@@ -745,14 +749,14 @@ pub(crate) async fn open_browser(url: &str) -> Result<(), KnutError> {
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
-pub(crate) struct AccountInfo {
+pub struct AccountInfo {
     pub id: String,
     pub label: String,
     pub active: bool,
     pub signed_in: bool,
 }
 
-pub(crate) fn account_list() -> Result<Vec<AccountInfo>, KnutError> {
+pub fn account_list() -> Result<Vec<AccountInfo>, AuthError> {
     let accounts = Store::configured()?.read()?;
     Ok(accounts
         .registrations
@@ -770,27 +774,27 @@ pub(crate) fn account_list() -> Result<Vec<AccountInfo>, KnutError> {
         .collect())
 }
 
-pub(crate) fn saved_model() -> Result<Option<String>, KnutError> {
+pub fn saved_model() -> Result<Option<String>, AuthError> {
     Ok(Store::configured()?.read()?.preferred_model)
 }
 
-pub(crate) async fn use_environment() -> Result<(), KnutError> {
+pub async fn use_environment() -> Result<(), AuthError> {
     let mut store = lock_store().await?;
     store.accounts.preferred_model = None;
     store.save()
 }
 
-pub(crate) fn needs_plan_notice() -> Result<bool, KnutError> {
+pub fn needs_plan_notice() -> Result<bool, AuthError> {
     Ok(!Store::configured()?.read()?.plan_notice_seen)
 }
 
-pub(crate) async fn acknowledge_plan_notice() -> Result<(), KnutError> {
+pub async fn acknowledge_plan_notice() -> Result<(), AuthError> {
     let mut store = lock_store().await?;
     store.accounts.plan_notice_seen = true;
     store.save()
 }
 
-pub(crate) async fn save_model(model: &str, client_id: &str) -> Result<(), KnutError> {
+pub async fn save_model(model: &str, client_id: &str) -> Result<(), AuthError> {
     let mut store = lock_store().await?;
     let registration = store
         .accounts
@@ -811,7 +815,7 @@ pub(crate) async fn save_model(model: &str, client_id: &str) -> Result<(), KnutE
 }
 
 /// Saved account labels, with active and signed-in status. Credentials stay private.
-pub fn accounts() -> Result<Vec<String>, KnutError> {
+pub fn accounts() -> Result<Vec<String>, AuthError> {
     let accounts = Store::configured()?.read()?;
     Ok(accounts
         .registrations
@@ -841,7 +845,7 @@ pub fn accounts() -> Result<Vec<String>, KnutError> {
 }
 
 /// Select a saved, signed-in registration without combining account credentials.
-pub async fn select_account(client_id: &str) -> Result<(), KnutError> {
+pub async fn select_account(client_id: &str) -> Result<(), AuthError> {
     let mut store = lock_store().await?;
     if !store
         .accounts
@@ -856,7 +860,7 @@ pub async fn select_account(client_id: &str) -> Result<(), KnutError> {
 }
 
 /// Revoke the selected renewable session, then clear its local tokens.
-pub async fn logout() -> Result<bool, KnutError> {
+pub async fn logout() -> Result<bool, AuthError> {
     let mut store = lock_store().await?;
     let selected = store.accounts.selected()?.clone();
     let mut revoked = selected.tokens.is_none();
@@ -894,6 +898,14 @@ pub async fn logout() -> Result<bool, KnutError> {
     store.accounts.preferred_model = None;
     store.save()?;
     Ok(revoked)
+}
+
+pub fn account_label(client_id: &str) -> Option<String> {
+    account_list()
+        .ok()?
+        .into_iter()
+        .find(|account| account.id == client_id && account.signed_in)
+        .map(|account| account.label)
 }
 
 #[cfg(test)]
@@ -1097,10 +1109,12 @@ mod tests {
     fn id_tokens_require_valid_signature_identity_expiry_and_nonce() {
         use jsonwebtoken::{EncodingKey, Header, encode};
         let key = EncodingKey::from_rsa_der(include_bytes!(
-            "../tests/fixtures/openai-test-signing-key.der"
+            "../../../tests/fixtures/openai-test-signing-key.der"
         ));
-        let keys: JwkSet =
-            serde_json::from_str(include_str!("../tests/fixtures/openai-test-jwks.json")).unwrap();
+        let keys: JwkSet = serde_json::from_str(include_str!(
+            "../../../tests/fixtures/openai-test-jwks.json"
+        ))
+        .unwrap();
         let mut header = Header::new(Algorithm::RS256);
         header.kid = Some("fixture".to_owned());
         let claims = serde_json::json!({"sub":"subject", "email":"fixture@example.invalid", "iss":ISSUER, "aud":"client", "iat":now(), "exp":now()+300, "nonce":"nonce"});

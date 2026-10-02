@@ -951,7 +951,7 @@ impl ReviewView {
     }
 }
 
-pub(crate) fn approval_text(name: &str, arguments: &serde_json::Value) -> String {
+pub fn approval_text(name: &str, arguments: &serde_json::Value) -> String {
     let mut text = format!("Action: {name}\n");
     for key in ["path", "expect_hash"] {
         if let Some(value) = arguments.get(key).and_then(serde_json::Value::as_str) {
