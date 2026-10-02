@@ -63,7 +63,7 @@ jobs:
       # the live-smoke variables.
       - name: Confirm live tests stay opt-in
         run: |
-          grep -q "KNUT_LIVE_SMOKE" src/provider.rs
+          grep -q "KNUT_LIVE_SMOKE" crates/knut-runtime/src/provider.rs
           echo "live provider smoke tests require KNUT_LIVE_SMOKE=1"
 
   release:

@@ -75,6 +75,7 @@ struct ToolEntry {
 #[derive(Clone, Default)]
 pub struct ToolRegistry {
     by_capability: HashMap<String, Vec<ToolEntry>>,
+    by_function: HashMap<String, (String, usize)>,
 }
 
 impl ToolRegistry {
@@ -116,13 +117,23 @@ impl ToolRegistry {
             }
         }
 
-        self.by_capability
-            .entry(metadata.capability.clone())
-            .or_default()
-            .push(ToolEntry {
-                metadata,
-                tool: Arc::new(tool),
+        let function = metadata.function_name();
+        if self.by_function.contains_key(&function) {
+            return Err(KnutError::InvalidArguments {
+                path: "$".to_owned(),
+                reason: format!("duplicate tool function {function:?}"),
             });
+        }
+        let entries = self
+            .by_capability
+            .entry(metadata.capability.clone())
+            .or_default();
+        self.by_function
+            .insert(function, (metadata.capability.clone(), entries.len()));
+        entries.push(ToolEntry {
+            metadata,
+            tool: Arc::new(tool),
+        });
 
         Ok(())
     }
@@ -143,11 +154,15 @@ impl ToolRegistry {
                 .flatten()
                 .find(|entry| &entry.metadata.id == id)
                 .ok_or_else(|| KnutError::ToolNotFound(id.clone()))?;
-            selected
+            let entries = selected
                 .by_capability
                 .entry(entry.metadata.capability.clone())
-                .or_default()
-                .push(entry.clone());
+                .or_default();
+            selected.by_function.insert(
+                entry.metadata.function_name(),
+                (entry.metadata.capability.clone(), entries.len()),
+            );
+            entries.push(entry.clone());
         }
         Ok(selected)
     }
@@ -209,6 +224,11 @@ impl ToolRegistry {
     pub fn find_exact(&self, capability: &str, tool_id: &str) -> Result<ToolMetadata, KnutError> {
         let entry = self.find_entry(capability, tool_id)?;
         Ok(entry.metadata.clone())
+    }
+
+    pub(crate) fn find_function(&self, name: &str) -> Option<&ToolMetadata> {
+        let (capability, index) = self.by_function.get(name)?;
+        Some(&self.by_capability.get(capability)?[*index].metadata)
     }
 
     fn find_entry(&self, capability: &str, tool_id: &str) -> Result<&ToolEntry, KnutError> {
@@ -549,6 +569,36 @@ mod tests {
             description,
             side_effect: SideEffect::ReadOnly,
         }
+    }
+
+    #[test]
+    fn function_lookup_is_rebuilt_for_selected_tools() {
+        let mut registry = ToolRegistry::default();
+        registry.register(tool("first", "files", "first")).unwrap();
+        registry
+            .register(tool("second", "files", "second"))
+            .unwrap();
+        registry.register(tool("third", "other", "third")).unwrap();
+        let first = registry
+            .find_exact("files", "first")
+            .unwrap()
+            .function_name();
+        let second = registry
+            .find_exact("files", "second")
+            .unwrap()
+            .function_name();
+        let third = registry
+            .find_exact("other", "third")
+            .unwrap()
+            .function_name();
+        let selected = registry
+            .select(&["third".to_owned(), "second".to_owned()])
+            .unwrap();
+        assert!(selected.find_function(&first).is_none());
+        assert_eq!(selected.find_function(&second).unwrap().id, "second");
+        assert_eq!(selected.find_function(&third).unwrap().id, "third");
+        assert!(selected.clone().find_function("unknown").is_none());
+        assert_eq!(registry.find_function(&first).unwrap().id, "first");
     }
 
     #[test]
