@@ -61,7 +61,8 @@ pub struct Requirement {
 ///
 /// `satisfied` is the function the runtime consults before `Done` is
 /// ever offered as an edge; a model's confidence plays no part in it.
-#[derive(Debug, Clone, PartialEq, Eq, Default)]
+#[derive(Debug, Clone, PartialEq, Eq, Default, Serialize, Deserialize)]
+#[serde(transparent)]
 pub struct CompletionRequirements {
     requirements: Vec<Requirement>,
 }
@@ -83,6 +84,10 @@ impl CompletionRequirements {
             blocking,
         });
         self
+    }
+
+    pub fn extend(&mut self, other: &Self) {
+        self.requirements.extend(other.requirements.iter().cloned());
     }
 
     pub fn requirements(&self) -> &[Requirement] {

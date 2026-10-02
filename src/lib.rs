@@ -14,6 +14,7 @@ mod engine;
 mod error;
 mod evals;
 mod frame;
+mod harness;
 mod headless;
 mod inspector;
 mod judgment;
@@ -27,6 +28,7 @@ mod patch;
 mod persist;
 mod planner;
 mod policy;
+mod profiles;
 mod provider;
 mod recovery;
 mod review;
@@ -86,8 +88,8 @@ pub use edge::{
     EdgeChoice, EdgeJudgment, EdgeRouter, EdgeSelector, EdgeState, MAX_STEP_ATTEMPTS, NodeOutcome,
 };
 pub use engine::{
-    ConnectionChange, ConnectionRequest, Engine, EngineReport, action_label, build_here,
-    build_with_write_approval, run_engine, run_engine_with_connections, source_label,
+    ConnectionChange, ConnectionRequest, Engine, EngineReport, action_label, build_harness,
+    build_here, build_with_write_approval, run_engine, run_engine_with_connections, source_label,
 };
 pub use error::{KnutError, SystemOneFailure, redacted};
 pub use evals::{
@@ -136,8 +138,9 @@ pub use mcp::{
 };
 pub use model::{
     BufferedSink, CascadeOutcome, ComputeCascade, Continuation, ContinuationPart, ExpectedArtifact,
-    Model, ModelAttempt, ModelCapabilities, ModelIdentity, ModelRequest, ModelResponse,
-    ModelStreamEvent, ModelStreamSink, ToolCall, Usage, VerificationVerdict, Verifier,
+    Model, ModelAttempt, ModelCapabilities, ModelExchange, ModelIdentity, ModelRequest,
+    ModelResponse, ModelStreamEvent, ModelStreamSink, ToolCall, ToolResult, Usage,
+    VerificationVerdict, Verifier,
 };
 pub use patch::{
     AppliedOp, ApplyFailure, ApplyOutcome, ApplyPatchTool, MAX_PATCH_OPS, Patch, PatchApplier,
@@ -216,3 +219,9 @@ pub use workspace::{
     SearchTool, Workspace, WriteTool, content_hash, discover_instructions,
     register_workspace_tools,
 };
+
+pub use harness::{
+    ASK_USER_TOOL_ID, AskUserTool, CompletionMonitor, ContextProvider, ContextRead, ContextRecord,
+    HarnessSetup, ResourceRef, TaskOptions,
+};
+pub use profiles::{WorkspaceProfile, workspace_setup};

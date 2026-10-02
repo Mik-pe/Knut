@@ -47,6 +47,8 @@ pub const MAX_LINE_BYTES: usize = 1024 * 1024;
 pub enum HeadlessCommand {
     /// A new task.
     Submit {
+        #[serde(default)]
+        options: crate::TaskOptions,
         prompt: String,
     },
     /// Steer the active task.
@@ -55,9 +57,13 @@ pub enum HeadlessCommand {
     },
     /// Queue a request for the next task.
     Queue {
+        #[serde(default)]
+        options: crate::TaskOptions,
         prompt: String,
     },
     UpdateQueued {
+        #[serde(default)]
+        options: crate::TaskOptions,
         id: u64,
         prompt: String,
     },
@@ -100,18 +106,25 @@ impl HeadlessCommand {
 
     pub fn to_session_command(&self) -> Option<SessionCommand> {
         match self {
-            HeadlessCommand::Submit { prompt } => Some(SessionCommand::Submit {
+            HeadlessCommand::Submit { prompt, options } => Some(SessionCommand::Submit {
                 prompt: prompt.clone(),
+                options: options.clone(),
             }),
             HeadlessCommand::Steer { prompt } => Some(SessionCommand::Steer {
                 prompt: prompt.clone(),
             }),
-            HeadlessCommand::Queue { prompt } => Some(SessionCommand::Queue {
+            HeadlessCommand::Queue { prompt, options } => Some(SessionCommand::Queue {
                 prompt: prompt.clone(),
+                options: options.clone(),
             }),
-            HeadlessCommand::UpdateQueued { id, prompt } => Some(SessionCommand::UpdateQueued {
+            HeadlessCommand::UpdateQueued {
+                id,
+                prompt,
+                options,
+            } => Some(SessionCommand::UpdateQueued {
                 id: *id,
                 prompt: prompt.clone(),
+                options: options.clone(),
             }),
             HeadlessCommand::RemoveQueued { id } => Some(SessionCommand::RemoveQueued { id: *id }),
             HeadlessCommand::RunQueued { id } => Some(SessionCommand::RunQueued { id: *id }),
@@ -596,6 +609,7 @@ impl AcpAdapter {
     pub fn prompt(&mut self, prompt: impl Into<String>) -> SessionCommand {
         SessionCommand::Submit {
             prompt: prompt.into(),
+            options: Default::default(),
         }
     }
 
@@ -1137,7 +1151,7 @@ mod tests {
         let mut adapter = HeadlessAdapter::new("s1");
         assert!(matches!(
             adapter.handle_line(r#"{"type":"submit","prompt":"do work"}"#).unwrap(),
-            Some(SessionCommand::Submit { prompt }) if prompt == "do work"
+            Some(SessionCommand::Submit { prompt, .. }) if prompt == "do work"
         ));
         assert!(!adapter.session.is_closed());
         assert!(
@@ -1559,12 +1573,14 @@ mod tests {
         for prompt in ["short", "first\nsecond"] {
             let command = HeadlessCommand::Queue {
                 prompt: prompt.into(),
+                options: Default::default(),
             }
             .to_session_command();
             assert_eq!(
                 command,
                 Some(SessionCommand::Queue {
-                    prompt: prompt.into()
+                    prompt: prompt.into(),
+                    options: Default::default(),
                 })
             );
         }

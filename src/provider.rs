@@ -572,6 +572,30 @@ impl ProviderModel {
         format!("{}{DEFAULT_CHAT_PATH}", self.config.base_url)
     }
 
+    fn validate_exchanges(&self, request: &ModelRequest) -> Result<(), KnutError> {
+        let identity = self.identity();
+        if request.exchanges.iter().any(|exchange| {
+            exchange.identity.provider != identity.provider
+                || exchange.identity.model != identity.model
+        }) {
+            return Err(KnutError::Model(
+                "conversation belongs to another endpoint/model".to_owned(),
+            ));
+        }
+        if self.config.transport == ProviderTransport::ChatCompletions
+            && request
+                .exchanges
+                .iter()
+                .flat_map(|exchange| &exchange.continuation.parts)
+                .any(|part| part.kind != "reasoning_content")
+        {
+            return Err(KnutError::Model(
+                "continuation belongs to another transport".to_owned(),
+            ));
+        }
+        Ok(())
+    }
+
     /// Build the wire request body.
     fn body(
         &self,
@@ -603,12 +627,53 @@ impl ProviderModel {
             user.push_str(&serde_json::to_string_pretty(&request.input).unwrap_or_default());
         }
         messages.push(json!({ "role": "user", "content": user }));
+        for exchange in &request.exchanges {
+            let mut assistant = json!({"role":"assistant", "content":exchange.content});
+            if !exchange.continuation.is_empty() {
+                assistant["reasoning_content"] = json!(
+                    exchange
+                        .continuation
+                        .parts
+                        .iter()
+                        .map(|part| part.value.as_str())
+                        .collect::<Vec<_>>()
+                        .join("")
+                );
+            }
+            if !exchange.tool_calls.is_empty() {
+                assistant["tool_calls"] =
+                    json!(exchange.tool_calls.iter().map(|call| json!({
+                    "id":call.id,"type":"function",
+                    "function":{"name":call.name,"arguments":call.arguments.to_string()},
+                })).collect::<Vec<_>>());
+            }
+            messages.push(assistant);
+            for result in &exchange.results {
+                messages.push(json!({"role":"tool", "tool_call_id":result.call_id,
+                    "content":result.output.to_string()}));
+            }
+        }
 
         let mut body = json!({
             "model": self.config.model,
             "messages": messages,
             "stream": stream,
         });
+
+        if !request.tools.is_empty() {
+            body["tools"] = json!(
+                request
+                    .tools
+                    .iter()
+                    .map(|tool| json!({
+                        "type":"function", "function":{
+                            "name":tool.function_name(), "description":tool.description,
+                            "parameters":tool.input_schema,
+                        },
+                    }))
+                    .collect::<Vec<_>>()
+            );
+        }
 
         if stream && self.config.supports_usage_in_stream {
             body["stream_options"] = json!({ "include_usage": true });
@@ -697,6 +762,7 @@ impl Model for ProviderModel {
         continuation: Option<&Continuation>,
         request: &ModelRequest,
     ) -> Result<ModelResponse, KnutError> {
+        self.validate_exchanges(request)?;
         if self.config.transport == ProviderTransport::Responses {
             return self
                 .responses_turn(request, continuation, &mut crate::BufferedSink::new())
@@ -733,9 +799,17 @@ impl Model for ProviderModel {
     }
 
     async fn complete(&self, request: &ModelRequest) -> Result<ModelResponse, KnutError> {
+        self.validate_exchanges(request)?;
         if self.config.transport == ProviderTransport::Responses {
             return self
-                .responses_turn(request, None, &mut crate::BufferedSink::new())
+                .responses_turn(
+                    request,
+                    request
+                        .exchanges
+                        .last()
+                        .map(|exchange| &exchange.continuation),
+                    &mut crate::BufferedSink::new(),
+                )
                 .await;
         }
         let started = Instant::now();
@@ -773,8 +847,18 @@ impl Model for ProviderModel {
         request: &ModelRequest,
         sink: &mut (dyn ModelStreamSink + Send),
     ) -> Result<ModelResponse, KnutError> {
+        self.validate_exchanges(request)?;
         if self.config.transport == ProviderTransport::Responses {
-            return self.responses_turn(request, None, sink).await;
+            return self
+                .responses_turn(
+                    request,
+                    request
+                        .exchanges
+                        .last()
+                        .map(|exchange| &exchange.continuation),
+                    sink,
+                )
+                .await;
         }
         let started = Instant::now();
         let response = self
@@ -1952,5 +2036,92 @@ mod tests {
         let user = body["messages"][0]["content"].as_str().unwrap();
         assert!(user.contains("summarize"));
         assert!(user.contains("alpha"));
+    }
+
+    pub(super) fn native_fixture_tool() -> crate::ToolMetadata {
+        crate::ToolMetadata {
+            id: "external/read".to_owned(),
+            tool_version: "1".to_owned(),
+            capability: "documents".to_owned(),
+            description: "Read the report".to_owned(),
+            input_schema: json!({"type":"object"}),
+            side_effect: crate::SideEffect::ReadOnly,
+        }
+    }
+
+    #[tokio::test]
+    async fn native_chat_tools_preserve_call_ids_results_and_reasoning() {
+        let tool = native_fixture_tool();
+        let first = json!({"choices":[{"message":{"role":"assistant", "content":"Inspecting",
+            "reasoning_content":"opaque reasoning", "tool_calls":[{"id":"report-call", "type":"function",
+                "function":{"name":tool.function_name(), "arguments":"{}"}}]}, "finish_reason":"tool_calls"}]}).to_string();
+        let final_response = json!({"choices":[{"message":{"role":"assistant", "content":"The report is ready"}, "finish_reason":"stop"}]}).to_string();
+        let (server, _) = FixtureServer::start(vec![(200, first), (200, final_response)]).await;
+        let model = ProviderModel::new(ProviderConfig::new(
+            "fixture",
+            server.base_url(),
+            "glm-5.3-flash",
+        ))
+        .unwrap();
+        let request = ModelRequest::new("Summarize the report", ExpectedArtifact::Text)
+            .with_tools(vec![tool.clone()]);
+        let response = model.complete(&request).await.unwrap();
+        let request = request.with_exchanges(vec![crate::ModelExchange {
+            identity: response.identity.clone(),
+            content: response.content,
+            tool_calls: response.tool_calls,
+            continuation: response.continuation,
+            results: vec![crate::ToolResult {
+                call_id: "report-call".to_owned(),
+                output: json!({"report":"ready"}),
+            }],
+        }]);
+        assert_eq!(
+            model.complete(&request).await.unwrap().content,
+            "The report is ready"
+        );
+        let sent = server.requests();
+        assert_eq!(
+            sent[0]["tools"][0]["function"]["name"],
+            tool.function_name()
+        );
+        assert_eq!(sent[1]["messages"][0]["role"], "user");
+        assert_eq!(
+            sent[1]["messages"][1]["reasoning_content"],
+            "opaque reasoning"
+        );
+        assert_eq!(sent[1]["messages"][1]["tool_calls"][0]["id"], "report-call");
+        assert_eq!(sent[1]["messages"][2]["tool_call_id"], "report-call");
+        assert_eq!(
+            serde_json::from_str::<Value>(sent[1]["messages"][2]["content"].as_str().unwrap())
+                .unwrap(),
+            json!({"report":"ready"})
+        );
+    }
+
+    #[tokio::test]
+    async fn native_exchanges_cannot_be_sent_to_another_model() {
+        let model = ProviderModel::new(ProviderConfig::glm_coding("fixture")).unwrap();
+        let request = ModelRequest::new("task", ExpectedArtifact::Text).with_exchanges(vec![
+            crate::ModelExchange {
+                identity: ModelIdentity {
+                    provider: "foreign".to_owned(),
+                    model: "foreign".to_owned(),
+                    tier: ModelTier::Reasoner,
+                },
+                content: "answer".to_owned(),
+                tool_calls: Vec::new(),
+                continuation: Continuation::new(),
+                results: Vec::new(),
+            },
+        ]);
+        assert!(
+            model
+                .complete(&request)
+                .await
+                .unwrap_err()
+                .to_string()
+                .contains("another endpoint/model")
+        );
     }
 }

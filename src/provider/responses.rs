@@ -1,4 +1,4 @@
-use std::time::Instant;
+use std::{collections::BTreeMap, time::Instant};
 
 use futures_util::StreamExt;
 use serde_json::{Value, json};
@@ -55,14 +55,43 @@ impl ProviderModel {
                     .map_err(|_| KnutError::Model("cannot encode model input".to_owned()))?,
             );
         }
-        input.push(json!({"role": "user", "content": user}));
+        if let Some(exchange) = request.exchanges.last() {
+            for result in &exchange.results {
+                input.push(
+                    json!({"type":"function_call_output", "call_id":result.call_id,
+                    "output":result.output.to_string()}),
+                );
+            }
+            if let Some(feedback) = request
+                .input
+                .get("feedback")
+                .filter(|value| !value.is_null())
+            {
+                input.push(json!({"role":"user", "content":feedback.to_string()}));
+            }
+        } else {
+            input.push(json!({"role": "user", "content": user}));
+        }
         let mut body = json!({
             "model": self.config.model,
+            "instructions": request.instruction,
             "input": input,
             "store": false,
             "stream": true,
             "include": ["reasoning.encrypted_content"],
         });
+        if !request.tools.is_empty() {
+            body["tools"] = json!(
+                request
+                    .tools
+                    .iter()
+                    .map(|tool| json!({
+                        "type":"function", "name":tool.function_name(),
+                        "description":tool.description, "parameters":tool.input_schema,
+                    }))
+                    .collect::<Vec<_>>()
+            );
+        }
         if let Some(effort) = self.config.reasoning_effort {
             body["reasoning"] = json!({"effort": effort.as_str()});
         }
@@ -98,6 +127,8 @@ impl ProviderModel {
         let mut stream = response.bytes_stream();
         let mut bytes = Vec::new();
         let mut data = String::new();
+        let mut output = BTreeMap::new();
+        let mut output_bytes = 0;
         while let Some(chunk) = stream.next().await {
             bytes.extend_from_slice(
                 &chunk.map_err(|_| incomplete(sink, "Responses stream interrupted"))?,
@@ -148,9 +179,34 @@ impl ProviderModel {
                                 name: required_string(&frame["item"], "name")?.to_owned(),
                             });
                         }
+                        Some("response.output_item.done") => {
+                            let index = frame["output_index"].as_u64().ok_or_else(|| {
+                                incomplete(sink, "Responses output item has no valid index")
+                            })?;
+                            let item = frame
+                                .get("item")
+                                .filter(|item| item.is_object())
+                                .ok_or_else(|| {
+                                    incomplete(sink, "Responses output event has no item")
+                                })?;
+                            output_bytes += item.to_string().len();
+                            if output_bytes > MAX_FRAME_BYTES {
+                                return Err(incomplete(
+                                    sink,
+                                    "Responses output exceeds size limit",
+                                ));
+                            }
+                            if output.insert(index, item.clone()).is_some() {
+                                return Err(incomplete(
+                                    sink,
+                                    "Responses output item completed twice",
+                                ));
+                            }
+                        }
                         Some("response.completed") => {
+                            let response = assemble_output(&frame["response"], output)?;
                             let result =
-                                self.decode_response(&frame["response"], &body, started.elapsed())?;
+                                self.decode_response(&response, &body, started.elapsed())?;
                             for call in &result.tool_calls {
                                 sink.on_event(ModelStreamEvent::ToolCallArgumentsDelta {
                                     id: call.id.clone(),
@@ -279,6 +335,24 @@ impl ProviderModel {
     }
 }
 
+fn assemble_output(response: &Value, mut items: BTreeMap<u64, Value>) -> Result<Value, KnutError> {
+    let output = response["output"]
+        .as_array()
+        .ok_or_else(|| KnutError::Model("Responses envelope has no output array".to_owned()))?;
+    for (index, item) in output.iter().enumerate() {
+        items.insert(index as u64, item.clone());
+    }
+    if items.keys().copied().ne(0..items.len() as u64) {
+        return Err(KnutError::Model(
+            "Responses output items are missing".to_owned(),
+        ));
+    }
+    let mut response = response.clone();
+    // ChatGPT plan streams can omit items from the terminal envelope.
+    response["output"] = Value::Array(items.into_values().collect());
+    Ok(response)
+}
+
 fn required_string<'a>(value: &'a Value, name: &str) -> Result<&'a str, KnutError> {
     value[name]
         .as_str()
@@ -352,6 +426,120 @@ mod tests {
         assert_eq!(sent[1]["input"][1]["encrypted_content"], "opaque-state");
         assert_eq!(sent[1]["input"][2]["role"], "assistant");
         assert_eq!(sent[1]["input"].as_array().unwrap().len(), 4);
+    }
+
+    #[tokio::test]
+    async fn completed_items_survive_an_empty_terminal_envelope() {
+        let tool = super::super::tests::native_fixture_tool();
+        let items = json!([
+            {"type":"reasoning", "id":"reason", "encrypted_content":"private-state", "summary":[]},
+            {"type":"function_call", "status":"completed", "call_id":"report-call", "name":tool.function_name(), "arguments":"{}"}
+        ]);
+        let wire = |items: &Value| {
+            let mut wire = String::new();
+            for (index, item) in items.as_array().unwrap().iter().enumerate() {
+                wire.push_str(&sse(
+                    &json!({"type":"response.output_item.done", "output_index":index, "item":item})
+                        .to_string(),
+                ));
+            }
+            let mut terminal = response("");
+            terminal["output"] = json!([]);
+            wire + &sse(&json!({"type":"response.completed", "response":terminal}).to_string())
+        };
+        let (server, _) = FixtureServer::start_chunked(
+            vec![
+                (200, wire(&items)),
+                (200, wire(&response("Report ready 🦉")["output"])),
+            ],
+            1,
+        )
+        .await;
+        let model = model(server.base_url());
+        let request = ModelRequest::new("Summarize the report", ExpectedArtifact::Text)
+            .with_tools(vec![tool]);
+        let first = model
+            .stream(&request, &mut BufferedSink::new())
+            .await
+            .unwrap();
+        assert_eq!(first.tool_calls[0].id, "report-call");
+        let request = request.with_exchanges(vec![crate::ModelExchange {
+            identity: first.identity,
+            content: first.content,
+            tool_calls: first.tool_calls,
+            continuation: first.continuation,
+            results: vec![crate::ToolResult {
+                call_id: "report-call".to_owned(),
+                output: json!({"report":"ready"}),
+            }],
+        }]);
+        let mut sink = BufferedSink::new();
+        let answer = model.stream(&request, &mut sink).await.unwrap();
+        assert_eq!(answer.content, "Report ready 🦉");
+        assert!(matches!(
+            sink.events().last(),
+            Some(ModelStreamEvent::Completed { .. })
+        ));
+        let sent = server.requests();
+        assert_eq!(sent[1]["input"][1]["encrypted_content"], "private-state");
+        assert_eq!(sent[1]["input"][2]["call_id"], "report-call");
+        assert_eq!(sent[1]["input"][3]["type"], "function_call_output");
+    }
+
+    #[tokio::test]
+    async fn streamed_items_do_not_turn_failed_or_truncated_streams_into_success() {
+        let item = response("partial")["output"][1].clone();
+        let done = sse(
+            &json!({"type":"response.output_item.done", "output_index":0, "item":item}).to_string(),
+        );
+        let mut terminal = response("");
+        terminal["output"] = json!([]);
+        terminal["status"] = json!("failed");
+        let cases = [
+            done.clone(),
+            done.clone()
+                + &sse(
+                    r#"{"type":"response.failed","response":{"error":{"code":"server_error"}}}"#,
+                ),
+            done + &sse(&json!({"type":"response.completed", "response":terminal}).to_string()),
+        ];
+        for wire in cases {
+            let (server, _) = FixtureServer::start(vec![(200, wire)]).await;
+            let mut sink = BufferedSink::new();
+            assert!(
+                model(server.base_url())
+                    .stream(
+                        &ModelRequest::new("task", ExpectedArtifact::Text),
+                        &mut sink
+                    )
+                    .await
+                    .is_err()
+            );
+            assert!(
+                !sink
+                    .events()
+                    .iter()
+                    .any(|event| matches!(event, ModelStreamEvent::Completed { .. }))
+            );
+        }
+    }
+
+    #[test]
+    fn output_assembly_preserves_order_without_duplicates_and_rejects_gaps() {
+        let envelope = response("final");
+        let items: BTreeMap<_, _> = envelope["output"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .cloned()
+            .enumerate()
+            .map(|(index, item)| (index as u64, item))
+            .collect();
+        assert_eq!(assemble_output(&envelope, items).unwrap(), envelope);
+        let mut empty = envelope.clone();
+        empty["output"] = json!([]);
+        let gaps = BTreeMap::from([(1, envelope["output"][1].clone())]);
+        assert!(assemble_output(&empty, gaps).is_err());
     }
 
     #[tokio::test]
@@ -478,5 +666,55 @@ mod tests {
                 .responses_body(&request, Some(&decoded.continuation))
                 .is_err()
         );
+    }
+
+    #[tokio::test]
+    async fn native_responses_tools_replay_encrypted_history_and_function_outputs() {
+        let tool = super::super::tests::native_fixture_tool();
+        let mut first = response("");
+        first["output"] = json!([
+            {"type":"reasoning", "id":"reason", "encrypted_content":"private-state", "summary":[]},
+            {"type":"function_call", "status":"completed", "call_id":"report-call", "name":tool.function_name(), "arguments":"{}"}
+        ]);
+        let wire = |envelope: Value| {
+            sse(&json!({"type":"response.completed", "response":envelope}).to_string())
+        };
+        let (server, _) = FixtureServer::start(vec![
+            (200, wire(first)),
+            (200, wire(response("The report is ready"))),
+        ])
+        .await;
+        let model = model(server.base_url());
+        let request = ModelRequest::new("Summarize the report", ExpectedArtifact::Text)
+            .with_tools(vec![tool.clone()]);
+        let first = model
+            .stream(&request, &mut BufferedSink::new())
+            .await
+            .unwrap();
+        let request = request.with_exchanges(vec![crate::ModelExchange {
+            identity: first.identity.clone(),
+            content: first.content,
+            tool_calls: first.tool_calls,
+            continuation: first.continuation,
+            results: vec![crate::ToolResult {
+                call_id: "report-call".to_owned(),
+                output: json!({"report":"ready"}),
+            }],
+        }]);
+        assert_eq!(
+            model
+                .stream(&request, &mut BufferedSink::new())
+                .await
+                .unwrap()
+                .content,
+            "The report is ready"
+        );
+        let sent = server.requests();
+        assert_eq!(sent[0]["tools"][0]["name"], tool.function_name());
+        assert_eq!(sent[1]["input"][1]["encrypted_content"], "private-state");
+        assert_eq!(sent[1]["input"][2]["call_id"], "report-call");
+        assert_eq!(sent[1]["input"][3]["type"], "function_call_output");
+        assert_eq!(sent[1]["input"][3]["call_id"], "report-call");
+        assert_eq!(sent[1]["input"].as_array().unwrap().len(), 4);
     }
 }

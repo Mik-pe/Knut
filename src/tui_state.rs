@@ -572,6 +572,7 @@ impl WorkbenchState {
                     FrameKind::Recovery => "recovery",
                     FrameKind::Continuation => "continuation",
                     FrameKind::CandidateSelection => "candidate",
+                    FrameKind::ContextSelection => "context",
                 };
                 self.push(
                     TimelineKind::Decision,

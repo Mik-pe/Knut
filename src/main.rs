@@ -32,7 +32,9 @@ fn main() -> std::process::ExitCode {
     // Load a nearby `.env` before anything reads credentials. Values are
     // *added* to the environment and never overwrite what the operator set,
     // so an exported key always wins over a file.
-    load_env_file();
+    if std::env::var("KNUT_LOAD_ENV").as_deref() != Ok("0") {
+        load_env_file();
+    }
 
     // The workbench shell polls the terminal on the main task, so session
     // work runs on a separate worker: a slow provider must never block
@@ -195,7 +197,7 @@ async fn run(args: Vec<String>) -> Result<(), KnutError> {
         "lsp" => lsp_status().await,
         "jsonl" => headless_jsonl(&positionals).await,
         "run" => {
-            coding_run_with_census(
+            task_run_with_census(
                 &positionals,
                 verbose,
                 approve_writes,
@@ -216,13 +218,13 @@ async fn run(args: Vec<String>) -> Result<(), KnutError> {
 }
 
 fn usage() -> String {
-    "Knut — a coding agent for your terminal
+    "Knut — a general agent harness for your terminal
 
 USAGE:
-  knut                     open the interactive coding session
-  knut run <prompt> [--yes]  run one coding task (--yes approves writes)
+  knut                     open the interactive agent session
+  knut run <prompt> [--yes]  run one task (--yes approves writes)
                            --census <new.json> records generator calls, including failures
-  knut tui                 open the interactive coding session explicitly
+  knut tui                 open the interactive agent session explicitly
   knut doctor [--live]      diagnose setup (--live calls configured providers)
   knut login openai-codex [--new]  sign in with ChatGPT (or add an account)
   knut logout openai-codex  sign out of the selected ChatGPT account
@@ -751,6 +753,7 @@ async fn headless_jsonl(positionals: &[String]) -> Result<(), KnutError> {
     if one_shot {
         let _ = command_tx.send(knut::SessionCommand::Submit {
             prompt: positionals.join(" "),
+            options: Default::default(),
         });
     } else {
         std::thread::spawn(move || {
@@ -855,14 +858,14 @@ async fn lsp_status() -> Result<(), KnutError> {
 /// and no accept-all verifier: it wires the configured provider, the real
 /// workspace tools, the mandatory gate, the sandboxed supervisor and the
 /// revision-bound check runner.
-async fn coding_run_with_census(
+async fn task_run_with_census(
     prompts: &[String],
     verbose: bool,
     yes: bool,
     census_path: Option<&str>,
 ) -> Result<(), KnutError> {
     let Some(path) = census_path else {
-        return coding_run(prompts, verbose, yes).await;
+        return task_run(prompts, verbose, yes).await;
     };
     let mut options = std::fs::OpenOptions::new();
     options.write(true).create_new(true);
@@ -875,7 +878,7 @@ async fn coding_run_with_census(
         .open(path)
         .map_err(|err| KnutError::Tool(format!("cannot create census {path:?}: {err}")))?;
     let started = std::time::Instant::now();
-    let (result, calls) = knut::capture_model_calls(coding_run(prompts, verbose, yes)).await;
+    let (result, calls) = knut::capture_model_calls(task_run(prompts, verbose, yes)).await;
     let report = knut::ModelCallReport::new(
         calls,
         result.is_ok(),
@@ -889,7 +892,7 @@ async fn coding_run_with_census(
     result
 }
 
-async fn coding_run(prompts: &[String], verbose: bool, yes: bool) -> Result<(), KnutError> {
+async fn task_run(prompts: &[String], verbose: bool, yes: bool) -> Result<(), KnutError> {
     let prompt = prompts.join(" ");
     if prompt.trim().is_empty() {
         return Err(KnutError::Tool("knut run needs a prompt".to_owned()));
@@ -907,10 +910,15 @@ async fn coding_run(prompts: &[String], verbose: bool, yes: bool) -> Result<(), 
         "  reasoner  {}",
         report.model.as_deref().unwrap_or("unavailable")
     );
-    println!("  checks    {}", report.checks.join(", "));
+    if !report.checks.is_empty() {
+        println!("  checks    {}", report.checks.join(", "));
+    }
     let (event_tx, mut events) = tokio::sync::mpsc::unbounded_channel();
     let (command_tx, commands) = tokio::sync::mpsc::unbounded_channel();
-    let _ = command_tx.send(knut::SessionCommand::Submit { prompt });
+    let _ = command_tx.send(knut::SessionCommand::Submit {
+        prompt,
+        options: Default::default(),
+    });
     let client = async move {
         let mut command_tx = Some(command_tx);
         let mut complete = false;
@@ -935,7 +943,7 @@ async fn coding_run(prompts: &[String], verbose: bool, yes: bool) -> Result<(), 
     if complete {
         Ok(())
     } else {
-        Err(KnutError::Tool("The task did not reach a verified state. Use a TUI/JSONL session to answer questions or approve writes, or --yes to pre-approve writes in a new run".to_owned()))
+        Err(KnutError::Tool("The task did not complete. Use a TUI/JSONL session to answer questions or approve writes, or --yes to pre-approve writes in a new run".to_owned()))
     }
 }
 
@@ -967,7 +975,7 @@ fn print_run_event(event: &knut::SessionEvent, verbose: bool) {
             println!("  {message} ({wait:?})")
         }
         knut::SessionEvent::TaskCompleted { summary, .. } => println!("\n{summary}"),
-        knut::SessionEvent::TaskFailed { reason, .. } => eprintln!("\nnot verified: {reason}"),
+        knut::SessionEvent::TaskFailed { reason, .. } => eprintln!("\nfailed: {reason}"),
         knut::SessionEvent::TaskCancelled { .. } => eprintln!("\ncancelled"),
         knut::SessionEvent::RuntimeError { message, .. } => eprintln!("{message}"),
         _ => {}
@@ -1482,7 +1490,7 @@ mod census_tests {
                 .unwrap()
                 .as_nanos(),
         ));
-        let result = coding_run_with_census(&[], false, false, path.to_str()).await;
+        let result = task_run_with_census(&[], false, false, path.to_str()).await;
         assert!(result.is_err());
         let original = std::fs::read(&path).unwrap();
         let report: knut::ModelCallReport = serde_json::from_slice(&original).unwrap();
@@ -1497,7 +1505,7 @@ mod census_tests {
             );
         }
         assert!(
-            coding_run_with_census(&[], false, false, path.to_str())
+            task_run_with_census(&[], false, false, path.to_str())
                 .await
                 .is_err()
         );

@@ -46,6 +46,20 @@ pub trait Tool: Send + Sync {
     async fn call(&self, input: Value) -> Result<Value, KnutError>;
 }
 
+impl ToolMetadata {
+    pub fn function_name(&self) -> String {
+        use sha2::{Digest, Sha256};
+        let digest = Sha256::digest(self.id.as_bytes());
+        format!(
+            "knut_{}",
+            digest[..12]
+                .iter()
+                .map(|byte| format!("{byte:02x}"))
+                .collect::<String>()
+        )
+    }
+}
+
 /// A tool as stored in the registry.
 #[derive(Clone)]
 struct ToolEntry {
@@ -58,7 +72,7 @@ struct ToolEntry {
 /// Selection is hierarchical: pick a capability, then choose an exact tool
 /// from that capability's bounded candidate set. Full input schemas are only
 /// serialized for the candidates, never for the whole catalog.
-#[derive(Default)]
+#[derive(Clone, Default)]
 pub struct ToolRegistry {
     by_capability: HashMap<String, Vec<ToolEntry>>,
 }
@@ -111,6 +125,31 @@ impl ToolRegistry {
             });
 
         Ok(())
+    }
+
+    pub fn select(&self, ids: &[String]) -> Result<Self, KnutError> {
+        let mut selected = Self::default();
+        let mut seen = std::collections::HashSet::new();
+        for id in ids {
+            if !seen.insert(id) {
+                return Err(KnutError::InvalidArguments {
+                    path: "options.tools".to_owned(),
+                    reason: format!("duplicate tool {id:?}"),
+                });
+            }
+            let entry = self
+                .by_capability
+                .values()
+                .flatten()
+                .find(|entry| &entry.metadata.id == id)
+                .ok_or_else(|| KnutError::ToolNotFound(id.clone()))?;
+            selected
+                .by_capability
+                .entry(entry.metadata.capability.clone())
+                .or_default()
+                .push(entry.clone());
+        }
+        Ok(selected)
     }
 
     /// All capability IDs, sorted.

@@ -465,7 +465,16 @@ fn submit_composer(state: &mut WorkbenchState) -> ShellAction {
             return ShellAction::Continue;
         }
         state.status = Some("Saving queued request...".to_owned());
-        return ShellAction::Command(SessionCommand::UpdateQueued { id, prompt });
+        return ShellAction::Command(SessionCommand::UpdateQueued {
+            id,
+            prompt,
+            options: state
+                .queued
+                .iter()
+                .find(|request| request.id == id)
+                .map(|request| request.options.clone())
+                .unwrap_or_default(),
+        });
     }
     if state
         .pending
@@ -486,10 +495,16 @@ fn submit_composer(state: &mut WorkbenchState) -> ShellAction {
         if std::mem::take(&mut state.steer_draft) {
             ShellAction::Command(SessionCommand::Steer { prompt: text })
         } else {
-            ShellAction::Command(SessionCommand::Queue { prompt: text })
+            ShellAction::Command(SessionCommand::Queue {
+                prompt: text,
+                options: Default::default(),
+            })
         }
     } else {
-        ShellAction::Command(SessionCommand::Submit { prompt: text })
+        ShellAction::Command(SessionCommand::Submit {
+            prompt: text,
+            options: Default::default(),
+        })
     }
 }
 
@@ -1075,7 +1090,7 @@ fn start_connection(
     if action == ConnectionAction::OpenAccount {
         panel.page = ConnectionPage::Account;
         panel.selection = 0;
-        panel.status = "Connect your ChatGPT plan to Knut's coding harness.".to_owned();
+        panel.status = "Connect your ChatGPT plan to Knut's agent harness.".to_owned();
         panel.error = None;
         return;
     }
@@ -1264,7 +1279,8 @@ mod tests {
         assert_eq!(
             action,
             ShellAction::Command(SessionCommand::Submit {
-                prompt: "fix the test".to_owned()
+                prompt: "fix the test".to_owned(),
+                options: Default::default(),
             })
         );
         // The composer is cleared after submitting.
@@ -1729,7 +1745,8 @@ mod tests {
         assert_eq!(
             handle_key(&mut state, key(KeyCode::Enter), &mut tab),
             ShellAction::Command(SessionCommand::Queue {
-                prompt: "short follow-up".into()
+                prompt: "short follow-up".into(),
+                options: Default::default(),
             })
         );
         state.composer.insert("preserve APIs\nand add a regression");
@@ -1754,6 +1771,7 @@ mod tests {
         state.composer.insert("unfinished draft");
         state.apply(&SessionEvent::RequestQueued {
             request: crate::session::QueuedRequest {
+                options: Default::default(),
                 id: 4,
                 prompt: "queued".into(),
             },
@@ -1769,12 +1787,14 @@ mod tests {
             handle_key(&mut state, key(KeyCode::Enter), &mut tab),
             ShellAction::Command(SessionCommand::UpdateQueued {
                 id: 4,
-                prompt: "queued changed".into()
+                prompt: "queued changed".into(),
+                options: Default::default(),
             })
         );
         assert_eq!(state.composer.text(), "queued changed");
         state.apply(&SessionEvent::RequestUpdated {
             request: crate::session::QueuedRequest {
+                options: Default::default(),
                 id: 4,
                 prompt: "queued changed".into(),
             },

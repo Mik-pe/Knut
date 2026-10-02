@@ -2065,6 +2065,7 @@ mod tests {
         });
         state.apply(&SessionEvent::RequestQueued {
             request: crate::session::QueuedRequest {
+                options: Default::default(),
                 id: 1,
                 prompt: "then update the docs".to_owned(),
             },

@@ -773,7 +773,9 @@ fn frame_kind_to_decision_type(kind: FrameKind) -> DecisionType {
         FrameKind::Ingress => DecisionType::Ingress,
         FrameKind::Recovery => DecisionType::Recovery,
         FrameKind::Continuation => DecisionType::Continuation,
-        FrameKind::CandidateSelection => DecisionType::CandidateSelection,
+        FrameKind::CandidateSelection | FrameKind::ContextSelection => {
+            DecisionType::CandidateSelection
+        }
     }
 }
 

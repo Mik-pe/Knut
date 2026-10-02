@@ -176,13 +176,31 @@ pub(crate) fn account_label(client_id: &str) -> Option<String> {
         .map(|account| account.label)
 }
 
+fn model_options(mut catalog: Vec<(String, String)>) -> Vec<(String, String)> {
+    // The account catalog can omit models that accept this same account's token.
+    let mut models = Vec::new();
+    for (id, name) in [
+        ("gpt-6.1-sol", "GPT-6.1 Sol"),
+        ("gpt-6-astra", "GPT-6 Astra"),
+        ("gpt-6-luna", "GPT-6 Luna"),
+    ] {
+        let entry = match catalog.iter().position(|(slug, _)| slug == id) {
+            Some(index) => catalog.remove(index),
+            None => (id.to_owned(), name.to_owned()),
+        };
+        models.push(entry);
+    }
+    models.extend(catalog);
+    models
+}
+
 async fn catalog() -> Result<ConnectionOutcome, KnutError> {
     let notice = openai_auth::needs_plan_notice()?;
     let result = ProviderModel::new(ProviderConfig::chatgpt("gpt-6.1-sol")?)?
         .list_models()
         .await;
     let (models, error) = match result {
-        Ok(models) if !models.is_empty() => (models, None),
+        Ok(models) if !models.is_empty() => (model_options(models), None),
         Ok(_) => (
             Vec::new(),
             Some("No models are available for this account. Manage usage or retry.".to_owned()),
@@ -294,5 +312,40 @@ impl Drop for ConnectionJob {
         if let Some(handle) = &self.handle {
             handle.abort();
         }
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn incomplete_catalog_still_offers_current_models_without_duplicates() {
+        let catalog = vec![
+            ("gpt-6-astra".to_owned(), "Account Astra".to_owned()),
+            ("gpt-5.6-sol".to_owned(), "GPT-5.6 Sol".to_owned()),
+        ];
+        let models = model_options(catalog.clone());
+        assert_eq!(model_options(models.clone()), models);
+        assert_eq!(models.len(), 4);
+        assert_eq!(models[1], catalog[0]);
+        assert_eq!(models[3], catalog[1]);
+
+        let mut panel = ConnectionPanel::open();
+        panel.page = ConnectionPage::Models;
+        panel.models = models;
+        let choices = panel.choices();
+        assert_eq!(
+            choices[0],
+            (
+                "gpt-6.1-sol — GPT-6.1 Sol".to_owned(),
+                ConnectionAction::SelectModel("gpt-6.1-sol".to_owned()),
+            )
+        );
+        assert_eq!(
+            choices[2].1,
+            ConnectionAction::SelectModel("gpt-6-luna".to_owned())
+        );
+        assert_eq!(choices[4].1, ConnectionAction::Models);
     }
 }

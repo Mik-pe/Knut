@@ -27,9 +27,8 @@ use crate::decision::{Action, Decision, ModelTier, Risk, Route};
 use crate::error::KnutError;
 use crate::session::{SessionCommand, SessionEvent, SessionRuntime, TaskState};
 use crate::{
-    CheckProfile, CheckRunner, ComputeCascade, ExecutionGate, JevSystemOne, Knut, Planner,
-    SideEffectPolicy, Supervisor, SystemZero, ToolRegistry, TypeSafeConfig, Workspace,
-    register_workspace_tools,
+    CheckProfile, CheckRunner, ComputeCascade, ExecutionGate, JevSystemOne, Knut, SideEffectPolicy,
+    Supervisor, SystemZero, ToolRegistry, TypeSafeConfig, Workspace,
 };
 
 /// What the driver can tell the shell about its own readiness.
@@ -97,31 +96,6 @@ pub fn build_here() -> (Engine, EngineReport) {
     }
 }
 
-/// Describe the registry's capabilities for discovery.
-///
-/// One entry per capability, described by the tools that back it, so a
-/// routed `Discover` can resolve to something real. The list is bounded by
-/// the registry itself, which is small and explicit by construction.
-fn discovery_candidates(registry: &ToolRegistry) -> Vec<(String, String)> {
-    registry
-        .capabilities()
-        .into_iter()
-        .map(|capability| {
-            let tools: Vec<String> = registry
-                .tools_for_capability(&capability)
-                .into_iter()
-                .map(|tool| format!("{} ({:?})", tool.id, tool.side_effect))
-                .collect();
-            let description = if tools.is_empty() {
-                capability.clone()
-            } else {
-                format!("{capability}: {}", tools.join(", "))
-            };
-            (capability, description)
-        })
-        .collect()
-}
-
 /// A runtime with no tools and no model: enough to accept commands and
 /// report why they cannot be carried out.
 fn minimal_engine(reason: Option<String>) -> Engine {
@@ -131,7 +105,6 @@ fn minimal_engine(reason: Option<String>) -> Engine {
     let registry = ToolRegistry::default();
     let runtime = SessionRuntime::new(
         Arc::new(deterministic_router()),
-        Planner::new(Arc::new(ComputeCascade::empty())),
         Arc::new(registry),
         gate,
         Arc::new(ComputeCascade::empty()),
@@ -155,6 +128,50 @@ pub fn build_with_write_approval(
     workspace: Workspace,
     approve_writes: bool,
 ) -> (Engine, EngineReport) {
+    let profile = match crate::WorkspaceProfile::from_env() {
+        Ok(profile) => profile,
+        Err(error) => return unavailable_engine(error.to_string()),
+    };
+    match crate::workspace_setup(workspace.clone(), profile) {
+        Ok(setup) => build_setup(setup, Some(workspace), approve_writes),
+        Err(error) => unavailable_engine(error.to_string()),
+    }
+}
+
+pub fn build_harness(setup: crate::HarnessSetup, approve_writes: bool) -> (Engine, EngineReport) {
+    build_setup(setup, None, approve_writes)
+}
+
+fn unavailable_engine(reason: String) -> (Engine, EngineReport) {
+    (
+        minimal_engine(Some(reason.clone())),
+        EngineReport {
+            model: None,
+            base_url: None,
+            frames: false,
+            tools: Vec::new(),
+            checks: Vec::new(),
+            unavailable: Some(reason),
+            routing_warning: None,
+            chatgpt_plan: false,
+            account: None,
+        },
+    )
+}
+
+fn build_setup(
+    mut setup: crate::HarnessSetup,
+    workspace: Option<Workspace>,
+    approve_writes: bool,
+) -> (Engine, EngineReport) {
+    if setup
+        .tools
+        .find_exact("user", crate::ASK_USER_TOOL_ID)
+        .is_err()
+        && let Err(error) = setup.tools.register(crate::AskUserTool)
+    {
+        return unavailable_engine(error.to_string());
+    }
     let provider_result = crate::ProviderConfig::from_env();
     let provider_error = provider_result.as_ref().err().map(ToString::to_string);
     let provider_config = provider_result.ok();
@@ -178,26 +195,16 @@ pub fn build_with_write_approval(
         account: None,
     };
 
-    // Tools are the real bounded read/search/write set for this workspace.
-    let mut registry = ToolRegistry::default();
-    if let Err(err) = register_workspace_tools(&mut registry, workspace.clone()) {
-        report.unavailable = Some(format!("workspace tools unavailable: {err}"));
-    }
-    let supervisor = Arc::new(Supervisor::new(workspace.clone()));
-    if let Err(error) = crate::register_command_tools(&mut registry, supervisor.clone()) {
-        report.unavailable = Some(format!("command tools unavailable: {error}"));
-    }
-    report.tools = registry.capabilities();
-    let profile = CheckProfile::for_workspace(&workspace);
-    if let Ok(profile) = &profile {
-        report.checks = profile
-            .checks
+    report.tools = setup.tools.capabilities();
+    if let Some(monitor) = &setup.completion {
+        report.checks = monitor
+            .requirements()
+            .requirements()
             .iter()
-            .map(|check| check.name.clone())
+            .map(|check| check.check.clone())
             .collect();
-    } else if let Err(error) = &profile {
-        report.unavailable = Some(error.to_string());
     }
+    let registry = setup.tools.clone();
 
     match (&provider_config, model_ready) {
         (Some(config), true) => {
@@ -229,13 +236,6 @@ pub fn build_with_write_approval(
         }
         _ => ComputeCascade::empty(),
     };
-    let planning_cascade = match &provider_config {
-        Some(config) if report.model.is_some() => {
-            provider_cascade(config).unwrap_or_else(|_| ComputeCascade::empty())
-        }
-        _ => ComputeCascade::empty(),
-    };
-
     // The gate: the shell is interactive, so a write asks rather than
     // assuming consent. Pre-approving writes belongs to scripted runs.
     let policy = SideEffectPolicy::new()
@@ -248,7 +248,7 @@ pub fn build_with_write_approval(
     }));
 
     // The optional router selects bounded routes; without it, System Zero
-    // delegates tool selection to the validated reasoner plan.
+    // delegates tool selection to the reasoner.
     let jev = match std::env::var("TYPESAFE_API_KEY") {
         Ok(_) => match TypeSafeConfig::from_env()
             .ok()
@@ -262,7 +262,7 @@ pub fn build_with_write_approval(
             // quietly ignored: the deterministic path still runs.
             None => {
                 report.routing_warning = Some(
-                    "decision model configuration is unusable; the reasoner will plan directly"
+                    "decision model configuration is unusable; the reasoner will choose actions directly"
                         .to_owned(),
                 );
                 None
@@ -274,38 +274,19 @@ pub fn build_with_write_approval(
     let frames = jev.clone();
     let router = Arc::new(session_router(jev));
 
-    let checks = profile
-        .ok()
-        .map(|profile| Arc::new(CheckRunner::new(workspace.clone(), supervisor, profile)));
-
-    let discovery = discovery_candidates(&registry);
     let runtime = SessionRuntime::new(
         router,
-        Planner::new(Arc::new(planning_cascade)),
         Arc::new(registry),
         gate,
         Arc::new(cascade),
         Arc::new(crate::AcceptAllVerifier),
-    )
-    .with_discovery(crate::session::DiscoveryCandidates {
-        // Real capabilities, described by the tools that actually back
-        // them. An empty set makes discovery ask the user for a capability
-        // the harness already has.
-        candidates: discovery,
-    });
-    let runtime = match checks {
-        Some(checks) => runtime.with_checks(checks),
-        None => runtime.with_requirements(crate::CompletionRequirements::none().require(
-            "repository-checks",
-            "configure checks for this repository",
-            true,
-        )),
-    };
+    );
+    let runtime = runtime.with_setup(setup);
     let runtime = match frames {
         Some(frames) => runtime.with_frames(frames),
         None => runtime,
     };
-    (Engine::new(runtime, Some(workspace)), report)
+    (Engine::new(runtime, workspace), report)
 }
 
 /// The router the shell runs on.
@@ -336,7 +317,7 @@ impl crate::SystemOne for LiveRouter {
     }
 }
 
-/// Deterministic ingress delegates open-ended tasks to reasoner planning.
+/// Deterministic ingress delegates open-ended tasks to the reasoner.
 pub(crate) fn deterministic_router() -> Knut<LiveRouter> {
     session_router(None)
 }
@@ -344,21 +325,21 @@ pub(crate) fn deterministic_router() -> Knut<LiveRouter> {
 fn session_router(live: Option<Arc<JevSystemOne>>) -> Knut<LiveRouter> {
     let mut rules = SystemZero::with_default_rules();
     if live.is_none() {
-        rules = rules.with_rule(ReasonerPlanRule);
+        rules = rules.with_rule(ReasonerTurnRule);
     }
     Knut::new(LiveRouter::new(live)).with_system_zero(rules)
 }
 
-struct ReasonerPlanRule;
+struct ReasonerTurnRule;
 
-impl crate::SystemZeroRule for ReasonerPlanRule {
+impl crate::SystemZeroRule for ReasonerTurnRule {
     fn name(&self) -> &str {
-        "reasoner-plan"
+        "reasoner-turn"
     }
 
     fn evaluate(&self, _input: &crate::DecisionInput) -> crate::RuleVerdict {
         crate::RuleVerdict::Decide(Decision {
-            route: Route::Plan,
+            route: Route::Generate,
             confidence: 1.0,
             retrieval: None,
             capability: None,
@@ -658,13 +639,12 @@ pub async fn run_engine_with_connections(
                                 Some(config) => provider_cascade(config)?,
                                 None => ComputeCascade::empty(),
                             });
-                            let planner = Planner::new(cascade.clone());
                             if environment {
                                 crate::openai_auth::use_environment().await?;
                             } else if let Some(config) = config && let Some(client_id) = config.chatgpt_client() {
                                 crate::openai_auth::save_model(config.model(), client_id).await?;
                             }
-                            engine.runtime.replace_models(planner, cascade)
+                            engine.runtime.replace_models(cascade)
                         }.await;
                         let _ = request.reply.send(result);
                     }
@@ -757,14 +737,14 @@ mod tests {
     use super::*;
 
     #[tokio::test]
-    async fn no_decision_model_routes_to_planning_as_system_zero() {
+    async fn no_decision_model_routes_to_reasoner_as_system_zero() {
         let router = deterministic_router();
         for capabilities in [vec![], vec!["files".to_owned(), "shell".to_owned()]] {
             let routed = router
                 .route(&crate::DecisionInput::new("fix the build", capabilities))
                 .await
                 .unwrap();
-            assert_eq!(routed.action, Action::Plan);
+            assert_eq!(routed.action, Action::Generate(ModelTier::Reasoner));
             assert_eq!(routed.source, crate::DecisionSource::SystemZero);
             assert_eq!(routed.decision.capability, None);
         }
@@ -837,6 +817,7 @@ mod tests {
         let (tx, mut rx) = tokio::sync::mpsc::unbounded_channel();
         block_on(engine.handle(SessionCommand::Submit {
             prompt: "what does src/lib.rs export".to_owned(),
+            options: Default::default(),
         }));
         engine.pump(&tx);
 
@@ -902,6 +883,7 @@ mod tests {
 
         block_on(engine.handle(SessionCommand::Submit {
             prompt: "hello".to_owned(),
+            options: Default::default(),
         }));
 
         assert!(engine.pump(&tx), "the shell is still connected");
@@ -933,6 +915,7 @@ mod tests {
         block_on(engine.handle_with(
             SessionCommand::Submit {
                 prompt: "do something".to_owned(),
+                options: Default::default(),
             },
             |engine| {
                 engine.pump(&tx);
@@ -987,6 +970,7 @@ mod tests {
         let (mut engine, _) = build(workspace);
         block_on(engine.handle(SessionCommand::Submit {
             prompt: "fix the build".to_owned(),
+            options: Default::default(),
         }));
         // Whatever the configuration, the shell never sits on a task that
         // silently did nothing: there is a state, and the pump carries the
@@ -1027,6 +1011,7 @@ mod tests {
             engine
                 .handle(SessionCommand::Submit {
                     prompt: "do something long".to_owned(),
+                    options: Default::default(),
                 })
                 .await;
             // Whatever the submit did — completed, failed, or waiting — a
@@ -1179,7 +1164,6 @@ mod tests {
             .with_system_zero(SystemZero::empty().with_rule(GenerateRule));
         let runtime = SessionRuntime::new(
             Arc::new(router),
-            Planner::new(cascade.clone()),
             Arc::new(ToolRegistry::default()),
             Arc::new(ExecutionGate::new(SideEffectPolicy::new())),
             cascade,
@@ -1192,6 +1176,7 @@ mod tests {
         commands
             .send(SessionCommand::Submit {
                 prompt: "hello".to_owned(),
+                options: Default::default(),
             })
             .unwrap();
         // The first fragment proves the task is Running with a stalled
@@ -1206,6 +1191,7 @@ mod tests {
         commands
             .send(SessionCommand::Queue {
                 prompt: "second task".to_owned(),
+                options: Default::default(),
             })
             .unwrap();
         tokio::time::timeout(std::time::Duration::from_secs(5), async {
@@ -1224,6 +1210,7 @@ mod tests {
             .send(SessionCommand::UpdateQueued {
                 id: 1,
                 prompt: "second task edited".to_owned(),
+                options: Default::default(),
             })
             .unwrap();
         tokio::time::timeout(std::time::Duration::from_secs(5), async {
@@ -1250,7 +1237,6 @@ mod tests {
             .with_system_zero(SystemZero::empty().with_rule(GenerateRule));
         let runtime = SessionRuntime::new(
             Arc::new(router),
-            Planner::new(cascade.clone()),
             Arc::new(ToolRegistry::default()),
             Arc::new(ExecutionGate::new(SideEffectPolicy::new())),
             cascade,
@@ -1269,6 +1255,7 @@ mod tests {
         commands
             .send(SessionCommand::Submit {
                 prompt: "hello".to_owned(),
+                options: Default::default(),
             })
             .unwrap();
         tokio::time::timeout(std::time::Duration::from_secs(5), async {
@@ -1346,6 +1333,7 @@ mod tests {
             .runtime
             .command(SessionCommand::Submit {
                 prompt: "first".into(),
+                options: Default::default(),
             })
             .await
             .unwrap();
@@ -1353,21 +1341,13 @@ mod tests {
         let config =
             crate::ProviderConfig::new("fixture", "http://127.0.0.1:1/v1", "fixture-model");
         let cascade = Arc::new(provider_cascade(&config).unwrap());
-        assert!(
-            engine
-                .runtime
-                .replace_models(Planner::new(cascade.clone()), cascade.clone())
-                .is_err()
-        );
+        assert!(engine.runtime.replace_models(cascade.clone()).is_err());
         engine
             .runtime
             .command(SessionCommand::Cancel)
             .await
             .unwrap();
-        engine
-            .runtime
-            .replace_models(Planner::new(cascade.clone()), cascade)
-            .unwrap();
+        engine.runtime.replace_models(cascade).unwrap();
         for tier in [ModelTier::Fast, ModelTier::Standard, ModelTier::Reasoner] {
             assert!(engine.cascade().has_model_for(tier));
         }
@@ -1375,6 +1355,7 @@ mod tests {
             .runtime
             .command(SessionCommand::Submit {
                 prompt: "second".into(),
+                options: Default::default(),
             })
             .await
             .unwrap();

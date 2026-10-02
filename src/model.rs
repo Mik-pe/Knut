@@ -71,6 +71,8 @@ pub struct ModelRequest {
     pub expected_artifact: ExpectedArtifact,
     /// Structured input/context for the task.
     pub input: Value,
+    pub tools: Vec<crate::ToolMetadata>,
+    pub exchanges: Vec<ModelExchange>,
 }
 
 impl ModelRequest {
@@ -80,11 +82,23 @@ impl ModelRequest {
             instruction: instruction.into(),
             expected_artifact,
             input: Value::Null,
+            tools: Vec::new(),
+            exchanges: Vec::new(),
         }
     }
 
     pub fn with_input(mut self, input: Value) -> Self {
         self.input = input;
+        self
+    }
+
+    pub fn with_tools(mut self, tools: Vec<crate::ToolMetadata>) -> Self {
+        self.tools = tools;
+        self
+    }
+
+    pub fn with_exchanges(mut self, exchanges: Vec<ModelExchange>) -> Self {
+        self.exchanges = exchanges;
         self
     }
 
@@ -381,6 +395,21 @@ pub struct ToolCall {
     pub arguments: Value,
 }
 
+#[derive(Debug, Clone, PartialEq)]
+pub struct ToolResult {
+    pub call_id: String,
+    pub output: Value,
+}
+
+#[derive(Debug, Clone, PartialEq)]
+pub struct ModelExchange {
+    pub identity: ModelIdentity,
+    pub content: String,
+    pub tool_calls: Vec<ToolCall>,
+    pub continuation: Continuation,
+    pub results: Vec<ToolResult>,
+}
+
 /// Attach the previous attempt's failure to an escalated request.
 ///
 /// The stronger model must see the exact earlier failure and evidence,
@@ -412,6 +441,26 @@ impl<T: Model + ?Sized> Model for std::sync::Arc<T> {
 
     async fn complete(&self, request: &ModelRequest) -> Result<ModelResponse, KnutError> {
         (**self).complete(request).await
+    }
+
+    fn capabilities(&self) -> ModelCapabilities {
+        (**self).capabilities()
+    }
+
+    async fn stream(
+        &self,
+        request: &ModelRequest,
+        sink: &mut (dyn ModelStreamSink + Send),
+    ) -> Result<ModelResponse, KnutError> {
+        (**self).stream(request, sink).await
+    }
+
+    async fn continue_turn(
+        &self,
+        continuation: Option<&Continuation>,
+        request: &ModelRequest,
+    ) -> Result<ModelResponse, KnutError> {
+        (**self).continue_turn(continuation, request).await
     }
 }
 

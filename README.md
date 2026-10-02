@@ -1,35 +1,32 @@
 # Knut
 
-Knut is an experimental agentic harness in Rust.
+Knut is an experimental general-purpose agent harness in Rust. Coding is its
+first workspace profile; the runtime also supports custom tools, document work,
+lookups and conversation without requiring a repository.
 
-The core idea is to spend expensive generative reasoning only when it is useful. Fast, bounded System One decisions route work between clarification, retrieval, tools, fast generation, and deeper reasoning.
+One live loop runs model turns, gated tool calls and their observations. An
+optional decision model prioritizes context and tool capabilities and helps
+classify failures. It never grants permissions or supplies completion evidence.
 
 ```text
-user prompt
-    |
-    v
-System 0        deterministic rules / cache
-    |
-    v
-System 1        Jev-style bounded decisions
-    |
-    +---- ask user
-    +---- retrieve
-    +---- tool
-    +---- fast model
-    `---- reasoner
-              |
-              v
-        validated plan/tree
-              |
-              v
-      System 1 chooses next edge
+user task + tools + instructions + context + completion requirements
+                              |
+                              v
+                       SessionRuntime
+                              |
+                 model -> gated tools -> observations
+                   ^                         |
+                   +-------------------------+
+                              |
+                      completion evidence
+
+optional decision model: context priority / tool priority / failure triage
 ```
 
 ## Prototype goals
 
 - Keep control flow explicit and testable.
-- Treat System One as a router and edge selector, not a text generator.
+- Use System One for bounded selection and failure triage.
 - Batch independent routing judgments when possible.
 - Escalate on uncertainty instead of trusting a weak route.
 - Keep permissions and side effects outside model judgment.
@@ -47,10 +44,11 @@ The core contains:
 - confidence-gated escalation,
 - a capability-oriented tool registry with bounded candidate discovery,
 - a model tier abstraction with a bounded compute cascade,
-- a validated behavior-tree core with cooperative cancellation,
-- an edge selector so System One re-routes after node results,
+- a native model/tool conversation loop with cooperative cancellation,
+- task-specific tools, instructions, context and completion requirements,
 - a policy layer: permission and side-effect approval are Rust, not judgment,
-- a System Two planner that produces validated plans only,
+- generic context providers and revision-bound completion monitors,
+- validated planner/tree utilities for the offline playground,
 - eval traces, shadow routing, replay, and offline benchmarks,
 - one event-driven session runtime shared by the TUI, headless and editor
   clients,
@@ -132,7 +130,9 @@ streaming. They preserve encrypted reasoning items and full input history,
 validate completed responses, and report interrupted streams or usage-limit
 failures. `gpt-5-codex` and other account-available Responses models can also be
 selected with `KNUT_PROVIDER_MODEL`. Access depends on your API account or the
-ChatGPT account's returned catalog.
+ChatGPT account. The ChatGPT model picker includes GPT-6.1 Sol, GPT-6 Astra and
+GPT-6 Luna alongside the account's refreshed catalog, which can omit usable
+models. Access is checked when a task runs.
 
 ChatGPT sign-in uses OpenAI's documented public-client OAuth flow with PKCE,
 state, nonce and signed ID-token validation. Knut stores separate registrations
@@ -165,11 +165,12 @@ Z.ai is the default when no saved ChatGPT model or explicit provider is selected
 | `TYPESAFE_API_KEY` | optional Jev credential; without it, the reasoner plans directly |
 | `TYPESAFE_MODEL` | Jev model override; default pinned to `jev-1.13.0` |
 | `KNUT_MODE` | `quality` (default) or `adaptive` |
+| `KNUT_PROFILE` | `auto` (default), `general`, or `coding` |
 
 A decision model is optional. With only the reasoner configured, System Zero
-hands tasks to the same validated planner, which chooses from the complete file
-and command tool catalog. Tool policy, exact approvals, bounded repair and
-revision-bound checks stay in the runtime. An unusable Jev configuration emits
+hands tasks to the native model/tool loop. The model sees registered tool schemas
+and receives results with their original call IDs. Tool policy, exact approvals,
+bounded repair and revision-bound checks stay in the runtime. An unusable Jev configuration emits
 a warning and uses this path; failures of a configured live Jev call remain
 explicit errors.
 
@@ -192,7 +193,8 @@ require their exact approval through TUI or JSONL.
 
 Small edits can use `files/edit`: a read hash plus a JSON-encoded array of exact
 `{old,new}` replacements. Ambiguous matches and stale revisions fail without
-writing. A run gets at most three plan/execute/check attempts; a blocked approval
+writing. A task is bounded to 32 runtime turns and 16 tool calls per model response,
+with two completion-repair attempts. A blocked approval
 ends the scripted run, and successful existing tests cannot hide failed edits.
 
 For a live repository-edit comparison with Ante, see
@@ -308,7 +310,7 @@ $ knut route|repl|demo-tree|eval         offline playground (mock, demo-only)
 
 The playground commands are explicitly demo-only: they use a deterministic
 mock router and canned tools, and their numbers are not measurements of
-coding quality. `run`, `verify`, `bench` and `tui` use the real engine.
+coding quality. `run` and `tui` use the shared live runtime; `verify` and `bench` run real checks.
 
 Session and JSONL protocol version 2 replaces implicit steer-or-queue routing
 with `queue`, `steer`, `update_queued`, `remove_queued` and `run_queued` commands.
@@ -322,7 +324,7 @@ node scripts/smoke-harness.mjs
 ```
 
 It uses an isolated Rust fixture, makes no paid provider calls, and verifies
-plan repair, failed-check recovery, exact approvals and queued task execution.
+tool-argument repair, failed-check recovery, exact approvals and queued task execution.
 This is not evidence of improved live-model success rates.
 
 For terminal regression checks, install the optional `tuistory` package where
@@ -332,20 +334,62 @@ For an existing installation, set `KNUT_TUISTORY_MODULE` to its absolute
 terminal sizes, editing, help, approvals and repair, and saves snapshots in a
 temporary directory. It also checks truecolor overrides and ASCII/reduced motion.
 
+## General tasks and embedding
+
+The CLI opens the current directory for file and sandboxed command tools.
+`auto` enables coding checks when a supported project manifest is present and
+otherwise uses the general profile. Select `general` explicitly for document
+work or conversation inside a repository; `coding` requires configured checks.
+Coding checks run when project content changes. Questions that leave the project
+unchanged can complete without a build; explicit task requirements still apply.
+
+```sh
+KNUT_PROFILE=general knut run "Summarize notes.txt"
+KNUT_PROFILE=general knut tui
+```
+
+Hosts can set `KNUT_LOAD_ENV=0` to skip loading the workspace `.env` file and
+supply an isolated environment to the child process.
+
+JSONL submit, queue and update commands accept optional task configuration:
+
+```json
+{"type":"submit","prompt":"Summarize the report","options":{"tools":["read"],"instructions":"Be concise.","context":[{"source":{"uri":"document:report","revision":"v1"},"description":"Report excerpt","content":{"text":"Quarterly results…"}}]}}
+```
+
+`tools` restricts registered tool IDs; an empty list permits no tools. Omit it to
+use the configured catalog. Instructions and context stay with queued tasks.
+`requirements` accepts an array of `{check, description, blocking}` records and
+adds to the profile's completion contract. Required evidence cannot be waived
+by the model. Task configuration is bounded to 128 KiB.
+
+For embedding, `HarnessSetup` supplies tools, instructions, an optional
+`ContextProvider` and an optional `CompletionMonitor`. `build_harness` builds the
+same engine without opening a workspace. `SessionRuntime::new` also accepts an
+injected model cascade for hosts that manage providers themselves. The CLI adds
+an `AskUserTool`; its answer returns through the tool-result continuation.
+
+Context records identify snapshots with a resource URI and revision. Supplied
+URL/document records do not fetch or establish freshness of external resources;
+that belongs to the configured provider. Workspace context performs gated reads
+and retains their content hashes. Decision-model priorities reorder context and
+tool schemas while retaining the full evidence/catalog. They are advisory; no
+cost or quality improvement is claimed without measurements.
+
 ## Architecture
 
-```
-commands/events ──▶ SessionRuntime ──▶ events to TUI · JSONL · ACP
-                        │
-        ┌───────────────┼────────────────┬──────────────┐
-        ▼               ▼                ▼              ▼
-   System 0/1      Planner (S2)    ExecutionGate   CheckRunner
-   (bounded)       validated plans  policy/approve  revision-bound
-        │               │                │          evidence
-        └───────────────┴────────────────┴──────────────┘
-                        │
-              provider adapters (GLM, DeepSeek) · workspace tools
-              sandboxed processes · patches · SQLite session store
+```text
+commands/events -> SessionRuntime -> TUI / JSONL / editor events
+                         |
+                 model/tool conversation
+                         |
+          ExecutionGate + CompletionMonitor + ContextProvider
+                         |
+               configured tools and provider adapters
+
+workspace profile: files / sandboxed commands / repository instructions
+coding profile:    workspace tools + revision-bound build/test/lint evidence
+custom setup:      application tools + context + completion contract
 ```
 
 See the [provider compatibility matrix](src/matrix.rs) for what each
@@ -370,8 +414,8 @@ this commit), on Linux:
 
 **Known limitations, stated rather than implied:**
 
-- TUI, `run`, and JSONL now drive the same session runtime. It performs
-  real reads/edits, resumes exact approved plans, and runs repository checks
+- TUI, `run`, and JSONL drive the same native conversation runtime. It performs
+  real reads/edits, resumes exact approved calls, and runs repository checks
   against the edited revision. Failed checks and tool failures have a bounded
   repair budget. This integration is regression-tested; the earlier measured
   Ante pilot used the previous standalone CLI loop.

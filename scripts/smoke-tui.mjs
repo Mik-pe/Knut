@@ -4,6 +4,7 @@ import os from 'node:os';
 import path from 'node:path';
 import {createRequire} from 'node:module';
 import {fileURLToPath} from 'node:url';
+import {knutBinary} from './binary.mjs';
 
 const require = createRequire(import.meta.url);
 const modulePath = require.resolve(process.env.KNUT_TUISTORY_MODULE || 'tuistory');
@@ -12,6 +13,7 @@ const captureImages = process.argv.includes('--screenshots');
 const renderer = captureImages
   ? await import(createRequire(modulePath).resolve('ghostty-opentui/image')) : null;
 const repo = path.resolve(path.dirname(fileURLToPath(import.meta.url)), '..');
+const binary = knutBinary();
 const artifacts = fs.mkdtempSync(path.join(os.tmpdir(), 'knut-tui-smoke-'));
 let provider, terminal;
 let frames = 0;
@@ -42,12 +44,12 @@ try {
   const workspace = path.join(artifacts, 'Knut');
   fs.cpSync(connection.root, workspace, {recursive: true});
   const original = fs.readFileSync(path.join(workspace, 'src/lib.rs'), 'utf8');
-  const env = {...process.env, KNUT_CONFIG_DIR: path.join(artifacts, 'config'), TYPESAFE_API_KEY: undefined, KNUT_PROVIDER_API_KEY: 'local-fixture',
+  const env = {...process.env, KNUT_CONFIG_DIR: path.join(artifacts, 'config'), KNUT_PROFILE: 'coding', KNUT_PROVIDER: 'chat-completions', TYPESAFE_API_KEY: undefined, KNUT_PROVIDER_API_KEY: 'local-fixture',
     KNUT_PROVIDER_MODEL: 'fixture', KNUT_PROVIDER_BASE_URL: connection.baseUrl,
     KNUT_PROVIDER_REASONING_EFFORT: undefined, CARGO_NET_OFFLINE: 'true',
     NO_COLOR: '1', KNUT_TUI_COLORS: 'truecolor', KNUT_TUI_MOTION: 'on',
     KNUT_SESSION_STORE: path.join(artifacts, 'sessions.db')};
-  terminal = await launchTerminal({command: path.join(repo, 'target/debug/knut'), args: ['tui'], cwd: workspace, cols: 100, rows: 32, env});
+  terminal = await launchTerminal({command: binary, args: ['tui'], cwd: workspace, cols: 100, rows: 32, env});
   await terminal.waitForText('What are we building?', {timeout: 15000});
   await snapshot('welcome-100x32', true);
   assert(terminal.getRawOutput().includes('38;2;'), 'explicit color override did not reach the terminal');
@@ -96,7 +98,7 @@ try {
   await terminal.press(['ctrl', 'q']);
   assert(await terminal.waitForExit(5000));
   terminal.close();
-  terminal = await launchTerminal({command: path.join(repo, 'target/debug/knut'), args: ['tui'], cwd: workspace, cols: 80, rows: 24, env});
+  terminal = await launchTerminal({command: binary, args: ['tui'], cwd: workspace, cols: 80, rows: 24, env});
   await terminal.waitForText('Draft restored', {timeout: 10000});
   assert((await snapshot('restored-draft', true)).includes('unfinished draft'));
   await terminal.type('restored ');
@@ -109,7 +111,7 @@ try {
   assert.equal(fs.readFileSync(path.join(workspace, 'src/lib.rs'), 'utf8'), original.replace('{ 0 }', '{ 7 }'));
   terminal.close();
   // Tuistory assigns TERM after merging env; set it in the child for the dumb-terminal case.
-  terminal = await launchTerminal({command: 'env', args: ['TERM=dumb', path.join(repo, 'target/debug/knut'), 'tui'], cwd: workspace, cols: 60, rows: 18,
+  terminal = await launchTerminal({command: 'env', args: ['TERM=dumb', binary, 'tui'], cwd: workspace, cols: 60, rows: 18,
     env: {...env, KNUT_TUI_COLORS: 'none', KNUT_TUI_MOTION: 'off', TERM: 'dumb'}});
   await terminal.waitForText('What are we building?', {timeout: 10000});
   const plain = await snapshot('ascii-reduced-motion', true);
