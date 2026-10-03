@@ -2,13 +2,38 @@ name: CI
 
 on:
   push:
+    branches: [main]
+    tags: ["**"]
   pull_request:
 
 env:
   CARGO_TERM_COLOR: always
 
 jobs:
+  verify-plan:
+    name: Decide verification
+    runs-on: ubuntu-latest
+    timeout-minutes: 5
+    permissions:
+      contents: read
+      actions: read
+    outputs:
+      needed: ${{ steps.decide.outputs.needed }}
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          persist-credentials: false
+      - name: Test CI reuse boundaries
+        run: node --test .github/scripts/ci-reuse.test.mjs
+      - name: Check successful PR tree
+        id: decide
+        env:
+          GH_TOKEN: ${{ github.token }}
+        run: node .github/scripts/ci-reuse.mjs decide
+
   quality:
+    needs: verify-plan
+    if: needs.verify-plan.outputs.needed == 'true'
     name: fmt / clippy / test
     runs-on: ubuntu-latest
     steps:
@@ -86,3 +111,24 @@ jobs:
           path: |
             knut-*.tar.gz
             knut-*.tar.gz.sha256
+
+  verified-tree:
+    name: Record verified PR tree
+    needs: [verify-plan, quality]
+    if: github.event_name == 'pull_request' && success()
+    runs-on: ubuntu-latest
+    timeout-minutes: 5
+    permissions:
+      contents: read
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          persist-credentials: false
+      - name: Record checked source tree
+        run: node .github/scripts/ci-reuse.mjs record
+      - uses: actions/upload-artifact@043fb46d1a93c77aae656e7c1c64a875d1fc6a0a # v7.0.1
+        with:
+          name: ci-tree-${{ github.run_id }}-${{ github.run_attempt }}
+          path: ${{ runner.temp }}/ci-tested-tree/receipt.json
+          retention-days: 14
+          if-no-files-found: error
