@@ -125,3 +125,18 @@ content hashes. Prioritization keeps the full evidence and tool catalog.
 The CLI registers `AskUserTool`; answers return through the tool-result
 continuation. Headless/editor adapters use the same session semantics. Language
 servers are reported by `knut lsp` and are never started implicitly.
+
+## Reusing routing work
+
+Tool function names are indexed when the registry is built. Dispatch looks up
+one metadata entry in the task's restricted registry before invoking the normal
+execution gate. Selecting task tools rebuilds the index, so excluded tools stay
+unavailable.
+
+Context reads still run on every model turn. A confident context priority is
+reused only while the full ordered records (URI, revision, description and
+content) are identical. Changed records, steering and new tasks invalidate it.
+Errors and uncertain decisions are never cached. All context remains available
+to the reasoner. The offline regression reduces three context-selection calls
+to one for three unchanged turns; it does not measure live latency or model
+quality.

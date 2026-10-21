@@ -123,7 +123,15 @@ impl Model for ScriptedModel {
                     .iter()
                     .find(|metadata| metadata.id == tool)
                     .map(ToolMetadata::function_name)
-                    .unwrap_or_else(|| tool.to_owned()),
+                    .unwrap_or_else(|| {
+                        WorldTool {
+                            id: tool,
+                            effect: SideEffect::ReadOnly,
+                            world: Arc::new(World::default()),
+                        }
+                        .metadata()
+                        .function_name()
+                    }),
                 arguments,
             })
             .collect();
@@ -133,6 +141,17 @@ impl Model for ScriptedModel {
 
 fn runtime(
     steps: Vec<Step>,
+) -> (
+    SessionRuntime<StaticSystemOne>,
+    Arc<ScriptedModel>,
+    Arc<World>,
+) {
+    configured_runtime(steps, None)
+}
+
+fn configured_runtime(
+    steps: Vec<Step>,
+    context: Option<Arc<dyn ContextProvider>>,
 ) -> (
     SessionRuntime<StaticSystemOne>,
     Arc<ScriptedModel>,
@@ -169,7 +188,7 @@ fn runtime(
     }));
     let runtime = SessionRuntime::new(
         Arc::new(router),
-        Arc::new(tools),
+        Arc::new(tools.clone()),
         Arc::new(ExecutionGate::new(
             SideEffectPolicy::new()
                 .allow(SideEffect::ReadOnly)
@@ -177,7 +196,12 @@ fn runtime(
         )),
         Arc::new(ComputeCascade::empty().with_reasoner(model.clone())),
         Arc::new(AcceptAllVerifier),
-    );
+    )
+    .with_setup(HarnessSetup {
+        tools,
+        context,
+        ..HarnessSetup::default()
+    });
     (runtime, model, world)
 }
 
@@ -842,4 +866,151 @@ async fn uncertain_context_priority_leaves_resource_order_unchanged() {
         model.requests.lock().unwrap()[0].input["context"][0]["source"]["uri"],
         "document:first"
     );
+}
+
+struct CountingContextRouter {
+    calls: AtomicUsize,
+    confidence: f64,
+}
+
+#[async_trait]
+impl FrameRouter for CountingContextRouter {
+    async fn ask(&self, frame: &DecisionFrame) -> Result<SystemOneResponse, KnutError> {
+        if frame.kind == FrameKind::ContextSelection {
+            self.calls.fetch_add(1, Ordering::SeqCst);
+        }
+        StaticFrameRouter::choice_over("candidate", "1", self.confidence, &["0", ESCALATE_ID])
+            .ask(frame)
+            .await
+    }
+}
+
+struct LiveDocumentContext;
+
+impl ContextProvider for LiveDocumentContext {
+    fn instructions(&self) -> Result<String, KnutError> {
+        Ok(String::new())
+    }
+    fn reads(&self, _prompt: &str) -> Vec<ContextRead> {
+        vec![ContextRead {
+            capability: "documents".to_owned(),
+            tool: "read".to_owned(),
+            input: json!({}),
+        }]
+    }
+    fn record(&self, _read: &ContextRead, output: &Value) -> Option<ContextRecord> {
+        Some(ContextRecord {
+            source: ResourceRef {
+                uri: "document:live".to_owned(),
+                revision: "v1".to_owned(),
+            },
+            description: "Live document".to_owned(),
+            content: output.clone(),
+        })
+    }
+}
+
+#[tokio::test]
+async fn context_priority_reuses_only_unchanged_confident_decisions() {
+    for (change_content, confidence, expected_calls) in
+        [(false, 0.95, 1), (true, 0.95, 2), (false, 0.6, 3)]
+    {
+        let (mut runtime, model, world) = configured_runtime(
+            vec![
+                call("one", "lookup", json!({})),
+                call("two", "lookup", json!({})),
+                answer("done"),
+            ],
+            Some(Arc::new(LiveDocumentContext)),
+        );
+        let router = Arc::new(CountingContextRouter {
+            calls: AtomicUsize::new(0),
+            confidence,
+        });
+        runtime = runtime.with_frames(router.clone());
+        runtime
+            .command(submit(
+                "Inspect the report",
+                TaskOptions {
+                    context: vec![record("document:report", "Report")],
+                    ..TaskOptions::default()
+                },
+            ))
+            .await
+            .unwrap();
+        assert_eq!(runtime.drive().await, Some(TaskState::Running));
+        if change_content {
+            *world.document.lock().unwrap() = "new content".to_owned();
+        }
+        assert_eq!(
+            drive_until_stable(&mut runtime, 4).await,
+            Some(TaskState::Completed)
+        );
+        assert_eq!(router.calls.load(Ordering::SeqCst), expected_calls);
+        assert_eq!(
+            world.reads.load(Ordering::SeqCst),
+            5,
+            "three fresh context reads plus two tool reads"
+        );
+        let requests = model.requests.lock().unwrap();
+        assert_eq!(requests.len(), 3);
+        for request in requests.iter() {
+            assert_eq!(request.input["context"].as_array().unwrap().len(), 2);
+            assert_eq!(
+                request.input["context"][0]["source"]["uri"],
+                if confidence >= 0.75 {
+                    "document:report"
+                } else {
+                    "document:live"
+                }
+            );
+        }
+        if change_content {
+            assert_eq!(
+                requests[1].input["context"][1]["content"]["text"],
+                "new content"
+            );
+        }
+    }
+}
+
+#[tokio::test]
+async fn steering_and_new_tasks_invalidate_context_priority() {
+    let (mut runtime, _, _) = runtime(vec![
+        call("read", "lookup", json!({})),
+        call("read_again", "lookup", json!({})),
+        answer("done"),
+        answer("next"),
+    ]);
+    let router = Arc::new(CountingContextRouter {
+        calls: AtomicUsize::new(0),
+        confidence: 0.95,
+    });
+    runtime = runtime.with_frames(router.clone());
+    let options = TaskOptions {
+        context: vec![record("document:one", "One"), record("document:two", "Two")],
+        ..TaskOptions::default()
+    };
+    runtime
+        .command(submit("Inspect", options.clone()))
+        .await
+        .unwrap();
+    runtime.drive().await.unwrap();
+    runtime
+        .command(SessionCommand::Steer {
+            prompt: "Focus on the second document".to_owned(),
+        })
+        .await
+        .unwrap();
+    assert_eq!(
+        drive_until_stable(&mut runtime, 4).await,
+        Some(TaskState::Completed)
+    );
+    assert_eq!(router.calls.load(Ordering::SeqCst), 2);
+    runtime
+        .command(submit("Inspect again", options))
+        .await
+        .unwrap();
+    assert_eq!(runtime.drive().await, Some(TaskState::Completed));
+    assert_eq!(router.calls.load(Ordering::SeqCst), 3);
 }
