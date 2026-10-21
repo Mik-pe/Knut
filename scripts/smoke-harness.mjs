@@ -2,9 +2,9 @@ import assert from 'node:assert/strict';
 import fs from 'node:fs';
 import http from 'node:http';
 import path from 'node:path';
-import {spawn, spawnSync} from 'node:child_process';
-import {createInterface} from 'node:readline';
-import {knutBinary} from './binary.mjs';
+import { spawn, spawnSync } from 'node:child_process';
+import { knutBinary } from './binary.mjs';
+import { readRequest, sendCompletion, startJsonlSession } from './smoke-fixtures.mjs';
 
 const binary = knutBinary();
 const root = fs.mkdtempSync('/var/tmp/knut-harness-smoke-');
@@ -21,88 +21,96 @@ let repairObserved = false;
 let diagnosticObserved = false;
 const server = http.createServer(async (req, res) => {
   try {
-    let body = '';
-    for await (const chunk of req) body += chunk;
-    const request = JSON.parse(body);
+    const request = await readRequest(req);
     modelCalls++;
-    const prompt = request.messages.filter(message => message.role === 'user').map(message => message.content).join('\n');
+    const prompt = request.messages
+      .filter(message => message.role === 'user')
+      .map(message => message.content)
+      .join('\n');
     assert(prompt.includes('Preserve the public API'));
     const tools = request.tools.map(tool => tool.function);
     const readTool = tools.find(tool => tool.parameters.properties?.start_line);
     const editTool = tools.find(tool => tool.parameters.properties?.changes);
     assert(readTool && editTool);
-    const results = request.messages.filter(message => message.role === 'tool').map(message => JSON.parse(message.content));
+    const results = request.messages
+      .filter(message => message.role === 'tool')
+      .map(message => JSON.parse(message.content));
     const last = results.at(-1);
     let content = '';
     let toolCalls = [];
     const invoke = (tool, args) => {
-      toolCalls = [{id: `call_${modelCalls}`, type: 'function', function: {name: tool.name, arguments: JSON.stringify(args)}}];
+      toolCalls = [{
+        id: `call_${modelCalls}`,
+        type: 'function',
+        function: { name: tool.name, arguments: JSON.stringify(args) },
+      }];
     };
     if (prompt.includes('Summarize notes.txt')) {
       assert(prompt.includes('general profile evidence'));
       content = 'The notes contain general profile evidence.';
     } else if (!last) {
-      invoke(readTool, modelCalls === 1 ? {file: 'src/lib.rs'} : {path: 'src/lib.rs'});
+      invoke(readTool, modelCalls === 1 ? { file: 'src/lib.rs' } : { path: 'src/lib.rs' });
     } else if (last.error) {
       assert(last.error.includes('path'));
       repairObserved = true;
-      invoke(readTool, {path: 'src/lib.rs'});
+      invoke(readTool, { path: 'src/lib.rs' });
     } else if (last.lines && last.content_hash && !prompt.includes('Inspect the result')) {
       const current = last.lines.map(line => line.text).join('\n');
       const old = current.includes('{ 0 }') ? '{ 0 }' : '{ 6 }';
       const value = old === '{ 0 }' ? 6 : 7;
       patchCalls++;
-      invoke(editTool, {path: 'src/lib.rs', expect_hash: last.content_hash,
-        changes: JSON.stringify([{old, new: `{ ${value} }`}])});
+      invoke(editTool, {
+        path: 'src/lib.rs',
+        expect_hash: last.content_hash,
+        changes: JSON.stringify([{ old, new: `{ ${value} }` }]),
+      });
     } else if (prompt.includes('failed_checks') && patchCalls === 1) {
       assert(prompt.includes('value_is_seven'));
       diagnosticObserved = true;
-      invoke(readTool, {path: 'src/lib.rs'});
+      invoke(readTool, { path: 'src/lib.rs' });
     } else {
       content = 'The task is complete.';
     }
-    const finishReason = toolCalls.length ? 'tool_calls' : 'stop';
-    if (request.stream) {
-      res.setHeader('Content-Type', 'text/event-stream');
-      const delta = toolCalls.length ? {tool_calls: toolCalls.map((tool, index) => ({index, ...tool}))} : {content};
-      res.write(`data: ${JSON.stringify({choices: [{index: 0, delta}]})}\n\n`);
-      res.write(`data: ${JSON.stringify({choices: [{index: 0, delta: {}, finish_reason: finishReason}], usage: {prompt_tokens: 100, completion_tokens: 50}})}\n\n`);
-      res.end('data: [DONE]\n\n');
-    } else {
-      res.setHeader('Content-Type', 'application/json');
-      res.end(JSON.stringify({choices: [{index: 0, message: {role: 'assistant', content, tool_calls: toolCalls}, finish_reason: finishReason}], usage: {prompt_tokens: 100, completion_tokens: 50}}));
-    }
+    sendCompletion(res, {
+      content, toolCalls, usage: { prompt_tokens: 100, completion_tokens: 50 },
+    }, request.stream);
   } catch (error) {
     console.error(error);
     res.writeHead(500);
-    res.end(JSON.stringify({error: String(error)}));
+    res.end(JSON.stringify({ error: String(error) }));
   }
 });
 await new Promise(resolve => server.listen(0, '127.0.0.1', resolve));
 const baseUrl = `http://127.0.0.1:${server.address().port}/v1`;
-const env = {...process.env, KNUT_CONFIG_DIR: path.join(root, 'config'), KNUT_PROFILE: 'coding', KNUT_PROVIDER: 'chat-completions', KNUT_PROVIDER_API_KEY: 'local-fixture', KNUT_PROVIDER_MODEL: 'fixture', KNUT_PROVIDER_BASE_URL: baseUrl, CARGO_NET_OFFLINE: 'true'};
+const env = {
+  ...process.env,
+  KNUT_CONFIG_DIR: path.join(root, 'config'),
+  KNUT_PROFILE: 'coding',
+  KNUT_PROVIDER: 'chat-completions',
+  KNUT_PROVIDER_API_KEY: 'local-fixture',
+  KNUT_PROVIDER_MODEL: 'fixture',
+  KNUT_PROVIDER_BASE_URL: baseUrl,
+  CARGO_NET_OFFLINE: 'true',
+};
 delete env.TYPESAFE_API_KEY;
 delete env.KNUT_PROVIDER_REASONING_EFFORT;
-const lock = spawnSync('cargo', ['generate-lockfile', '--offline'], {cwd: root, env, encoding: 'utf8'});
+const lock = spawnSync('cargo', ['generate-lockfile', '--offline'], { cwd: root, env, encoding: 'utf8' });
 assert.equal(lock.status, 0, lock.stderr);
 
 if (process.argv.includes('--serve')) {
-  fs.writeFileSync(path.join(root, 'connection.json'), JSON.stringify({root, baseUrl}));
-  console.log(JSON.stringify({root, baseUrl, ready: true}));
+  fs.writeFileSync(path.join(root, 'connection.json'), JSON.stringify({ root, baseUrl }));
+  console.log(JSON.stringify({ root, baseUrl, ready: true }));
 } else {
-  const child = spawn(binary, ['jsonl'], {cwd: root, env, stdio: ['pipe', 'pipe', 'pipe']});
+  const session = startJsonlSession(binary, root, env);
+  const { child, send, exited } = session;
   const events = [];
-  let stderr = '';
   let approvals = 0;
   let completed = 0;
-  const send = command => child.stdin.write(`${JSON.stringify(command)}\n`);
-  child.stderr.on('data', chunk => { stderr += chunk; });
-  const deadline = setTimeout(() => child.kill('SIGKILL'), 120_000);
-  const exited = new Promise(resolve => child.on('exit', (code, signal) => resolve({code, signal})));
   try {
-    for await (const line of createInterface({input: child.stdout})) {
-      const message = JSON.parse(line);
-      if (message.type === 'ready') send({type: 'submit', prompt: 'Fix value() to return seven; preserve the existing test.'});
+    for await (const message of session.messages()) {
+      if (message.type === 'ready') {
+        send({ type: 'submit', prompt: 'Fix value() to return seven; preserve the existing test.' });
+      }
       const event = message.event;
       if (!event) continue;
       events.push(event);
@@ -111,51 +119,62 @@ if (process.argv.includes('--serve')) {
       if (event.kind === 'waiting_for_user') {
         assert(event.wait.approval);
         if (++approvals === 1) {
-          send({type: 'queue', prompt: 'short'});
-          send({type: 'update_queued', id: 1, prompt: 'Inspect the result and run the checks.'});
-          send({type: 'queue', prompt: 'remove me'});
-          send({type: 'remove_queued', id: 2});
+          send({ type: 'queue', prompt: 'short' });
+          send({ type: 'update_queued', id: 1, prompt: 'Inspect the result and run the checks.' });
+          send({ type: 'queue', prompt: 'remove me' });
+          send({ type: 'remove_queued', id: 2 });
         }
         const proposal = events.findLast(item => item.kind === 'tool_call_proposed');
         assert.equal(proposal.arguments.path, 'src/lib.rs');
         assert(proposal.arguments.expect_hash);
-        send({type: 'approve', approval_key: event.wait.approval.approval_key});
+        send({ type: 'approve', approval_key: event.wait.approval.approval_key });
       }
       if (event.kind === 'task_completed' && ++completed === 2) {
-        send({type: 'close'});
+        send({ type: 'close' });
         child.stdin.end();
       }
     }
     const exit = await exited;
-    assert.equal(exit.code, 0, `${JSON.stringify(exit)}\n${stderr}`);
+    assert.equal(exit.code, 0, `${JSON.stringify(exit)}\n${session.stderr}`);
     assert.equal(approvals, 2);
     assert.equal(completed, 2);
     assert(repairObserved && diagnosticObserved);
     assert.equal(events.filter(event => event.kind === 'task_started').length, 2);
     assert.equal(events.filter(event => event.kind === 'task_steered').length, 0);
     assert.equal(fs.readFileSync(path.join(root, 'src/lib.rs'), 'utf8'), source.replace('{ 0 }', '{ 7 }'));
-    const verified = spawnSync('cargo', ['test', '--quiet', '--offline'], {cwd: root, env, encoding: 'utf8'});
+    const verified = spawnSync('cargo', ['test', '--quiet', '--offline'], { cwd: root, env, encoding: 'utf8' });
     assert.equal(verified.status, 0, verified.stderr);
     const generalRoot = fs.mkdtempSync('/var/tmp/knut-general-smoke-');
     fs.writeFileSync(path.join(generalRoot, 'AGENTS.md'), 'Preserve the public API.\n');
     fs.writeFileSync(path.join(generalRoot, 'notes.txt'), 'general profile evidence\n');
     const general = await new Promise(resolve => {
-      const task = spawn(binary, ['run', 'Summarize notes.txt'], {cwd: generalRoot, env: {...env, KNUT_PROFILE: 'auto'}});
-      let stdout = '', stderr = '';
+      const task = spawn(binary, ['run', 'Summarize notes.txt'], {
+        cwd: generalRoot,
+        env: { ...env, KNUT_PROFILE: 'auto' },
+      });
+      let stdout = '';
+      let stderr = '';
       task.stdout.on('data', chunk => { stdout += chunk; });
       task.stderr.on('data', chunk => { stderr += chunk; });
-      task.on('exit', code => resolve({code, stdout, stderr}));
+      task.on('exit', code => resolve({ code, stdout, stderr }));
     });
     assert.equal(general.code, 0, general.stderr);
     assert(general.stdout.includes('The notes contain general profile evidence.'));
-    const coding = spawnSync(binary, ['run', 'Summarize notes.txt'], {cwd: generalRoot, env: {...env, KNUT_PROFILE: 'coding'}, encoding: 'utf8'});
+    const coding = spawnSync(binary, ['run', 'Summarize notes.txt'], {
+      cwd: generalRoot,
+      env: { ...env, KNUT_PROFILE: 'coding' },
+      encoding: 'utf8',
+    });
     assert.notEqual(coding.status, 0);
     assert(coding.stderr.includes('No repository checks configured'));
-    console.log(JSON.stringify({root, generalRoot, approvals, completed, modelCalls, patchCalls,
-      independentChecks: 'passed', generalProfile: 'passed', requiredCodingChecks: 'passed'}));
+    console.log(JSON.stringify({
+      root, generalRoot, approvals, completed, modelCalls, patchCalls,
+      independentChecks: 'passed',
+      generalProfile: 'passed',
+      requiredCodingChecks: 'passed',
+    }));
   } finally {
-    clearTimeout(deadline);
-    if (child.exitCode === null) child.kill('SIGTERM');
+    session.close();
     fs.writeFileSync(path.join(root, 'events.json'), JSON.stringify(events, null, 2));
     server.close();
     server.closeAllConnections();

@@ -10,9 +10,8 @@ use serde::Deserialize;
 use serde_json::{Value, json};
 
 use crate::{
-    Continuation, ContinuationPart, ExpectedArtifact, KnutError, Model, ModelCapabilities,
-    ModelIdentity, ModelRequest, ModelResponse, ModelStreamEvent, ModelStreamSink, ModelTier,
-    ToolCall, Usage,
+    Continuation, ContinuationPart, KnutError, Model, ModelCapabilities, ModelIdentity,
+    ModelRequest, ModelResponse, ModelStreamEvent, ModelStreamSink, ModelTier, ToolCall, Usage,
 };
 
 mod responses;
@@ -85,10 +84,12 @@ pub struct ProviderConfig {
     supports_reasoning_effort: bool,
     /// Requested effort, sent only when supported.
     reasoning_effort: Option<ReasoningEffort>,
+    explicit_reasoning_effort: bool,
     /// Whether this provider accepts `stream_options.include_usage`.
     supports_usage_in_stream: bool,
     transport: ProviderTransport,
     chatgpt_client: Option<String>,
+    environment_provider: String,
 }
 
 impl std::fmt::Debug for ProviderConfig {
@@ -120,6 +121,12 @@ impl ProviderConfig {
                 base_url.as_str(),
                 "https://api.z.ai/api/coding/paas/v4" | "https://api.z.ai/api/paas/v4"
             );
+        let environment_provider = if base_url.starts_with("https://api.z.ai/") {
+            "zai"
+        } else {
+            "chat-completions"
+        }
+        .to_owned();
         Self {
             api_key: api_key.into(),
             base_url,
@@ -133,9 +140,11 @@ impl ProviderConfig {
             reasoning_field: "reasoning_content".to_owned(),
             supports_reasoning_effort,
             reasoning_effort: supports_reasoning_effort.then_some(ReasoningEffort::Max),
+            explicit_reasoning_effort: false,
             supports_usage_in_stream: true,
             transport: ProviderTransport::ChatCompletions,
             chatgpt_client: None,
+            environment_provider,
         }
     }
 
@@ -165,9 +174,11 @@ impl ProviderConfig {
 
     /// OpenAI Responses API, including Codex reasoning models.
     pub fn openai(api_key: impl Into<String>, model: impl Into<String>) -> Self {
-        Self::new(api_key, "https://api.openai.com/v1", model)
+        let mut config = Self::new(api_key, "https://api.openai.com/v1", model)
             .with_transport(ProviderTransport::Responses)
-            .with_billing(BillingPath::Metered)
+            .with_billing(BillingPath::Metered);
+        config.environment_provider = "openai".to_owned();
+        config
     }
 
     pub fn with_transport(mut self, transport: ProviderTransport) -> Self {
@@ -206,7 +217,24 @@ impl ProviderConfig {
     /// documents support; the capability report reflects the truth.
     pub fn with_reasoning_effort(mut self, effort: ReasoningEffort) -> Self {
         self.reasoning_effort = Some(effort);
+        self.explicit_reasoning_effort = true;
         self
+    }
+
+    /// Inferred reasoning defaults follow the model; explicit effort must remain supported.
+    pub fn with_model(mut self, model: impl Into<String>) -> Result<Self, KnutError> {
+        let model = model.into();
+        if model.trim().is_empty() || model.len() > 1024 || model.chars().any(char::is_control) {
+            return Err(KnutError::Model("Invalid provider model ID".to_owned()));
+        }
+        let defaults = Self::new("", &self.base_url, &model).with_transport(self.transport);
+        self.model = model;
+        self.supports_reasoning_effort = defaults.supports_reasoning_effort;
+        if !self.explicit_reasoning_effort {
+            self.reasoning_effort = defaults.reasoning_effort;
+        }
+        self.validate_reasoning()?;
+        Ok(self)
     }
 
     pub fn with_usage_in_stream(mut self, supported: bool) -> Self {
@@ -232,8 +260,37 @@ impl ProviderConfig {
         Self::from_environment()
     }
 
+    /// API model preferences apply only to the same provider, endpoint and transport.
     pub fn from_environment() -> Result<Self, KnutError> {
+        let config = Self::environment_default()?;
+        if !config.uses_chatgpt_plan()
+            && let Some(model) = crate::openai_auth::saved_api_model(&config.preference_identity())?
+        {
+            return config.with_model(model);
+        }
+        Ok(config)
+    }
+
+    /// Ignore saved model choices when explicitly restoring environment configuration.
+    pub fn environment_default() -> Result<Self, KnutError> {
         Self::from_settings(|key| std::env::var(key).ok())
+    }
+
+    pub(crate) fn preference_identity(&self) -> String {
+        use sha2::{Digest, Sha256};
+        let mut digest = Sha256::new();
+        for part in [
+            self.environment_provider.as_str(),
+            self.base_url.as_str(),
+            match self.transport {
+                ProviderTransport::ChatCompletions => "chat-completions",
+                ProviderTransport::Responses => "responses",
+            },
+        ] {
+            digest.update((part.len() as u64).to_be_bytes());
+            digest.update(part.as_bytes());
+        }
+        format!("{:x}", digest.finalize())
     }
 
     pub fn chatgpt(model: impl Into<String>) -> Result<Self, KnutError> {
@@ -314,6 +371,7 @@ impl ProviderConfig {
             .to_owned()
         });
         let mut config = Self::new(api_key, base_url, model);
+        config.environment_provider = provider;
         if openai {
             config = config
                 .with_transport(ProviderTransport::Responses)
@@ -337,6 +395,7 @@ impl ProviderConfig {
             config.timeout = Duration::from_secs(seconds);
         }
         if let Some(effort) = get("KNUT_PROVIDER_REASONING_EFFORT") {
+            config.explicit_reasoning_effort = true;
             config.reasoning_effort = Some(match effort.as_str() {
                 "low" => ReasoningEffort::Low,
                 "medium" => ReasoningEffort::Medium,
@@ -691,7 +750,6 @@ impl ProviderModel {
             }
         }
 
-        let _ = ExpectedArtifact::Json; // shape contract stays with the caller
         body
     }
 }
@@ -877,7 +935,7 @@ impl Model for ProviderModel {
         }
 
         let mut stream = response.bytes_stream();
-        let mut buffer = String::new();
+        let mut lines = StreamLines::default();
         let mut accumulator = StreamAccumulator::new(self.config.reasoning_field.clone());
         let mut raw_error: Option<String> = None;
 
@@ -896,15 +954,13 @@ impl Model for ProviderModel {
                 }
             };
 
-            // Fragmented UTF-8 and split SSE frames are normal: buffer
-            // bytes, decode lossily at frame boundaries, and keep the
-            // remainder for the next chunk.
-            buffer.push_str(&String::from_utf8_lossy(&chunk));
-
-            while let Some(newline) = buffer.find('\n') {
-                let line = buffer[..newline].trim_end_matches('\r').to_owned();
-                buffer.drain(..=newline);
-
+            let complete_lines = lines.push(&chunk).map_err(|reason| {
+                sink.on_event(ModelStreamEvent::Incomplete {
+                    reason: reason.to_owned(),
+                });
+                KnutError::Model(reason.to_owned())
+            })?;
+            for line in complete_lines {
                 let Some(payload) = line.strip_prefix("data:") else {
                     continue;
                 };
@@ -935,7 +991,11 @@ impl Model for ProviderModel {
                     continue;
                 }
 
-                for event in accumulator.absorb(&frame) {
+                for event in accumulator.absorb(&frame).inspect_err(|error| {
+                    sink.on_event(ModelStreamEvent::Incomplete {
+                        reason: error.to_string(),
+                    });
+                })? {
                     sink.on_event(event);
                 }
             }
@@ -957,11 +1017,51 @@ impl Model for ProviderModel {
             return Err(KnutError::Model(reason));
         }
 
-        sink.on_event(ModelStreamEvent::Completed {
-            usage: accumulator.usage,
-        });
+        let usage = accumulator.usage;
+        let response = accumulator
+            .into_response(self.identity(), started.elapsed())
+            .inspect_err(|error| {
+                sink.on_event(ModelStreamEvent::Incomplete {
+                    reason: error.to_string(),
+                });
+            })?;
+        sink.on_event(ModelStreamEvent::Completed { usage });
+        Ok(response)
+    }
+}
 
-        accumulator.into_response(self.identity(), started.elapsed())
+const MAX_STREAM_BYTES: usize = 8 * 1024 * 1024;
+const MAX_STREAM_TOOL_CALLS: usize = 16;
+
+#[derive(Default)]
+struct StreamLines {
+    pending: Vec<u8>,
+    scanned: usize,
+    total: usize,
+}
+
+impl StreamLines {
+    fn push(&mut self, chunk: &[u8]) -> Result<Vec<String>, &'static str> {
+        self.total = self.total.saturating_add(chunk.len());
+        if self.total > MAX_STREAM_BYTES {
+            return Err("provider stream exceeds the 8 MiB limit");
+        }
+        self.pending.extend_from_slice(chunk);
+        let mut lines = Vec::new();
+        let mut start = 0;
+        for newline in
+            (self.scanned..self.pending.len()).filter(|index| self.pending[*index] == b'\n')
+        {
+            let line = std::str::from_utf8(&self.pending[start..newline])
+                .map_err(|_| "provider stream contains invalid UTF-8")?
+                .trim_end_matches('\r')
+                .to_owned();
+            start = newline + 1;
+            lines.push(line);
+        }
+        self.pending.drain(..start);
+        self.scanned = self.pending.len();
+        Ok(lines)
     }
 }
 
@@ -996,7 +1096,7 @@ impl StreamAccumulator {
         }
     }
 
-    fn absorb(&mut self, frame: &StreamFrame) -> Vec<ModelStreamEvent> {
+    fn absorb(&mut self, frame: &StreamFrame) -> Result<Vec<ModelStreamEvent>, KnutError> {
         let mut events = Vec::new();
 
         if let Some(usage) = &frame.usage {
@@ -1026,7 +1126,7 @@ impl StreamAccumulator {
                 continue;
             };
 
-            if let Some(reasoning) = delta.reasoning() {
+            if let Some(reasoning) = delta.reasoning(&self.reasoning_field) {
                 self.reasoning.push(reasoning.to_owned());
                 events.push(ModelStreamEvent::ReasoningDelta {
                     text: reasoning.to_owned(),
@@ -1044,6 +1144,11 @@ impl StreamAccumulator {
 
             for call in &delta.tool_calls {
                 let index = call.index.unwrap_or(0);
+                if index >= MAX_STREAM_TOOL_CALLS {
+                    return Err(KnutError::Model(
+                        "provider returned an out-of-range tool call index".to_owned(),
+                    ));
+                }
                 while self.calls.len() <= index {
                     self.calls.push(PartialCall {
                         id: String::new(),
@@ -1077,8 +1182,7 @@ impl StreamAccumulator {
             }
         }
 
-        let _ = &self.reasoning_field;
-        events
+        Ok(events)
     }
 
     fn into_response(
@@ -1086,6 +1190,11 @@ impl StreamAccumulator {
         identity: ModelIdentity,
         latency: Duration,
     ) -> Result<ModelResponse, KnutError> {
+        if self.finish_reason.as_deref() == Some("length") {
+            return Err(KnutError::Model(
+                "provider stopped at its output limit; the answer is truncated".to_owned(),
+            ));
+        }
         let mut tool_calls = Vec::new();
         for call in self.calls {
             if call.name.is_empty() {
@@ -1171,10 +1280,15 @@ struct StreamDelta {
 }
 
 impl StreamDelta {
-    fn reasoning(&self) -> Option<&str> {
-        self.reasoning_content
+    fn reasoning(&self, field: &str) -> Option<&str> {
+        let (preferred, fallback) = if field == "reasoning" {
+            (&self.reasoning, &self.reasoning_content)
+        } else {
+            (&self.reasoning_content, &self.reasoning)
+        };
+        preferred
             .as_deref()
-            .or(self.reasoning.as_deref())
+            .or(fallback.as_deref())
             .filter(|text| !text.is_empty())
     }
 }
@@ -1245,7 +1359,7 @@ impl ChatCompletion {
         self,
         mut identity: ModelIdentity,
         latency: Duration,
-        _reasoning_field: &str,
+        reasoning_field: &str,
     ) -> Result<ModelResponse, KnutError> {
         // Record what actually answered, not what we asked for.
         if let Some(model) = &self.model {
@@ -1292,11 +1406,18 @@ impl ChatCompletion {
             ));
         }
 
-        let reasoning = choice
-            .message
-            .reasoning_content
-            .or(choice.message.reasoning)
-            .filter(|text| !text.is_empty());
+        let reasoning = if reasoning_field == "reasoning" {
+            choice
+                .message
+                .reasoning
+                .or(choice.message.reasoning_content)
+        } else {
+            choice
+                .message
+                .reasoning_content
+                .or(choice.message.reasoning)
+        }
+        .filter(|text| !text.is_empty());
         let continuation = match reasoning {
             Some(value) => Continuation {
                 parts: vec![ContinuationPart {
@@ -1327,6 +1448,7 @@ impl ChatCompletion {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::ExpectedArtifact;
 
     /// A minimal HTTP/1.1 server for protocol fixtures.
     ///
@@ -1567,15 +1689,9 @@ mod tests {
 
     #[tokio::test]
     async fn fragmented_frames_across_tcp_chunks_reassemble() {
-        // The server writes one byte at a time: frames split across TCP
-        // reads must still reassemble deterministically.
         let (server, _) =
             FixtureServer::start(vec![(200, reasoning_tool_then_artifact_stream())]).await;
-        let _ = server;
 
-        // A single-frame-per-read server with a slow write is covered by
-        // the accumulator tests; here assert the same payload through the
-        // real socket path is stable.
         let model =
             ProviderModel::new(ProviderConfig::new("k", server.base_url(), "glm-5.3-flash"))
                 .unwrap();
@@ -1636,6 +1752,32 @@ mod tests {
             .await
             .unwrap_err();
         assert!(matches!(err, KnutError::Model(_)), "got {err:?}");
+    }
+
+    #[tokio::test]
+    async fn truncated_streams_cannot_emit_a_successful_completion() {
+        let payload = "data: {\"choices\":[{\"delta\":{\"content\":\"half an answer\"}}]}\n\ndata: {\"choices\":[{\"delta\":{},\"finish_reason\":\"length\"}]}\n\ndata: [DONE]\n\n";
+        let (server, _) = FixtureServer::start(vec![(200, payload.into())]).await;
+        let model =
+            ProviderModel::new(ProviderConfig::new("k", server.base_url(), "glm-5.3-flash"))
+                .unwrap();
+        let mut sink = crate::BufferedSink::new();
+        let error = model
+            .stream(&ModelRequest::new("x", ExpectedArtifact::Text), &mut sink)
+            .await
+            .unwrap_err();
+        assert!(error.to_string().contains("truncated"));
+        assert!(
+            sink.events()
+                .iter()
+                .any(|event| matches!(event, ModelStreamEvent::Incomplete { .. }))
+        );
+        assert!(
+            !sink
+                .events()
+                .iter()
+                .any(|event| matches!(event, ModelStreamEvent::Completed { .. }))
+        );
     }
 
     #[tokio::test]
@@ -1753,6 +1895,70 @@ mod tests {
     }
 
     #[test]
+    fn model_changes_recompute_capabilities_and_preserve_explicit_effort() {
+        let changed = ProviderConfig::glm_coding("secret")
+            .with_model("glm-5.3")
+            .unwrap();
+        assert_eq!(changed.reasoning_effort(), Some("max"));
+        let ordinary = changed.with_model("ordinary-chat-model").unwrap();
+        assert!(!ordinary.supports_reasoning_effort);
+        assert_eq!(ordinary.reasoning_effort(), None);
+        assert_eq!(ordinary.api_key, "secret");
+        assert_eq!(ordinary.billing, BillingPath::Plan);
+
+        let explicit = ProviderConfig::openai("secret", "gpt-6.1-sol")
+            .with_reasoning_effort(ReasoningEffort::Max);
+        assert!(explicit.clone().with_model("gpt-5").is_err());
+        assert!(explicit.clone().with_model("gpt-4.1").is_err());
+        assert_eq!(
+            explicit.with_model("gpt-6-sol").unwrap().reasoning_effort(),
+            Some("max")
+        );
+        let reasoning = ProviderConfig::openai("secret", "gpt-4.1")
+            .with_model("gpt-6.1-sol")
+            .unwrap();
+        assert!(reasoning.supports_reasoning_effort);
+        assert!(
+            ProviderConfig::glm_coding("secret")
+                .with_model("\n")
+                .is_err()
+        );
+    }
+
+    #[test]
+    fn model_preference_identity_tracks_provider_endpoint_and_transport_only() {
+        let config = ProviderConfig::openai("first-secret", "first-model");
+        let identity = config.preference_identity();
+        assert_eq!(identity.len(), 64);
+        assert!(identity.bytes().all(|byte| byte.is_ascii_hexdigit()));
+        assert_eq!(
+            identity,
+            ProviderConfig::openai("different-secret", "different-model").preference_identity()
+        );
+        assert_ne!(
+            identity,
+            config
+                .clone()
+                .with_transport(ProviderTransport::ChatCompletions)
+                .preference_identity()
+        );
+        let mut other = config.clone();
+        other.base_url = "https://api.openai.com/other/v1".to_owned();
+        assert_ne!(identity, other.preference_identity());
+        other = config;
+        other.environment_provider = "chat-completions".to_owned();
+        assert_ne!(identity, other.preference_identity());
+
+        let env = ProviderConfig::from_settings(|key| match key {
+            "KNUT_PROVIDER" => Some("openai".to_owned()),
+            "OPENAI_API_KEY" => Some("secret".to_owned()),
+            _ => None,
+        })
+        .unwrap();
+        assert_eq!(identity, env.preference_identity());
+    }
+
+    #[test]
     fn explicit_provider_selection_never_borrows_another_providers_key() {
         let settings = |values: &[(&str, &str)]| -> Result<ProviderConfig, KnutError> {
             ProviderConfig::from_settings(|key| {
@@ -1852,6 +2058,53 @@ mod tests {
     }
 
     #[test]
+    fn byte_fragmented_stream_lines_preserve_unicode_and_reject_invalid_encoding() {
+        let text = "data: hé界🙂\r\n\ndata: next\n";
+        let mut lines = StreamLines::default();
+        let mut complete = Vec::new();
+        for byte in text.as_bytes() {
+            complete.extend(lines.push(&[*byte]).unwrap());
+        }
+        assert_eq!(complete, ["data: hé界🙂", "", "data: next"]);
+        assert!(lines.pending.is_empty());
+        assert!(StreamLines::default().push(b"data: \xff\n").is_err());
+    }
+
+    #[test]
+    fn provider_streams_are_bounded_and_tool_indexes_do_not_allocate_arbitrarily() {
+        let mut lines = StreamLines::default();
+        assert!(
+            lines
+                .push(&vec![b'x'; MAX_STREAM_BYTES])
+                .unwrap()
+                .is_empty()
+        );
+        assert!(lines.push(b"x").is_err());
+        let frame: StreamFrame = serde_json::from_value(json!({
+            "choices":[{"delta":{"tool_calls":[{"index":usize::MAX,"id":"c","function":{"name":"write","arguments":"{}"}}]}}]
+        })).unwrap();
+        let mut accumulator = StreamAccumulator::new("reasoning_content".to_owned());
+        assert!(accumulator.absorb(&frame).is_err());
+        assert!(accumulator.calls.is_empty());
+    }
+
+    #[test]
+    fn configured_reasoning_field_selects_the_provider_continuation() {
+        let frame: StreamFrame = serde_json::from_value(
+            json!({"choices":[{"delta":{"reasoning_content":"fallback","reasoning":"preferred"}}]}),
+        )
+        .unwrap();
+        let mut accumulator = StreamAccumulator::new("reasoning".into());
+        accumulator.absorb(&frame).unwrap();
+        assert_eq!(accumulator.reasoning, ["preferred"]);
+        let completion: ChatCompletion = serde_json::from_value(json!({"choices":[{"message":{"content":"answer","reasoning_content":"fallback","reasoning":"preferred"}}]})).unwrap();
+        let response = completion
+            .into_response(identity(), Duration::ZERO, "reasoning")
+            .unwrap();
+        assert_eq!(response.continuation.parts[0].value, "preferred");
+    }
+
+    #[test]
     fn reasoning_content_precedes_content_and_is_preserved() {
         let mut accumulator = StreamAccumulator::new("reasoning_content".to_owned());
 
@@ -1865,7 +2118,7 @@ mod tests {
         let mut events = Vec::new();
         for raw in frames {
             let frame: StreamFrame = serde_json::from_str(raw).unwrap();
-            events.extend(accumulator.absorb(&frame));
+            events.extend(accumulator.absorb(&frame).unwrap());
         }
 
         // Reasoning arrived as reasoning deltas, not as text deltas.
@@ -1902,7 +2155,7 @@ mod tests {
         let mut events = Vec::new();
         for raw in frames {
             let frame: StreamFrame = serde_json::from_str(raw).unwrap();
-            events.extend(accumulator.absorb(&frame));
+            events.extend(accumulator.absorb(&frame).unwrap());
         }
 
         // Start, argument deltas, then end only at finish.
@@ -1930,7 +2183,7 @@ mod tests {
             r#"{"choices":[{"delta":{"tool_calls":[{"index":0,"id":"c","function":{"name":"write","arguments":"{\"path\":"}}]}}]}"#,
         )
         .unwrap();
-        accumulator.absorb(&frame);
+        accumulator.absorb(&frame).unwrap();
 
         assert!(
             accumulator

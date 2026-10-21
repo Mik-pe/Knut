@@ -1,22 +1,6 @@
-//! A task graph and an honest decision inspector (issue #30).
-//!
-//! The inspector is *optional*: it exists to answer "why did it do that?"
-//! and "what is still outstanding?", not to narrate every match arm. The
-//! ordinary transcript stays about useful work.
-//!
-//! Honesty rules carried through:
-//! - a genuine model choice, a deterministic schedule, a cache hit and an
-//!   operator decision are four different provenances, and they are never
-//!   conflated;
-//! - the *proposed* route and the *effective* route are both kept, so a
-//!   fallback never inherits the rejected choice's confidence;
-//! - router confidence is a routing score, never a percentage chance that
-//!   code is correct;
-//! - unavailable usage and cost are labelled as such, never shown as
-//!   billed totals;
-//! - latency is split into the phases it actually has;
-//! - context inspection shows which files and revisions were selected,
-//!   and hides sensitive payloads by default.
+//! Router confidence describes a routing choice, not code correctness.
+//! Proposed and effective routes keep separate provenance; unavailable usage
+//! and cost are never inferred.
 
 use std::collections::BTreeMap;
 

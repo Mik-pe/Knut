@@ -1,24 +1,5 @@
-//! A second reasoner provider and an evidence-based compatibility matrix
-//! (issue #41).
-//!
-//! Knut stays provider-independent without pretending all OpenAI-compatible
-//! endpoints behave identically. The differences that actually matter are
-//! field names, stream ordering, tool-call framing and usage reporting —
-//! and each is stated with the evidence behind it.
-//!
-//! Support levels are deliberately three:
-//! - `Unsupported` — the adapter will not attempt it;
-//! - `FixtureTested` — verified against a local fixture, not a live provider;
-//! - `LiveVerified` — observed against the real provider, with the date.
-//!
-//! A compatibility endpoint returning text is *not* evidence of tool or
-//! reasoning support, and the matrix never says otherwise.
-//!
-//! Verified live on 2026-09-21 against `deepseek-v4.1-flash` at
-//! `https://ollama.com/v1`: reasoning arrives in the `reasoning` field (not
-//! GLM's `reasoning_content`), tool calls carry `id`/`index`/`type`/
-//! `function`, and usage reports `prompt_tokens`, `completion_tokens` and
-//! `prompt_tokens_details.cached_tokens`.
+//! Fixture-tested compatibility is distinct from live verification. A text
+//! response alone does not demonstrate tool-call or reasoning support.
 
 use serde::{Deserialize, Serialize};
 

@@ -278,6 +278,15 @@ impl Theme {
 
     /// Resolve a colour for this terminal.
     pub fn color(&self, rgb: Rgb) -> Color {
+        if !self.paint_background && self.level.is_color() {
+            return match rgb {
+                value if value == self.palette.green => Color::Green,
+                value if value == self.palette.rose => Color::Red,
+                value if value == self.palette.amber => Color::Yellow,
+                value if value == self.palette.cyan => Color::Cyan,
+                _ => to_ansi16(rgb),
+            };
+        }
         match self.level {
             ColorLevel::TrueColor => Color::Rgb(rgb.0, rgb.1, rgb.2),
             ColorLevel::Ansi256 => Color::Indexed(to_ansi256(rgb)),
@@ -292,6 +301,14 @@ impl Theme {
 
     /// A foreground style.
     pub fn fg(&self, rgb: Rgb) -> Style {
+        if !self.paint_background {
+            if rgb == self.palette.text {
+                return Style::default();
+            }
+            if rgb == self.palette.dim || rgb == self.palette.faint {
+                return Style::default().add_modifier(Modifier::DIM);
+            }
+        }
         if self.level.is_color() {
             Style::default().fg(self.color(rgb))
         } else {
@@ -301,7 +318,7 @@ impl Theme {
 
     /// A background style.
     pub fn bg(&self, rgb: Rgb) -> Style {
-        if self.paint_background {
+        if self.paint_background && self.level.is_color() {
             Style::default().bg(self.color(rgb))
         } else {
             Style::default()
@@ -315,7 +332,7 @@ impl Theme {
 
     /// Dimmed copy.
     pub fn dim(&self) -> Style {
-        if self.level.is_color() {
+        if self.level.is_color() && self.paint_background {
             self.fg(self.palette.dim)
         } else {
             Style::default().add_modifier(Modifier::DIM)
@@ -324,7 +341,7 @@ impl Theme {
 
     /// The faintest useful copy (timestamps, counts).
     pub fn faint(&self) -> Style {
-        if self.level.is_color() {
+        if self.level.is_color() && self.paint_background {
             self.fg(self.palette.faint)
         } else {
             Style::default().add_modifier(Modifier::DIM)
@@ -349,6 +366,12 @@ impl Theme {
         } else {
             Style::default().add_modifier(Modifier::BOLD)
         }
+    }
+
+    pub fn selection(&self) -> Style {
+        self.text()
+            .patch(self.bg(self.palette.bg_sel))
+            .add_modifier(Modifier::BOLD)
     }
 
     /// The panel border style.
@@ -681,6 +704,18 @@ mod tests {
         let plain = Theme::plain();
         assert!(!plain.paint_background);
         assert_eq!(plain.bg(plain.palette.bg_panel).bg, None);
+    }
+
+    #[test]
+    fn terminal_background_inherits_body_foreground_and_native_accent_colors() {
+        let mut theme = Theme::for_level(ColorLevel::TrueColor);
+        theme.paint_background = false;
+        assert_eq!(theme.text().fg, None);
+        assert!(theme.dim().add_modifier.contains(Modifier::DIM));
+        assert_eq!(theme.bg(theme.palette.bg_raise).bg, None);
+        assert_eq!(theme.accent().fg, Some(Color::Cyan));
+        assert_eq!(theme.selection().bg, None);
+        assert!(theme.selection().add_modifier.contains(Modifier::BOLD));
     }
 
     #[test]

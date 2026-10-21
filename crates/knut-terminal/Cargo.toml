@@ -7,12 +7,12 @@ description = "Terminal workbench and session event presentation"
 
 [dependencies]
 crossterm.workspace = true
+knut-runtime = { path = "../knut-runtime" }
+libc.workspace = true
 ratatui.workspace = true
+reqwest.workspace = true
 serde.workspace = true
 serde_json.workspace = true
 tokio.workspace = true
-unicode-width.workspace = true
-knut-runtime = { path = "../knut-runtime" }
-libc.workspace = true
-reqwest.workspace = true
 unicode-segmentation.workspace = true
+unicode-width.workspace = true

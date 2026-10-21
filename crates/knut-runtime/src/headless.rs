@@ -1,26 +1,5 @@
-//! Headless JSONL and ACP adapters over the same session runtime
-//! (issue #40).
-//!
-//! Scripts and editors use the *same* engine as the TUI: one
-//! `SessionRuntime`, one command/event contract, one approval fingerprint,
-//! one journal. Nothing here reimplements permissions, cancellation or
-//! session semantics, because a second implementation is how those drift.
-//!
-//! Contracts:
-//! - **stdout carries protocol messages only.** Diagnostics go to stderr,
-//!   so a client parsing JSONL never trips over a log line.
-//! - **approvals are exact.** A client's approval resolves the same
-//!   pending-action fingerprint the TUI would; a missing permission UI
-//!   means the action stays *blocked*, never implicitly approved.
-//! - **one writer per session.** A second client cannot race a writable
-//!   session.
-//! - **disconnects stop work.** A client that vanishes cannot leave new
-//!   work dispatching.
-//! - **ACP capabilities are advertised only when implemented**, and the
-//!   protocol version is negotiated rather than assumed.
-//!
-//! ACP reference: <https://agentclientprotocol.com/protocol/v1/overview>,
-//! protocol version 1.
+//! Protocol output excludes diagnostics. Approvals resolve exact pending
+//! fingerprints; clients without a permission UI leave those actions blocked.
 
 use std::collections::BTreeMap;
 
@@ -930,13 +909,10 @@ impl ProtocolFailures {
 /// Convert engine errors that are really protocol errors.
 pub fn classify_engine_error(err: &KnutError) -> Option<ProtocolError> {
     match err {
-        KnutError::InvalidArguments { path, reason } if path == "task" => {
+        KnutError::InvalidArguments { path, .. } if path == "task" => {
             Some(ProtocolError::NoActiveTask)
         }
-        _ => {
-            let _ = err;
-            None
-        }
+        _ => None,
     }
 }
 

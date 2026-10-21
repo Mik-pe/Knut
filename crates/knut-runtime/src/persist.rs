@@ -1,26 +1,6 @@
-//! Persistent sessions and crash-safe recovery (issue #31).
-//!
-//! A local SQLite store holds versioned session events, artifact
-//! references, task revisions and operation journal state, so real work
-//! survives a crash or a terminal restart without repeating writes.
-//!
-//! The rules that matter:
-//! - **intent is written before dispatch, outcome after.** An operation
-//!   that was dispatched and never reported is *unknown*, and is
-//!   reconciled with the user rather than assumed not to have run.
-//! - **replaying a transcript rebuilds state only.** It never dispatches
-//!   a historical tool call or provider request.
-//! - **resume validates before continuing.** Workspace identity, policy
-//!   revision and pending-approval scope are re-checked; a stale grant is
-//!   never resurrected.
-//! - **one writer per workspace.** A second process cannot claim the same
-//!   operation reservation.
-//! - **corruption is reported, never silently reset.**
-//!
-//! Confidential payloads stay local: events are stored separately from
-//! credentials (which are never stored at all), the database file is
-//! created with owner-only permissions, and exports redact paths to
-//! hashes by default.
+//! Intent is recorded before dispatch and outcome afterwards. Missing outcomes
+//! remain unknown until reconciled; replaying events never executes historical
+//! calls, and resumed sessions revalidate approval scope.
 
 use std::collections::BTreeMap;
 use std::path::{Path, PathBuf};

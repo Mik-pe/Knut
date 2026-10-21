@@ -502,7 +502,7 @@ fn tier_rank(tier: ModelTier) -> u8 {
 /// **observable disagreement**, not proof of a mistake: nobody ran the
 /// cheaper path, so its outcome is unknown. Counts that *would* be
 /// counterfactuals are named as disagreements, and a matched executed
-/// comparison (issue #35) is what turns them into evidence.
+/// comparison is what turns them into evidence.
 ///
 /// Usage and cost are summed from the attempts actually made — including
 /// failed and repaired ones — never from the initially selected tier.
@@ -778,7 +778,6 @@ impl<S: SystemOne + 'static> SystemOne for ShadowSystemOne<S> {
         let inner = Arc::clone(&self.inner);
         let recorded = Arc::clone(&self.recorded_outcomes);
         let cancel = Arc::clone(&self.cancel);
-        let _ = &self.spawned;
         let input = input.clone();
         let deadline = self.shadow_timeout;
 

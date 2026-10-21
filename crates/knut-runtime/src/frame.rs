@@ -1,18 +1,5 @@
-//! Coding-loop decision frames: Jev at meaningful observation boundaries,
-//! not just prompt ingress (issue #22).
-//!
-//! A [`DecisionFrame`] is the compact, versioned evidence bundle a bounded
-//! question is asked over: goal/turn revision, the current work unit, the
-//! capabilities that actually exist, bounded candidate IDs, the latest
-//! structured observation and what work remains. Questions select among
-//! *runtime-authorized* candidates; they never invent tool arguments,
-//! patches, permissions or proof of completion.
-//!
-//! Two rules keep this honest:
-//! - a frame never offers a candidate the runtime could not dispatch
-//!   (availability, policy and revision are checked before asking);
-//! - an unusable answer (unknown choice, stale revision, transport
-//!   failure) falls back to the safe path — reasoning — never to success.
+//! Decision frames offer runtime-authorized candidates. Invalid, stale or
+//! unavailable judgments fall back to reasoning and cannot authorize completion.
 
 use std::collections::BTreeMap;
 

@@ -26,7 +26,7 @@ pub enum NodeStatus {
 }
 
 /// The kind of value a node produces, used to type-check references
-/// before anything executes (issue #19).
+/// before anything executes.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(rename_all = "snake_case")]
 pub enum ArtifactKind {
@@ -1654,8 +1654,6 @@ mod tests {
         .unwrap_or_else(|err| panic!("test plan failed validation: {err}"));
         crate::ValidatedPlan::from_validated(plan, 1).unwrap()
     }
-
-    // --- artifact bindings (#19) ----------------------------------------
 
     /// Build the read -> summarize fragment with a typed reference.
     fn read_then_summarize(note: Value) -> (Arc<ToolRegistry>, PlanNode) {

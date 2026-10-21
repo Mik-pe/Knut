@@ -3,7 +3,7 @@ use std::{collections::BTreeMap, time::Instant};
 use futures_util::StreamExt;
 use serde_json::{Value, json};
 
-use super::{ProviderModel, provider_error};
+use super::{ProviderModel, StreamLines, provider_error};
 use crate::{
     Continuation, ContinuationPart, KnutError, Model, ModelRequest, ModelResponse,
     ModelStreamEvent, ModelStreamSink, ToolCall, Usage,
@@ -125,26 +125,16 @@ impl ProviderModel {
             return Err(provider_error(Some(status), &detail));
         }
         let mut stream = response.bytes_stream();
-        let mut bytes = Vec::new();
+        let mut lines = StreamLines::default();
         let mut data = String::new();
         let mut output = BTreeMap::new();
         let mut output_bytes = 0;
         while let Some(chunk) = stream.next().await {
-            bytes.extend_from_slice(
-                &chunk.map_err(|_| incomplete(sink, "Responses stream interrupted"))?,
-            );
-            if bytes.len() > MAX_FRAME_BYTES {
-                return Err(incomplete(
-                    sink,
-                    "Responses stream frame exceeds size limit",
-                ));
-            }
-            while let Some(newline) = bytes.iter().position(|byte| *byte == b'\n') {
-                let line = std::str::from_utf8(&bytes[..newline])
-                    .map_err(|_| incomplete(sink, "invalid UTF-8 in Responses stream"))?
-                    .trim_end_matches('\r')
-                    .to_owned();
-                bytes.drain(..=newline);
+            let chunk = chunk.map_err(|_| incomplete(sink, "Responses stream interrupted"))?;
+            let complete_lines = lines
+                .push(&chunk)
+                .map_err(|reason| incomplete(sink, reason))?;
+            for line in complete_lines {
                 if let Some(payload) = line.strip_prefix("data:") {
                     if !data.is_empty() {
                         data.push('\n');

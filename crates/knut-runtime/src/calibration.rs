@@ -1,25 +1,5 @@
-//! Calibrated routing policy: bounded caches, per-decision thresholds and
-//! honest calibration metrics (issue #36).
-//!
-//! The prototype reused one 0.75 confidence floor for every action. That
-//! confuses *confident routing* with *guaranteed correctness*, so this
-//! module separates the pieces:
-//!
-//! - **per-decision-type thresholds.** A cheap deterministic rule and a
-//!   risky recovery classification do not share a confidence floor.
-//! - **raw and effective scores stay separate.** A Noul answer's raw
-//!   probability is preserved; dampening or abstention produces an
-//!   *effective* score, and both are recorded.
-//! - **a bounded, versioned cache.** Keys cover everything
-//!   decision-relevant (workspace revision, candidate set, policy, tool,
-//!   question and model versions, mode), so a hit cannot cross
-//!   workspaces or survive a relevant change. Nothing here caches
-//!   permissions: a hit still goes through the execution gate.
-//! - **explicit deadlines and a circuit breaker** driven by observed
-//!   latency, with fallback to reasoning rather than to success.
-//! - **held-out evaluation** of the thresholds, including abstentions and
-//!   negative results, and a policy-version check that refuses to reuse
-//!   calibration from a different version.
+//! Cached decisions never cache permission; execution still passes through
+//! the gate. Raw scores and effective thresholds remain separate for calibration.
 
 use std::collections::{BTreeMap, HashMap, VecDeque};
 use std::sync::Mutex;
